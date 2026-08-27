@@ -18,6 +18,7 @@ from unittest.mock import patch
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from papa_shin_stock import cache as cache_module
 from papa_shin_stock.cache import CacheLock, CacheState, StockCache, _fsync_directory
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
@@ -397,6 +398,30 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(exact_temp.exists())
         self.assertTrue(ambiguous.exists())
         self.assertTrue(unrelated.exists())
+
+    def test_commit_lock_uses_windows_one_byte_locking_backend(self) -> None:
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, int, int]] = []
+
+            def locking(self, descriptor: int, mode: int, length: int) -> None:
+                self.calls.append((descriptor, mode, length))
+
+        backend = FakeMsvcrt()
+        with patch.object(cache_module, "_fcntl", None):
+            with patch.object(cache_module, "_msvcrt", backend):
+                with patch.object(cache_module.os, "lseek", return_value=0) as seek:
+                    cache_module._lock_commit_descriptor(17)
+                    cache_module._unlock_commit_descriptor(17)
+
+        self.assertEqual(
+            backend.calls,
+            [(17, backend.LK_LOCK, 1), (17, backend.LK_UNLCK, 1)],
+        )
+        self.assertEqual(seek.call_count, 2)
 
     def test_active_lock_without_cache_is_cache_locked_error(self) -> None:
         lock = self.cache_root / ".refresh.lock"

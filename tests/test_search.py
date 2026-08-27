@@ -837,7 +837,6 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
         cache = StockCache(self.cache_root, object())
-        competing_writers: list[str] = []
         real_write = cache_module._write_runtime_status_atomic
 
         with cache_module.CacheLock.acquire(self.cache_root) as lock:
@@ -861,28 +860,212 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             )
             cache_module.os.utime(heartbeat, (expired, expired))
 
-            def try_reclaim_then_write(
+            def assert_fresh_lease_then_write(
                 root: Path, directory_name: str, value: object
             ) -> None:
-                try:
-                    with cache_module.CacheLock.acquire(root):
-                        competing_writers.append("acquired")
-                except StockError as error:
-                    self.assertEqual(error.code, "cache_locked")
+                owner_state = cache_module.CacheLock._read_owner(lock.path)
+                self.assertIsNotNone(owner_state)
+                self.assertLess(cache_module.time.time() - owner_state[1], 5)
                 real_write(root, directory_name, value)
 
             with patch.object(
                 cache_module,
                 "_write_runtime_status_atomic",
-                side_effect=try_reclaim_then_write,
+                side_effect=assert_fresh_lease_then_write,
             ):
                 updated = cache._record_runtime_status(
                     state, True, "network_error", lock
                 )
 
-        self.assertEqual(competing_writers, [])
         self.assertTrue(updated.stale)
         self.assertEqual(updated.warning_code, "network_error")
+
+    def test_reclaimed_writer_before_commit_lock_cannot_overwrite_later_commit(
+        self,
+    ) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        delayed_lock = cache_module.CacheLock.acquire(self.cache_root)
+        self.addCleanup(delayed_lock.release)
+        delayed_at_commit = threading.Event()
+        allow_delayed_commit = threading.Event()
+        delayed_errors: list[StockError] = []
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+
+        def pause_delayed_commit(root: Path) -> object:
+            if threading.current_thread().name == "delayed-runtime-writer":
+                delayed_at_commit.set()
+                if not allow_delayed_commit.wait(timeout=5):
+                    raise AssertionError("delayed commit timeout")
+            return real_commit_acquire(root)
+
+        def run_delayed() -> None:
+            try:
+                StockCache(self.cache_root, object())._record_runtime_status(
+                    state, True, "network_error", delayed_lock
+                )
+            except StockError as error:
+                delayed_errors.append(error)
+
+        with patch.object(
+            cache_module.RuntimeCommitLock,
+            "acquire",
+            side_effect=pause_delayed_commit,
+        ):
+            delayed = threading.Thread(
+                target=run_delayed, name="delayed-runtime-writer"
+            )
+            delayed.start()
+            self.assertTrue(delayed_at_commit.wait(timeout=5))
+            expired = (
+                cache_module.time.time()
+                - cache_module._LOCK_TTL_SECONDS
+                - 1
+            )
+            owner = delayed_lock.path / "owner.json"
+            owner.write_text(
+                json.dumps({"token": delayed_lock.token, "created_at": expired}),
+                encoding="utf-8",
+            )
+            cache_module.os.utime(
+                delayed_lock.path / f"heartbeat-{delayed_lock.token}",
+                (expired, expired),
+            )
+
+            with cache_module.CacheLock.acquire(self.cache_root) as current_lock:
+                current = CacheState.load(self.cache_root)
+                self.assertIsNotNone(current)
+                committed = StockCache(
+                    self.cache_root, object()
+                )._record_runtime_status(current, False, None, current_lock)
+
+            allow_delayed_commit.set()
+            delayed.join(timeout=5)
+
+        self.assertFalse(delayed.is_alive())
+        self.assertEqual([error.code for error in delayed_errors], ["cache_locked"])
+        final = CacheState.load(self.cache_root)
+        self.assertIsNotNone(final)
+        self.assertEqual(final.runtime_revision, committed.runtime_revision)
+        self.assertFalse(final.stale)
+
+    def test_writer_holding_commit_lock_orders_later_reclaimer_after_it(self) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        first_lock = cache_module.CacheLock.acquire(self.cache_root)
+        first_in_replace = threading.Event()
+        allow_first_replace = threading.Event()
+        second_waiting = threading.Event()
+        second_acquired = threading.Event()
+        first_errors: list[BaseException] = []
+        second_errors: list[BaseException] = []
+        second_results: list[CacheState] = []
+        real_write = cache_module._write_runtime_status_atomic
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+
+        def pause_first_write(
+            root: Path, directory_name: str, value: object
+        ) -> None:
+            if threading.current_thread().name == "first-runtime-writer":
+                first_in_replace.set()
+                if not allow_first_replace.wait(timeout=5):
+                    raise AssertionError("first replace timeout")
+            real_write(root, directory_name, value)
+
+        def observe_second_wait(root: Path) -> object:
+            if threading.current_thread().name == "second-runtime-writer":
+                second_waiting.set()
+            return real_commit_acquire(root)
+
+        def run_first() -> None:
+            try:
+                StockCache(self.cache_root, object())._record_runtime_status(
+                    state, True, "network_error", first_lock
+                )
+            except BaseException as error:
+                first_errors.append(error)
+            finally:
+                first_lock.release()
+
+        def run_second() -> None:
+            try:
+                with cache_module.CacheLock.acquire(self.cache_root) as lock:
+                    second_acquired.set()
+                    current = CacheState.load(self.cache_root)
+                    self.assertIsNotNone(current)
+                    second_results.append(
+                        StockCache(self.cache_root, object())._record_runtime_status(
+                            current, False, None, lock
+                        )
+                    )
+            except BaseException as error:
+                second_errors.append(error)
+
+        with patch.object(
+            cache_module, "_write_runtime_status_atomic", side_effect=pause_first_write
+        ):
+            with patch.object(
+                cache_module.RuntimeCommitLock,
+                "acquire",
+                side_effect=observe_second_wait,
+            ):
+                first = threading.Thread(
+                    target=run_first, name="first-runtime-writer"
+                )
+                first.start()
+                self.assertTrue(first_in_replace.wait(timeout=5))
+                expired = (
+                    cache_module.time.time()
+                    - cache_module._LOCK_TTL_SECONDS
+                    - 1
+                )
+                (first_lock.path / "owner.json").write_text(
+                    json.dumps(
+                        {"token": first_lock.token, "created_at": expired}
+                    ),
+                    encoding="utf-8",
+                )
+                cache_module.os.utime(
+                    first_lock.path / f"heartbeat-{first_lock.token}",
+                    (expired, expired),
+                )
+
+                second = threading.Thread(
+                    target=run_second, name="second-runtime-writer"
+                )
+                second.start()
+                self.assertTrue(second_waiting.wait(timeout=5))
+                self.assertFalse(second_acquired.is_set())
+                allow_first_replace.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(first_errors, [])
+        self.assertEqual(second_errors, [])
+        self.assertEqual(len(second_results), 1)
+        final = CacheState.load(self.cache_root)
+        self.assertIsNotNone(final)
+        self.assertEqual(final.runtime_revision, second_results[0].runtime_revision)
+        self.assertFalse(final.stale)
+
+    def test_commit_lock_is_released_when_runtime_replace_fails(self) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        with cache_module.CacheLock.acquire(self.cache_root) as lock:
+            with patch.object(
+                cache_module,
+                "_write_runtime_status_atomic",
+                side_effect=PermissionError("/private/cache/runtime-status"),
+            ):
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    StockCache(self.cache_root, object())._record_runtime_status(
+                        state, True, "network_error", lock
+                    )
+
+            with cache_module.RuntimeCommitLock.acquire(self.cache_root):
+                pass
 
     def test_runtime_read_rejects_zero_identity_without_nofollow(self) -> None:
         runtime = self.runtime_status_path()

@@ -11,12 +11,22 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 from urllib.parse import urljoin, urlsplit
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows only
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX only
+    _msvcrt = None
 
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
@@ -423,6 +433,84 @@ class RefreshResult:
         return result
 
 
+class RuntimeCommitLock:
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor = descriptor
+
+    @classmethod
+    def acquire(cls, root: Path) -> "RuntimeCommitLock":
+        path = root / ".runtime-status.commit.lock"
+        descriptor = -1
+        try:
+            observed = _lstat_optional(path)
+            if observed is not None and not stat.S_ISREG(observed.st_mode):
+                raise _cache_unavailable()
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags, 0o600)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise _cache_unavailable()
+            if (
+                observed is not None
+                and observed.st_ino > 0
+                and opened.st_ino > 0
+                and (
+                    observed.st_dev != opened.st_dev
+                    or observed.st_ino != opened.st_ino
+                )
+            ):
+                raise _cache_unavailable()
+            if opened.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            _lock_commit_descriptor(descriptor)
+            return cls(descriptor)
+        except StockError:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise _cache_unavailable() from error
+
+    def release(self, *, suppress_errors: bool = False) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        failure: OSError | None = None
+        try:
+            _unlock_commit_descriptor(descriptor)
+        except OSError as error:
+            failure = error
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if failure is None:
+                failure = error
+        if failure is not None and not suppress_errors:
+            raise _cache_unavailable() from failure
+
+    def __enter__(self) -> "RuntimeCommitLock":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release(suppress_errors=exc_type is not None)
+
+
 class CacheLock:
     def __init__(self, path: Path, token: str) -> None:
         self.path = path
@@ -442,10 +530,35 @@ class CacheLock:
             try:
                 path.mkdir()
             except FileExistsError:
-                if not cls._reclaim_stale(path):
-                    raise StockError(
-                        "cache_locked", "Обновление кэша уже выполняется", 6
-                    )
+                with RuntimeCommitLock.acquire(root):
+                    try:
+                        observed_lock = path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        raise StockError(
+                            "cache_locked",
+                            "Не удалось установить блокировку кэша",
+                            6,
+                        ) from error
+                    if not stat.S_ISDIR(observed_lock.st_mode):
+                        raise StockError(
+                            "cache_locked", "Обновление кэша уже выполняется", 6
+                        )
+                    if not cls._reclaim_stale(path):
+                        try:
+                            path.lstat()
+                        except FileNotFoundError:
+                            continue
+                        except OSError as error:
+                            raise StockError(
+                                "cache_locked",
+                                "Не удалось установить блокировку кэша",
+                                6,
+                            ) from error
+                        raise StockError(
+                            "cache_locked", "Обновление кэша уже выполняется", 6
+                        )
                 continue
             except OSError as error:
                 raise StockError(
@@ -741,19 +854,41 @@ class StockCache:
         validate_runtime_status(value, state.generation_id)
         try:
             lock.heartbeat()
-            _write_runtime_status_atomic(self.root, state.directory_name, value)
-            lock.assert_owned()
+            with RuntimeCommitLock.acquire(self.root):
+                lock.assert_owned()
+                _assert_runtime_commit_expected(self.root, state)
+                lock.assert_owned()
+                _write_runtime_status_atomic(
+                    self.root, state.directory_name, value
+                )
+                lock.assert_owned()
+                written = load_runtime_status(
+                    _runtime_status_path(self.root, state.directory_name),
+                    state.generation_id,
+                )
+                if (
+                    written.revision != value["revision"]
+                    or written.checked_at != value["checked_at"]
+                    or written.stale != stale
+                    or written.warning_code != warning_code
+                ):
+                    raise StockError(
+                        "cache_locked", "Активное поколение кэша изменилось", 6
+                    )
+                lock.assert_owned()
+        except StockError:
+            raise
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
             raise _cache_unavailable() from error
-        refreshed = CacheState.load(self.root, lock.heartbeat)
-        lock.assert_owned()
-        if (
-            refreshed is None
-            or not _same_generation(refreshed, state)
-            or refreshed.runtime_revision != value["revision"]
-        ):
-            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
-        return refreshed
+        runtime_path = _runtime_status_path(self.root, state.directory_name)
+        return replace(
+            state,
+            checked_at=written.checked_at,
+            files=replace(state.files, runtime_status=runtime_path),
+            runtime_revision=written.revision,
+            stale=written.stale,
+            warning_code=written.warning_code,
+        )
 
     def _stale_fallback(
         self, state: CacheState, warning_code: str
@@ -1144,6 +1279,33 @@ def _write_runtime_status_atomic(
     _write_json_atomic(path, value)
 
 
+def _assert_runtime_commit_expected(cache_dir: Path, expected: CacheState) -> None:
+    pointer = CurrentPointer.load(cache_dir / "current.json")
+    if (
+        pointer.generation_id != expected.generation_id
+        or pointer.directory_name != expected.directory_name
+    ):
+        raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
+    path = _runtime_status_path(cache_dir, expected.directory_name)
+    observed = _lstat_optional(path)
+    if observed is None:
+        if expected.runtime_revision is not None:
+            raise StockError(
+                "cache_locked", "Активное поколение кэша изменилось", 6
+            )
+        return
+    if not stat.S_ISREG(observed.st_mode):
+        raise _cache_unavailable()
+    current = load_runtime_status(path, expected.generation_id)
+    if (
+        current.revision != expected.runtime_revision
+        or current.checked_at != expected.checked_at
+        or current.stale != expected.stale
+        or current.warning_code != expected.warning_code
+    ):
+        raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
+
+
 def _lstat_optional(path: Path) -> os.stat_result | None:
     try:
         return path.lstat()
@@ -1151,6 +1313,28 @@ def _lstat_optional(path: Path) -> os.stat_result | None:
         return None
     except OSError as error:
         raise _cache_unavailable() from error
+
+
+def _lock_commit_descriptor(descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows only
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(descriptor, _msvcrt.LK_LOCK, 1)
+        return
+    raise _cache_unavailable()
+
+
+def _unlock_commit_descriptor(descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows only
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(descriptor, _msvcrt.LK_UNLCK, 1)
+        return
+    raise _cache_unavailable()
 
 
 def _same_generation(left: CacheState, right: CacheState) -> bool:
