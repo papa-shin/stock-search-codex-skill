@@ -76,6 +76,15 @@ class StockSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "query_invalid"):
             normalize_tire_size("205evil55junk16")
 
+    def test_size_rejects_non_ascii_whitespace(self) -> None:
+        for value in ("205\t55R16", "205\v55R16", "205\f55R16", "205\u00a055R16"):
+            with self.assertRaisesRegex(StockError, "query_invalid"):
+                normalize_tire_size(value)
+
+    def test_tiny_decimal_exponent_is_safe_query_error(self) -> None:
+        with self.assertRaisesRegex(StockError, "query_invalid"):
+            self.search(max_price="1e-600000")
+
     def test_search_distinguishes_sku_and_quantity(self) -> None:
         result = self.search(size="205/55R16", season="Лето")
 

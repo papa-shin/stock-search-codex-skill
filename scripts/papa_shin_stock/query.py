@@ -16,9 +16,9 @@ _MAX_OFFERS_LIMIT = 25
 def normalize_tire_size(value: str) -> str:
     if not isinstance(value, str):
         raise StockError("query_invalid", "Некорректный типоразмер", 4)
-    if any(character in value for character in "\t\n\r"):
+    if any(character.isspace() and character != " " for character in value):
         raise StockError("query_invalid", "Некорректный типоразмер", 4)
-    match = _TIRE_SIZE.fullmatch(value.strip())
+    match = _TIRE_SIZE.fullmatch(value)
     if match is None:
         raise StockError("query_invalid", "Некорректный типоразмер", 4)
     return f"{match['width']}/{match['profile']}R{match['rim']}"
@@ -141,7 +141,7 @@ def _price_or_none(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError) as error:
         raise StockError("query_invalid", "Некорректная цена", 4) from error
-    if not parsed.is_finite() or parsed < 0 or parsed.adjusted() > 12:
+    if not parsed.is_finite() or parsed < 0 or abs(parsed.adjusted()) > 128:
         raise StockError("query_invalid", "Некорректная цена", 4)
     return parsed
 
