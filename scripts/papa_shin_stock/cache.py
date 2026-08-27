@@ -27,6 +27,7 @@ _LOCK_TTL_SECONDS = 30 * 60
 _LOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_MAX_STATUS_TEXT = 256
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
     errno.EINVAL,
@@ -41,16 +42,21 @@ class GenerationFiles:
     manifest: Path
     products: Path
     offers: Path
+    runtime_status: Path | None = None
 
     @classmethod
     def from_directory(
-        cls, generation_id: str, directory: Path
+        cls,
+        generation_id: str,
+        directory: Path,
+        runtime_status: Path | None = None,
     ) -> "GenerationFiles":
         return cls(
             generation_id=generation_id,
             manifest=directory / "manifest.json",
             products=directory / "products.jsonl",
             offers=directory / "offers.jsonl",
+            runtime_status=runtime_status,
         )
 
     def assert_readable(self) -> None:
@@ -76,8 +82,16 @@ class CurrentPointer:
     @classmethod
     def load(cls, path: Path) -> "CurrentPointer":
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            value = _parse_json(path.read_text(encoding="utf-8"))
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
             raise _cache_unavailable() from error
         if not isinstance(value, dict):
             raise _cache_unavailable()
@@ -152,8 +166,16 @@ class CacheState:
         if state_path.is_symlink() or not state_path.is_file():
             raise _cache_unavailable()
         try:
-            value = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            value = _parse_json(state_path.read_text(encoding="utf-8"))
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
             raise _cache_unavailable() from error
         if not isinstance(value, dict):
             raise _cache_unavailable()
@@ -163,8 +185,6 @@ class CacheState:
         checked_at = value.get("checked_at")
         manifest_etag = value.get("manifest_etag")
         manifest_last_modified = value.get("manifest_last_modified")
-        stale = value.get("stale", False)
-        warning_code = value.get("warning_code")
         if generation_id != pointer.generation_id:
             raise _cache_unavailable()
         if not isinstance(generated_at, str) or not generated_at:
@@ -177,8 +197,16 @@ class CacheState:
             manifest_last_modified, str
         ):
             raise _cache_unavailable()
-        if not isinstance(stale, bool) or (warning_code is not None and not isinstance(warning_code, str)):
-            raise _cache_unavailable()
+        runtime_path = _runtime_status_path(cache_dir, pointer.directory_name)
+        if runtime_path.exists():
+            runtime_status = load_runtime_status(runtime_path, pointer.generation_id)
+            files = GenerationFiles.from_directory(
+                pointer.generation_id,
+                generation,
+                runtime_status=runtime_path,
+            )
+        else:
+            runtime_status = validate_runtime_status(value, pointer.generation_id)
         return cls(
             generation_id=generation_id,
             generated_at=generated_at,
@@ -187,9 +215,66 @@ class CacheState:
             manifest_last_modified=manifest_last_modified,
             directory_name=pointer.directory_name,
             files=files,
-            stale=stale,
-            warning_code=warning_code,
+            stale=runtime_status.stale,
+            warning_code=runtime_status.warning_code,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatus:
+    generation_id: str
+    checked_at: str
+    stale: bool
+    warning_code: str | None
+
+
+def validate_runtime_status(
+    value: object, expected_generation_id: str
+) -> RuntimeStatus:
+    if not isinstance(value, dict):
+        raise _cache_unavailable()
+    generation_id = value.get("generation_id")
+    checked_at = value.get("checked_at")
+    stale = value.get("stale", False)
+    warning_code = value.get("warning_code")
+    if generation_id != expected_generation_id:
+        raise _cache_unavailable()
+    if (
+        not isinstance(checked_at, str)
+        or not checked_at
+        or len(checked_at) > _MAX_STATUS_TEXT
+    ):
+        raise _cache_unavailable()
+    if not isinstance(stale, bool):
+        raise _cache_unavailable()
+    if stale:
+        if (
+            not isinstance(warning_code, str)
+            or not warning_code
+            or len(warning_code) > _MAX_STATUS_TEXT
+        ):
+            raise _cache_unavailable()
+    elif warning_code is not None:
+        raise _cache_unavailable()
+    return RuntimeStatus(generation_id, checked_at, stale, warning_code)
+
+
+def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatus:
+    if path.is_symlink() or not path.is_file():
+        raise _cache_unavailable()
+    try:
+        value = _parse_json(path.read_text(encoding="utf-8"))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ) as error:
+        raise _cache_unavailable() from error
+    return validate_runtime_status(value, expected_generation_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,18 +681,23 @@ class StockCache:
     def _record_runtime_status(
         self, state: CacheState, stale: bool, warning_code: str | None
     ) -> CacheState:
-        _write_json_atomic(
-            state.files.manifest.parent / "state.json",
-            {
-                "generation_id": state.generation_id,
-                "generated_at": state.generated_at,
-                "checked_at": datetime.now(timezone.utc).isoformat() if not stale else state.checked_at,
-                "manifest_etag": state.manifest_etag,
-                "manifest_last_modified": state.manifest_last_modified,
-                "stale": stale,
-                "warning_code": warning_code,
-            },
-        )
+        value = {
+            "generation_id": state.generation_id,
+            "checked_at": (
+                datetime.now(timezone.utc).isoformat()
+                if not stale
+                else state.checked_at
+            ),
+            "stale": stale,
+            "warning_code": warning_code,
+        }
+        validate_runtime_status(value, state.generation_id)
+        try:
+            _write_json_atomic(
+                _runtime_status_path(self.root, state.directory_name), value
+            )
+        except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
+            raise _cache_unavailable() from error
         refreshed = CacheState.load(self.root)
         if refreshed is None:
             raise _cache_unavailable()
@@ -696,6 +786,16 @@ class StockCache:
         try:
             _fsync_directory(final_directory.parent)
             lock.assert_owned()
+            _write_json_atomic(
+                _runtime_status_path(self.root, final_name),
+                {
+                    "generation_id": manifest.generation_id,
+                    "checked_at": checked_at,
+                    "stale": False,
+                    "warning_code": None,
+                },
+            )
+            lock.assert_owned()
             _write_json_atomic(current_path, pointer.to_dict())
             lock.assert_owned()
             state = CacheState.load(self.root, lock.heartbeat)
@@ -736,6 +836,10 @@ class StockCache:
         if state is not None and state.files.manifest.parent == directory:
             return
         shutil.rmtree(directory, ignore_errors=True)
+        try:
+            _runtime_status_path(self.root, directory.name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
         lock.assert_owned()
@@ -761,6 +865,29 @@ class StockCache:
                     continue
                 try:
                     shutil.rmtree(entry)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    cleanup_incomplete = True
+        runtime = self.root / "runtime"
+        try:
+            runtime_entries = list(runtime.iterdir())
+        except FileNotFoundError:
+            runtime_entries = []
+        except OSError:
+            cleanup_incomplete = True
+            runtime_entries = []
+        for entry in runtime_entries:
+            lock.assert_owned()
+            pointer = self._load_current_pointer_for_cleanup()
+            active_name = (
+                f"{pointer.directory_name}.json" if pointer is not None else None
+            )
+            if entry.name == active_name or entry.is_symlink():
+                continue
+            if entry.name.endswith(".json") or entry.name.startswith("."):
+                try:
+                    entry.unlink()
                 except FileNotFoundError:
                     continue
                 except OSError:
@@ -856,6 +983,44 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise _manifest_invalid()
         value[key] = item
     return value
+
+
+def _parse_json(value: str) -> object:
+    parsed = json.loads(
+        value,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    _assert_finite_json(parsed)
+    return parsed
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError("non-finite number")
+
+
+def _assert_finite_json(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite number")
+    if isinstance(value, dict):
+        for item in value.values():
+            _assert_finite_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_finite_json(item)
+
+
+def _runtime_status_path(cache_dir: Path, directory_name: str) -> Path:
+    return cache_dir / "runtime" / f"{directory_name}.json"
 
 
 def _header(headers: dict[str, str], name: str) -> str | None:

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from papa_shin_stock.cache import GenerationFiles
+from papa_shin_stock.cache import (
+    GenerationFiles,
+    load_runtime_status,
+)
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.query import SearchQuery, normalize_tire_size
@@ -46,43 +50,89 @@ class SearchResult:
     def unknown_characteristics(self) -> tuple[dict[str, str], ...]: return tuple(x for p in self.products for x in p.unknown_characteristics)
     def to_public_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"status":self.status,"generation":self.generation,"filters":self.filters,"summary":self.summary.to_public_dict(),"products":[],"unknown_characteristics":[],"warnings":list(self.warnings)}
-        if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_OUTPUT: raise StockError("query_invalid","Слишком большой запрос",4)
+        if _public_size(result) > _MAX_OUTPUT: raise StockError("query_invalid","Слишком большой запрос",4)
+        unknown_counts: list[int] = []
         for product in self.products:
-            result["products"].append(product.to_public_dict(self.offers[product.product_id])); result["unknown_characteristics"].extend(product.unknown_characteristics)
-            if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_OUTPUT:
+            result["products"].append(product.to_public_dict(self.offers[product.product_id])); result["unknown_characteristics"].extend(product.unknown_characteristics); unknown_counts.append(len(product.unknown_characteristics))
+            if _public_size(result) > _MAX_OUTPUT:
                 result["products"].pop()
-                if product.unknown_characteristics: del result["unknown_characteristics"][-len(product.unknown_characteristics):]
-                result["warnings"].append({"code":"output_truncated","message":"Вывод ограничен"})
-                if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_OUTPUT: raise StockError("query_invalid","Слишком большой запрос",4)
+                removed_unknown = unknown_counts.pop()
+                if removed_unknown: del result["unknown_characteristics"][-removed_unknown:]
+                warning = {"code":"output_truncated","message":"Вывод ограничен"}
+                result["warnings"].append(warning)
+                while _public_size(result) > _MAX_OUTPUT and result["products"]:
+                    result["products"].pop()
+                    removed_unknown = unknown_counts.pop()
+                    if removed_unknown: del result["unknown_characteristics"][-removed_unknown:]
+                if _public_size(result) > _MAX_OUTPUT: raise StockError("query_invalid","Слишком большой запрос",4)
                 break
         return result
 
 class _Spool:
     def __init__(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix="papa-shin-search-"); self.db=sqlite3.connect(str(Path(self.temp.name)/"query.sqlite3")); self.db.create_collation("decimal", _decimal_compare)
-        self.db.executescript("CREATE TABLE c(id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT); CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER)")
-    def close(self) -> None: self.db.close(); self.temp.cleanup()
+        self.temp: tempfile.TemporaryDirectory[str] | None = None
+        self.db: sqlite3.Connection | None = None
+        try:
+            self.temp = tempfile.TemporaryDirectory(prefix="papa-shin-search-")
+            self.db = sqlite3.connect(str(Path(self.temp.name) / "query.sqlite3"))
+            self.db.create_collation("decimal", _decimal_compare)
+            self.db.executescript("CREATE TABLE c(id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT); CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER)")
+        except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
+            self._cleanup()
+            raise _spool_unavailable() from error
+    def __enter__(self) -> "_Spool": return self
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        cleanup_error = self._cleanup()
+        if exc is None and cleanup_error is not None:
+            raise _spool_unavailable() from cleanup_error
+        return False
+    def _cleanup(self) -> BaseException | None:
+        failure: BaseException | None = None
+        if self.db is not None:
+            try: self.db.close()
+            except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError, RecursionError) as error: failure = error
+            self.db = None
+        if self.temp is not None:
+            name = Path(self.temp.name)
+            try: self.temp.cleanup()
+            except (OSError, ValueError) as error:
+                if failure is None: failure = error
+            if name.exists(): shutil.rmtree(name, ignore_errors=True)
+            self.temp = None
+        return failure
+    def _connection(self) -> sqlite3.Connection:
+        if self.db is None: raise _spool_unavailable()
+        return self.db
     def add_product(self, p: Product) -> None:
-        try: self.db.execute("INSERT INTO c VALUES(?,?,?,?,?,?,?)",(p.product_id,p.name,p.article,p.product_type,json.dumps(p.characteristics),p.total_quantity,json.dumps(p.unknown_characteristics)))
+        try: self._connection().execute("INSERT INTO c VALUES(?,?,?,?,?,?,?)",(p.product_id,p.name,p.article,p.product_type,json.dumps(p.characteristics),p.total_quantity,json.dumps(p.unknown_characteristics)))
         except sqlite3.IntegrityError as error: raise StockError("manifest_invalid","Некорректные данные товаров",3) from error
-    def has(self, ident: str) -> bool: return self.db.execute("SELECT 1 FROM c WHERE id=?",(ident,)).fetchone() is not None
+        except OverflowError as error: raise StockError("manifest_invalid","Некорректные данные товаров",3) from error
+        except (sqlite3.Error,OSError,ValueError,TypeError,RecursionError) as error: raise _spool_unavailable() from error
+    def has(self, ident: str) -> bool:
+        try: return self._connection().execute("SELECT 1 FROM c WHERE id=?",(ident,)).fetchone() is not None
+        except (sqlite3.Error,OSError,ValueError,TypeError,OverflowError,RecursionError) as error: raise _spool_unavailable() from error
     def add_offer(self, ident: str, offer: Offer, limit: int) -> None:
-        self.db.execute("INSERT INTO o VALUES(?,?,?,?,?)",(ident,offer.supplier,_price_text(offer.price),offer.delivery_days,offer.quantity)); self.db.execute("DELETE FROM o WHERE id=? AND rowid NOT IN (SELECT rowid FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",(ident,ident,limit))
+        try:
+            self._connection().execute("INSERT INTO o VALUES(?,?,?,?,?)",(ident,offer.supplier,_price_text(offer.price),offer.delivery_days,offer.quantity)); self._connection().execute("DELETE FROM o WHERE id=? AND rowid NOT IN (SELECT rowid FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",(ident,ident,limit))
+        except OverflowError as error: raise StockError("manifest_invalid","Некорректные данные предложений",3) from error
+        except (sqlite3.Error,OSError,ValueError,TypeError,RecursionError) as error: raise _spool_unavailable() from error
     def result(self, query: SearchQuery) -> tuple[SearchSummary,tuple[Product,...],dict[str,tuple[Offer,...]]]:
-        required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE EXISTS(SELECT 1 FROM o WHERE o.id=c.id)" if required else ""
-        count,total=self.db.execute(f"SELECT COUNT(*),COALESCE(SUM(q),0) FROM c {where}").fetchone()
-        rows=self.db.execute(f"SELECT id,n,a,t,ch,q,u FROM c {where} ORDER BY CASE WHEN EXISTS(SELECT 1 FROM o WHERE o.id=c.id) THEN 0 ELSE 1 END,(SELECT p FROM o WHERE o.id=c.id ORDER BY p COLLATE decimal,d,q DESC LIMIT 1) COLLATE decimal,q DESC,id LIMIT ?",(query.limit,))
-        products=[]; offers={}
-        for row in rows:
-            product=Product(row[0],row[1],row[2],row[3],json.loads(row[4]),row[5],tuple(json.loads(row[6]))); products.append(product)
-            offers[product.product_id]=tuple(Offer(x[0],Decimal(x[1]),x[2],x[3]) for x in self.db.execute("SELECT s,p,d,q FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC",(product.product_id,)))
-        return SearchSummary(count,total),tuple(products),offers
+        try:
+            required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE EXISTS(SELECT 1 FROM o WHERE o.id=c.id)" if required else ""
+            count,total=self._connection().execute(f"SELECT COUNT(*),COALESCE(SUM(q),0) FROM c {where}").fetchone()
+            rows=self._connection().execute(f"SELECT id,n,a,t,ch,q,u FROM c {where} ORDER BY CASE WHEN EXISTS(SELECT 1 FROM o WHERE o.id=c.id) THEN 0 ELSE 1 END,(SELECT p FROM o WHERE o.id=c.id ORDER BY p COLLATE decimal,d,q DESC LIMIT 1) COLLATE decimal,q DESC,id LIMIT ?",(query.limit,))
+            products=[]; offers={}
+            for row in rows:
+                product=Product(row[0],row[1],row[2],row[3],json.loads(row[4]),row[5],tuple(json.loads(row[6]))); products.append(product)
+                offers[product.product_id]=tuple(Offer(x[0],Decimal(x[1]),x[2],x[3]) for x in self._connection().execute("SELECT s,p,d,q FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC",(product.product_id,)))
+            return SearchSummary(count,total),tuple(products),offers
+        except StockError: raise
+        except (sqlite3.Error,OSError,ValueError,TypeError,OverflowError,RecursionError,InvalidOperation) as error: raise _spool_unavailable() from error
 
 class StockSearcher:
     def __init__(self, files: GenerationFiles, config: StockConfig) -> None: self.files=files; self.config=config
     def search(self, query: SearchQuery) -> SearchResult:
-        spool=_Spool()
-        try:
+        with _Spool() as spool:
             generation,warnings=_generation(self.files)
             for row in _rows(self.files.products):
                 assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
@@ -93,7 +143,6 @@ class StockSearcher:
                     offer=_offer(row)
                     if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
             summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
-        finally: spool.close()
 
 def _rows(path: Path):
     try:
@@ -109,15 +158,16 @@ def _rows(path: Path):
 
 def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
     try: manifest=_parse(files.manifest.read_text(encoding="utf-8"))
-    except (OSError,UnicodeError,ValueError,TypeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
-    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not isinstance(manifest.get("generated_at"),str): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
-    state=None; path=files.manifest.parent/"state.json"
-    if path.is_file() and not path.is_symlink():
-        try: state=_parse(path.read_text(encoding="utf-8"))
-        except (OSError,UnicodeError,ValueError,TypeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
-    if state is not None and (not isinstance(state,dict) or state.get("generation_id") != files.generation_id or not isinstance(state.get("checked_at"),str) or not state["checked_at"] or len(state["checked_at"])>_MAX_TEXT or not isinstance(state.get("stale",False),bool) or (state.get("warning_code") is not None and (not isinstance(state["warning_code"],str) or len(state["warning_code"])>_MAX_TEXT))): raise StockError("cache_unavailable","Проверенный кэш недоступен",7)
-    stale=isinstance(state,dict) and state.get("stale") is True; code=state.get("warning_code") if isinstance(state,dict) else None
-    return {"id":files.generation_id,"generated_at":manifest["generated_at"],"checked_at":state.get("checked_at",manifest["generated_at"]) if isinstance(state,dict) else manifest["generated_at"],"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and isinstance(code,str) else ())
+    except (OSError,UnicodeError,ValueError,TypeError,OverflowError,RecursionError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
+    generated_at=manifest.get("generated_at") if isinstance(manifest,dict) else None
+    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not isinstance(generated_at,str) or not generated_at or len(generated_at)>_MAX_TEXT: raise StockError("generation_mismatch","Поколение данных не согласовано",5)
+    path=files.runtime_status or files.manifest.parent/"state.json"
+    if path.exists() or files.runtime_status is not None:
+        state=load_runtime_status(path,files.generation_id)
+        checked_at=state.checked_at; stale=state.stale; code=state.warning_code
+    else:
+        checked_at=generated_at; stale=False; code=None
+    return {"id":files.generation_id,"generated_at":generated_at,"checked_at":checked_at,"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and code is not None else ())
 
 def _product(row: dict[str,object], ident: str) -> Product:
     chars=row.get("characteristics",{});
@@ -156,6 +206,8 @@ def _decimal(value:object)->Decimal:
     return result
 def _price_text(value:Decimal)->str:return format(value,"f")
 def _decimal_compare(a:str,b:str)->int:return (_decimal(a)>_decimal(b))-(_decimal(a)<_decimal(b))
+def _public_size(value:object)->int:return len(json.dumps(value,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
+def _spool_unavailable()->StockError:return StockError("cache_unavailable","Временное хранилище поиска недоступно",7)
 def _parse(value:str)->object:
     parsed=json.loads(value,object_pairs_hook=_unique,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
 def _finite(value:object)->None:
