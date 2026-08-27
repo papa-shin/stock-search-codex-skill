@@ -415,7 +415,10 @@ class CacheLock:
             or isinstance(created_at, bool)
         ):
             return None
-        timestamp = float(created_at)
+        try:
+            timestamp = float(created_at)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if (
             not math.isfinite(timestamp)
             or timestamp > time.time() + _LOCK_FUTURE_SKEW_SECONDS
@@ -524,9 +527,9 @@ class StockCache:
                     )
 
                 manifest = Manifest.parse(response.body)
-                if previous is not None:
-                    cleanup_warning = self._cleanup_inactive_generations(lock)
-                    if cleanup_warning is not None:
+                cleanup_warning = self._cleanup_inactive_generations(lock)
+                if cleanup_warning is not None:
+                    if previous is not None:
                         current = CacheState.load(self.root, lock.heartbeat)
                         if current is None:
                             raise _cache_unavailable()
@@ -537,6 +540,7 @@ class StockCache:
                             stale=True,
                             warning_code=cleanup_warning,
                         )
+                    raise _cache_unavailable()
                 lock.heartbeat()
                 staged = self._download_generation(manifest, config, lock)
                 try:
@@ -701,22 +705,25 @@ class StockCache:
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
         lock.assert_owned()
-        pointer = CurrentPointer.load(self.root / "current.json")
         generations = self.root / "generations"
         try:
             entries = list(generations.iterdir())
+        except FileNotFoundError:
+            return None
         except OSError:
             return "cache_cleanup_incomplete"
         cleanup_incomplete = False
         for entry in entries:
             lock.assert_owned()
-            pointer = CurrentPointer.load(self.root / "current.json")
-            if entry.name == pointer.directory_name or entry.is_symlink():
+            pointer = self._load_current_pointer_for_cleanup()
+            if (
+                pointer is not None and entry.name == pointer.directory_name
+            ) or entry.is_symlink():
                 continue
             if entry.name.startswith(("generation-", ".staging-")):
                 lock.assert_owned()
-                pointer = CurrentPointer.load(self.root / "current.json")
-                if entry.name == pointer.directory_name:
+                pointer = self._load_current_pointer_for_cleanup()
+                if pointer is not None and entry.name == pointer.directory_name:
                     continue
                 try:
                     shutil.rmtree(entry)
@@ -725,6 +732,15 @@ class StockCache:
                 except OSError:
                     cleanup_incomplete = True
         return "cache_cleanup_incomplete" if cleanup_incomplete else None
+
+    def _load_current_pointer_for_cleanup(self) -> CurrentPointer | None:
+        current_path = self.root / "current.json"
+        try:
+            return CurrentPointer.load(current_path)
+        except StockError:
+            if not current_path.exists():
+                return None
+            raise
 
 
 def _manifest_file(value: object) -> ManifestFile:

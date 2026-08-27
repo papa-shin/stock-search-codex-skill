@@ -497,6 +497,36 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.status, "updated")
         self.assertFalse(lock.exists())
 
+    def test_huge_numeric_owner_timestamp_is_fail_closed_before_directory_ttl(
+        self,
+    ) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            '{"token":"corrupt-writer","created_at":' + "9" * 400 + "}",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertTrue(lock.is_dir())
+
+    def test_huge_numeric_owner_timestamp_uses_stale_directory_ttl(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            '{"token":"corrupt-writer","created_at":' + "9" * 400 + "}",
+            encoding="utf-8",
+        )
+        stale_time = time.time() - 30 * 60 - 1
+        os.utime(lock, (stale_time, stale_time))
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertFalse(lock.exists())
+
     def test_stale_reclaim_does_not_delete_changed_owner_token(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()
@@ -667,6 +697,37 @@ class StockCacheTest(unittest.TestCase):
             directories_after_first,
         )
         self.assertEqual(len(directories_after_first), 2)
+
+    def test_repeated_staging_cleanup_failure_without_cache_is_bounded(self) -> None:
+        client = FakeHttpClient(interrupt_offers=True)
+        real_rmtree = shutil.rmtree
+        generations = self.cache_root / "generations"
+
+        def fail_for_staging(path: Path, *args: object, **kwargs: object) -> None:
+            candidate = Path(path)
+            if candidate.parent == generations and candidate.name.startswith(
+                ".staging-"
+            ):
+                raise PermissionError("synthetic persistent staging cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with patch(
+            "papa_shin_stock.cache.shutil.rmtree",
+            side_effect=fail_for_staging,
+        ):
+            for _ in range(3):
+                with self.assertRaises(StockError) as raised:
+                    StockCache(self.cache_root, client).refresh(self.config)
+                self.assertNotEqual(raised.exception.exit_code, 0)
+
+        staging = sorted(
+            path.name
+            for path in generations.iterdir()
+            if path.is_dir() and path.name.startswith(".staging-")
+        )
+        self.assertFalse((self.cache_root / "current.json").exists())
+        self.assertEqual(len(staging), 1)
+        self.assertEqual(len(client.download_calls), 2)
 
     def test_displaced_writer_cannot_cleanup_new_current_generation(self) -> None:
         self.fixture.seed_generation()
