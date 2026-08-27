@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from email.message import Message
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -23,6 +26,7 @@ from papa_shin_stock.http_client import (
     assert_allowed_download_url,
     normalized_origin,
 )
+import fetch_stock
 
 
 class FakeResponse:
@@ -217,6 +221,50 @@ class SafeHttpSecurityTest(unittest.TestCase):
             )
 
         self.assertFalse(destination.exists())
+
+
+class FetchStockCliTest(unittest.TestCase):
+    def test_success_prints_single_public_json_document_and_returns_zero(self) -> None:
+        public_result = {
+            "status": "stale_cache",
+            "generation": {
+                "id": "synthetic-generation",
+                "generated_at": "2026-08-27T10:00:00+00:00",
+                "checked_at": "2026-08-27T10:01:00+00:00",
+                "stale": True,
+            },
+            "warnings": [{"code": "network_error", "message": "Используется кэш"}],
+        }
+        output = StringIO()
+
+        with patch.object(fetch_stock, "refresh_default", return_value=public_result):
+            with redirect_stdout(output):
+                exit_code = fetch_stock.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(output.getvalue()), public_result)
+        self.assertEqual(output.getvalue().count("\n"), 1)
+
+    def test_error_prints_safe_json_envelope_and_returns_error_exit_code(self) -> None:
+        output = StringIO()
+        error = StockError("config_invalid", "Безопасное сообщение", 2)
+
+        with patch.object(fetch_stock, "refresh_default", side_effect=error):
+            with redirect_stdout(output):
+                exit_code = fetch_stock.main()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "error",
+                "error": {
+                    "code": "config_invalid",
+                    "message": "Безопасное сообщение",
+                },
+            },
+        )
+        self.assertNotIn("synthetic-password", output.getvalue())
 
 
 if __name__ == "__main__":
