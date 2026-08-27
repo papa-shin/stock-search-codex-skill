@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from urllib.request import Request
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from papa_shin_stock.config import StockConfig
+from papa_shin_stock.errors import StockError
+from papa_shin_stock.http_client import (
+    RejectCrossOriginRedirect,
+    SafeHttpClient,
+    assert_allowed_download_url,
+    normalized_origin,
+)
+
+
+class FakeResponse:
+    def __init__(self, body: bytes, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        self._body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            result, self._body = self._body, b""
+            return result
+        result, self._body = self._body[:size], self._body[size:]
+        return result
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+
+class RecordingOpener:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self._responses = responses
+        self.requests: list[Request] = []
+
+    def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
+        self.requests.append(request)
+        return self._responses.pop(0)
+
+
+class SafeHttpSecurityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.directory = Path(self.temp_dir.name)
+        self.https_config = StockConfig(
+            manifest_url="https://stock.example.test/manifest.json",
+            username="test-user",
+            password="test-password",
+            product_id_field="product_id",
+            offer_product_id_field="offer_id",
+            cache_dir=self.directory,
+        )
+        self.http_config = StockConfig(
+            manifest_url="http://stock.example.test/manifest.json",
+            username="test-user",
+            password="test-password",
+            product_id_field="product_id",
+            offer_product_id_field="offer_id",
+            cache_dir=self.directory,
+        )
+
+    def test_cross_origin_download_is_rejected(self) -> None:
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            assert_allowed_download_url(
+                "https://stock.example.test/manifest.json",
+                "https://other.example.test/products.jsonl",
+            )
+
+    def test_http_url_is_rejected(self) -> None:
+        with self.assertRaisesRegex(StockError, "config_invalid"):
+            SafeHttpClient.for_config(self.http_config)
+
+    def test_normalized_origin_treats_default_https_port_as_same_origin(self) -> None:
+        self.assertEqual(
+            normalized_origin("https://STOCK.example.test:443/manifest.json"),
+            ("https", "stock.example.test", None),
+        )
+
+    def test_manifest_request_uses_conditional_headers_and_origin_bound_auth(self) -> None:
+        opener = RecordingOpener(
+            [FakeResponse(b"", status=304, headers={"ETag": '"v2"'})]
+        )
+        client = SafeHttpClient(self.https_config, opener)
+
+        response = client.get_manifest(etag='"v1"', last_modified="Tue, 01 Sep 2026 00:00:00 GMT")
+
+        self.assertEqual(response.status, 304)
+        self.assertEqual(response.body, b"")
+        self.assertEqual(response.headers, {"ETag": '"v2"'})
+        request = opener.requests[0]
+        self.assertEqual(request.get_header("If-none-match"), '"v1"')
+        self.assertEqual(request.get_header("If-modified-since"), "Tue, 01 Sep 2026 00:00:00 GMT")
+        expected_authorization = base64.b64encode(b"test-user:test-password").decode("ascii")
+        self.assertEqual(request.get_header("Authorization"), f"Basic {expected_authorization}")
+
+    def test_cross_origin_request_does_not_reach_opener_or_send_credentials(self) -> None:
+        opener = RecordingOpener([])
+        client = SafeHttpClient(self.https_config, opener)
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            client._open_same_origin("https://other.example.test/products.jsonl", {})
+
+        self.assertEqual(opener.requests, [])
+
+    def test_cross_origin_redirect_is_rejected(self) -> None:
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        request = Request("https://stock.example.test/manifest.json")
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://other.example.test/manifest.json",
+            )
+
+    def test_download_writes_verified_payload_and_returns_receipt(self) -> None:
+        payload = b'{"product_id":"A-12"}\n'
+        opener = RecordingOpener([FakeResponse(payload)])
+        client = SafeHttpClient(self.https_config, opener)
+        destination = self.directory / "products.jsonl"
+
+        receipt = client.download(
+            "https://stock.example.test/products.jsonl",
+            destination,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+        self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(receipt.bytes, len(payload))
+        self.assertEqual(receipt.sha256, hashlib.sha256(payload).hexdigest())
+
+    def test_download_removes_payload_that_fails_integrity_check(self) -> None:
+        destination = self.directory / "products.jsonl"
+        client = SafeHttpClient(self.https_config, RecordingOpener([FakeResponse(b"altered")]))
+
+        with self.assertRaisesRegex(StockError, "download_integrity_failed"):
+            client.download(
+                "https://stock.example.test/products.jsonl",
+                destination,
+                expected_bytes=8,
+                expected_sha256="0" * 64,
+            )
+
+        self.assertFalse(destination.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
