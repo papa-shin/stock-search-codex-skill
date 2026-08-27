@@ -72,6 +72,10 @@ class StockSearchTest(unittest.TestCase):
         self.assertEqual(normalize_tire_size("205/55 16"), "205/55R16")
         self.assertEqual(normalize_tire_size("205 55 R16"), "205/55R16")
 
+    def test_size_rejects_unapproved_separators(self) -> None:
+        with self.assertRaisesRegex(StockError, "query_invalid"):
+            normalize_tire_size("205evil55junk16")
+
     def test_search_distinguishes_sku_and_quantity(self) -> None:
         result = self.search(size="205/55R16", season="Лето")
 
@@ -130,6 +134,27 @@ class StockSearchTest(unittest.TestCase):
             ),
         )
 
+    def test_unknown_and_missing_size_and_season_are_reported(self) -> None:
+        products = self.files.products
+        products.write_text(
+            products.read_text(encoding="utf-8").replace(
+                '"size":"205/55R16","season":"Лето","spikes":{"status":"unknown"}',
+                '"size":{"status":"unknown"},"season":{"status":"missing"},"spikes":{"status":"unknown"}',
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.search(min_total_quantity=0)
+
+        self.assertIn(
+            {"product_id": "synthetic-unknown", "characteristic": "size", "status": "unknown"},
+            result.unknown_characteristics,
+        )
+        self.assertIn(
+            {"product_id": "synthetic-unknown", "characteristic": "season", "status": "missing"},
+            result.unknown_characteristics,
+        )
+
     def test_product_generation_mismatch_fails_closed(self) -> None:
         products = self.files.products
         products.write_bytes((FIXTURES_DIR / "products-generation-mismatch.jsonl").read_bytes())
@@ -159,7 +184,7 @@ class StockSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "manifest_invalid"):
             self.search()
 
-    def test_too_many_matching_products_are_rejected_before_offer_pass(self) -> None:
+    def test_more_than_ten_thousand_products_returns_exact_top_result(self) -> None:
         product = (
             '{"private_product_key":"synthetic-%s","content_generation_id":"synthetic-generation",'
             '"name":"Synthetic","article":"SYN","product_type":"Шины",'
@@ -169,9 +194,88 @@ class StockSearchTest(unittest.TestCase):
         self.files.products.write_text(
             "".join(product % index for index in range(10_001)), encoding="utf-8"
         )
+        self.files.offers.write_text(
+            "".join(
+                '{"private_offer_product_key":"synthetic-%s","content_generation_id":"synthetic-generation",'
+                '"supplier":"Synthetic","price":"%s","delivery_days":1,"quantity":1}\n'
+                % (index, 20_000 - index)
+                for index in range(10_001)
+            ),
+            encoding="utf-8",
+        )
 
-        with self.assertRaisesRegex(StockError, "query_invalid"):
-            self.search(size="205/55R16", season="Лето")
+        result = self.search(size="205/55R16", season="Лето", limit=1)
+
+        self.assertEqual(result.products[0].product_id, "synthetic-10000")
+
+    def test_duplicate_json_keys_fail_closed(self) -> None:
+        self.files.products.write_text(
+            '{"private_product_key":"synthetic-a","content_generation_id":"synthetic-generation",'
+            '"content_generation_id":"other-generation"}\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            self.search()
+
+    def test_nested_overflow_json_number_fails_closed(self) -> None:
+        products = self.files.products
+        products.write_text(
+            products.read_text(encoding="utf-8").replace('"load_index":"91"', '"load_index":{"bad":1e400}', 1),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            self.search()
+
+    def test_unapproved_large_nested_characteristic_is_not_public(self) -> None:
+        products = self.files.products
+        products.write_text(
+            products.read_text(encoding="utf-8").replace(
+                '"characteristics":{"load_index":"91","speed_index":"V"}',
+                '"characteristics":{"load_index":"91","private_nested":{"payload":"' + "x" * 1_100_000 + '"}}',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        public = self.search(size="205/55R16", season="Лето").to_public_dict()
+        serialized = json.dumps(public, ensure_ascii=False, separators=(",", ":"))
+
+        self.assertNotIn("private_nested", serialized)
+        self.assertLessEqual(len(serialized.encode("utf-8")), 512 * 1024)
+
+    def test_offer_tie_prefers_higher_quantity(self) -> None:
+        offers = self.files.offers
+        offers.write_text(
+            offers.read_text(encoding="utf-8")
+            + '{"private_offer_product_key":"synthetic-summer-b","content_generation_id":"synthetic-generation","supplier":"Low","price":"6000","delivery_days":4,"quantity":1}\n'
+            + '{"private_offer_product_key":"synthetic-summer-b","content_generation_id":"synthetic-generation","supplier":"High","price":"6000","delivery_days":4,"quantity":99}\n',
+            encoding="utf-8",
+        )
+
+        public = self.search(size="205/55R16", season="Лето").to_public_dict()
+        product = next(item for item in public["products"] if item["product_id"] == "synthetic-summer-b")
+
+        self.assertEqual(product["offers"][0]["supplier"], "High")
+
+    def test_persisted_stale_status_is_returned_by_later_search(self) -> None:
+        (self.generation_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "stale": True,
+                    "warning_code": "network_error",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        public = self.search().to_public_dict()
+
+        self.assertTrue(public["generation"]["stale"])
+        self.assertEqual(public["warnings"][0]["code"], "network_error")
 
     def test_output_is_bounded_and_uses_only_neutral_product_id(self) -> None:
         result = self.search(size="205/55R16", season="Лето", limit=2, offers_limit=3)
@@ -212,6 +316,16 @@ class SearchStockCliTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(output.getvalue()), public_result)
+
+    def test_invalid_argument_writes_safe_json_envelope(self) -> None:
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = search_stock.main(["--limit", "nope"])
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(result["error"]["code"], "query_invalid")
 
 
 if __name__ == "__main__":

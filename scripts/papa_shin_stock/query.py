@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from papa_shin_stock.errors import StockError
 
 
-_TIRE_SIZE = re.compile(r"^(?P<width>\d{3})\D*(?P<profile>\d{2,3})\D*[Rr]?\D*(?P<rim>\d{2})$")
+_TIRE_SIZE = re.compile(r"^(?P<width>\d{3})(?:/|\s)(?P<profile>\d{2,3})(?:R|r|\sR?|\s)(?P<rim>\d{2})$")
 _MAX_LIMIT = 100
 _MAX_OFFERS_LIMIT = 25
 
@@ -139,7 +139,7 @@ def _price_or_none(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError) as error:
         raise StockError("query_invalid", "Некорректная цена", 4) from error
-    if not parsed.is_finite() or parsed < 0:
+    if not parsed.is_finite() or parsed < 0 or parsed.adjusted() > 12:
         raise StockError("query_invalid", "Некорректная цена", 4)
     return parsed
 

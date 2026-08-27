@@ -22,26 +22,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--truck-axis")
     parser.add_argument("--truck-construction")
     parser.add_argument("--supplier")
-    parser.add_argument("--min-total-quantity", type=int, default=4)
+    parser.add_argument("--min-total-quantity", default=4)
     parser.add_argument("--max-price")
-    parser.add_argument("--max-delivery-days", type=int)
-    parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--offers-limit", type=int, default=5)
+    parser.add_argument("--max-delivery-days")
+    parser.add_argument("--limit", default=10)
+    parser.add_argument("--offers-limit", default=5)
     return parser
 
 
 def search_default(namespace: argparse.Namespace) -> dict[str, object]:
+    query = SearchQuery.from_args(namespace)
     config = StockConfig.load()
     files = StockCache(config.cache_dir, SafeHttpClient.for_config(config)).current_generation()
-    query = SearchQuery.from_args(namespace)
     return StockSearcher(files, config).search(query).to_public_dict()
 
 
 def main(argv: list[str] | None = None) -> int:
-    namespace = build_parser().parse_args(argv)
     try:
+        namespace = build_parser().parse_args(argv)
         result = search_default(namespace)
         exit_code = 0
+    except SystemExit:
+        result = {"status": "error", "error": {"code": "query_invalid", "message": "Некорректные параметры поиска"}}
+        exit_code = 4
     except StockError as error:
         result = {
             "status": "error",

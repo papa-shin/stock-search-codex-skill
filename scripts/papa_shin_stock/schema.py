@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+import sqlite3
+import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -10,18 +13,10 @@ from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.query import SearchQuery, normalize_tire_size
 
-
-_PRODUCT_FILTERS = (
-    "product_type",
-    "season",
-    "spikes",
-    "run_flat",
-    "disk_type",
-    "truck_axis",
-    "truck_construction",
-)
-_UNKNOWN_STATUSES = {"unknown", "missing"}
-_MAX_CANDIDATES = 10_000
+_UNKNOWN = {"unknown", "missing"}
+_PUBLIC_CHARS = {"load_index", "speed_index"}
+_MAX_TEXT = 256
+_MAX_OUTPUT = 512 * 1024
 
 
 def assert_generation(row: dict[str, object], expected: str) -> None:
@@ -31,357 +26,139 @@ def assert_generation(row: dict[str, object], expected: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Offer:
-    supplier: str
-    price: Decimal
-    delivery_days: int
-    quantity: int
-
-    def sort_key(self) -> tuple[Decimal, int, int]:
-        return self.price, self.delivery_days, self.quantity
-
-    def to_public_dict(self) -> dict[str, object]:
-        return {
-            "supplier": self.supplier,
-            "price": _decimal_text(self.price),
-            "delivery_days": self.delivery_days,
-            "quantity": self.quantity,
-        }
-
+    supplier: str; price: Decimal; delivery_days: int; quantity: int
+    def to_public_dict(self) -> dict[str, object]: return {"supplier": self.supplier, "price": _price_text(self.price), "delivery_days": self.delivery_days, "quantity": self.quantity}
 
 @dataclass(frozen=True, slots=True)
 class Product:
-    product_id: str
-    name: str
-    article: str
-    product_type: str
-    characteristics: dict[str, object]
-    total_quantity: int
-    unknown_characteristics: tuple[dict[str, str], ...]
-
-    def to_public_dict(self, offers: tuple[Offer, ...]) -> dict[str, object]:
-        return {
-            "product_id": self.product_id,
-            "name": self.name,
-            "article": self.article,
-            "product_type": self.product_type,
-            "characteristics": self.characteristics,
-            "total_quantity": self.total_quantity,
-            "minimum_price": _decimal_text(offers[0].price) if offers else None,
-            "offers": [offer.to_public_dict() for offer in offers],
-        }
-
+    product_id: str; name: str; article: str; product_type: str; characteristics: dict[str, str]; total_quantity: int; unknown_characteristics: tuple[dict[str, str], ...]
+    def to_public_dict(self, offers: tuple[Offer, ...]) -> dict[str, object]: return {"product_id":self.product_id,"name":self.name,"article":self.article,"product_type":self.product_type,"characteristics":self.characteristics,"total_quantity":self.total_quantity,"minimum_price":_price_text(offers[0].price) if offers else None,"offers":[x.to_public_dict() for x in offers]}
 
 @dataclass(frozen=True, slots=True)
 class SearchSummary:
-    sku_count: int
-    total_quantity: int
-
-    def to_public_dict(self) -> dict[str, int]:
-        return {"sku_count": self.sku_count, "total_quantity": self.total_quantity}
-
+    sku_count: int; total_quantity: int
+    def to_public_dict(self) -> dict[str, int]: return {"sku_count":self.sku_count,"total_quantity":self.total_quantity}
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
-    generation: dict[str, object]
-    filters: dict[str, object]
-    summary: SearchSummary
-    products: tuple[Product, ...]
-    offers: dict[str, tuple[Offer, ...]]
-    unknown_characteristics: tuple[dict[str, str], ...]
-    warnings: tuple[dict[str, str], ...] = ()
-    status: str = "ok"
-
+    generation: dict[str, object]; filters: dict[str, object]; summary: SearchSummary; products: tuple[Product, ...]; offers: dict[str, tuple[Offer, ...]]; warnings: tuple[dict[str, str], ...]=(); status: str="ok"
+    @property
+    def unknown_characteristics(self) -> tuple[dict[str, str], ...]: return tuple(x for p in self.products for x in p.unknown_characteristics)
     def to_public_dict(self) -> dict[str, object]:
-        return {
-            "status": self.status,
-            "generation": self.generation,
-            "filters": self.filters,
-            "summary": self.summary.to_public_dict(),
-            "products": [
-                product.to_public_dict(self.offers.get(product.product_id, ()))
-                for product in self.products
-            ],
-            "unknown_characteristics": list(self.unknown_characteristics),
-            "warnings": list(self.warnings),
-        }
+        result: dict[str, object] = {"status":self.status,"generation":self.generation,"filters":self.filters,"summary":self.summary.to_public_dict(),"products":[],"unknown_characteristics":[],"warnings":list(self.warnings)}
+        for product in self.products:
+            result["products"].append(product.to_public_dict(self.offers[product.product_id])); result["unknown_characteristics"].extend(product.unknown_characteristics)
+            if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_OUTPUT:
+                result["products"].pop(); del result["unknown_characteristics"][-len(product.unknown_characteristics):]; result["warnings"].append({"code":"output_truncated","message":"Вывод ограничен"}); break
+        return result
 
+class _Spool:
+    def __init__(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="papa-shin-search-"); self.db=sqlite3.connect(str(Path(self.temp.name)/"query.sqlite3")); self.db.create_collation("decimal", _decimal_compare)
+        self.db.executescript("CREATE TABLE c(id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT); CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER)")
+    def close(self) -> None: self.db.close(); self.temp.cleanup()
+    def add_product(self, p: Product) -> None:
+        try: self.db.execute("INSERT INTO c VALUES(?,?,?,?,?,?,?)",(p.product_id,p.name,p.article,p.product_type,json.dumps(p.characteristics),p.total_quantity,json.dumps(p.unknown_characteristics)))
+        except sqlite3.IntegrityError as error: raise StockError("manifest_invalid","Некорректные данные товаров",3) from error
+    def has(self, ident: str) -> bool: return self.db.execute("SELECT 1 FROM c WHERE id=?",(ident,)).fetchone() is not None
+    def add_offer(self, ident: str, offer: Offer, limit: int) -> None:
+        self.db.execute("INSERT INTO o VALUES(?,?,?,?,?)",(ident,offer.supplier,_price_text(offer.price),offer.delivery_days,offer.quantity)); self.db.execute("DELETE FROM o WHERE id=? AND rowid NOT IN (SELECT rowid FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",(ident,ident,limit))
+    def result(self, query: SearchQuery) -> tuple[SearchSummary,tuple[Product,...],dict[str,tuple[Offer,...]]]:
+        required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE EXISTS(SELECT 1 FROM o WHERE o.id=c.id)" if required else ""
+        count,total=self.db.execute(f"SELECT COUNT(*),COALESCE(SUM(q),0) FROM c {where}").fetchone()
+        rows=self.db.execute(f"SELECT id,n,a,t,ch,q,u FROM c {where} ORDER BY CASE WHEN EXISTS(SELECT 1 FROM o WHERE o.id=c.id) THEN 0 ELSE 1 END,(SELECT p FROM o WHERE o.id=c.id ORDER BY p COLLATE decimal,d,q DESC LIMIT 1) COLLATE decimal,q DESC,id LIMIT ?",(query.limit,))
+        products=[]; offers={}
+        for row in rows:
+            product=Product(row[0],row[1],row[2],row[3],json.loads(row[4]),row[5],tuple(json.loads(row[6]))); products.append(product)
+            offers[product.product_id]=tuple(Offer(x[0],Decimal(x[1]),x[2],x[3]) for x in self.db.execute("SELECT s,p,d,q FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC",(product.product_id,)))
+        return SearchSummary(count,total),tuple(products),offers
 
 class StockSearcher:
-    def __init__(self, files: GenerationFiles, config: StockConfig) -> None:
-        self.files = files
-        self.config = config
-
+    def __init__(self, files: GenerationFiles, config: StockConfig) -> None: self.files=files; self.config=config
     def search(self, query: SearchQuery) -> SearchResult:
-        generation = _read_generation_metadata(self.files)
-        candidates = self._read_matching_products(query)
-        offers = self._read_matching_offers(candidates, query)
-        return self._build_result(query, generation, candidates, offers)
-
-    def _read_matching_products(self, query: SearchQuery) -> dict[str, Product]:
-        candidates: dict[str, Product] = {}
-        for row in _jsonl_rows(self.files.products):
-            assert_generation(row, self.files.generation_id)
-            product_id = self.config.resolve_product_id(row)
-            product = _product_from_row(row, product_id)
-            if not _matches_product(product, row, query):
-                continue
-            if product_id in candidates:
-                raise StockError("manifest_invalid", "Некорректные данные товаров", 3)
-            if len(candidates) >= _MAX_CANDIDATES:
-                raise StockError("query_invalid", "Слишком много товаров по заданным фильтрам", 4)
-            candidates[product_id] = product
-        return candidates
-
-    def _read_matching_offers(
-        self, candidates: dict[str, Product], query: SearchQuery
-    ) -> dict[str, tuple[Offer, ...]]:
-        selected: dict[str, list[Offer]] = {product_id: [] for product_id in candidates}
-        for row in _jsonl_rows(self.files.offers):
-            assert_generation(row, self.files.generation_id)
-            product_id = _resolve_offer_product_id(row, self.config.offer_product_id_field)
-            offers = selected.get(product_id)
-            if offers is None:
-                continue
-            offer = _offer_from_row(row)
-            if not _matches_offer(offer, query):
-                continue
-            offers.append(offer)
-            offers.sort(key=Offer.sort_key)
-            del offers[query.offers_limit:]
-        return {product_id: tuple(values) for product_id, values in selected.items()}
-
-    def _build_result(
-        self,
-        query: SearchQuery,
-        generation: dict[str, object],
-        candidates: dict[str, Product],
-        offers: dict[str, tuple[Offer, ...]],
-    ) -> SearchResult:
-        requires_matching_offer = any(
-            value is not None
-            for value in (query.supplier, query.max_price, query.max_delivery_days)
-        )
-        products = [
-            product
-            for product_id, product in candidates.items()
-            if not requires_matching_offer or offers[product_id]
-        ]
-        products.sort(key=lambda product: _product_sort_key(product, offers[product.product_id]))
-        products = products[: query.limit]
-        selected_ids = {product.product_id for product in products}
-        selected_offers = {
-            product_id: values
-            for product_id, values in offers.items()
-            if product_id in selected_ids
-        }
-        unknown_characteristics = tuple(
-            unknown
-            for product in products
-            for unknown in product.unknown_characteristics
-        )
-        return SearchResult(
-            generation=generation,
-            filters=query.public_filters(),
-            summary=SearchSummary(
-                sku_count=len(products),
-                total_quantity=sum(product.total_quantity for product in products),
-            ),
-            products=tuple(products),
-            offers=selected_offers,
-            unknown_characteristics=unknown_characteristics,
-        )
-
-
-def _jsonl_rows(path: Path):
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if not line.strip():
-                    continue
-                try:
-                    row = _parse_json(line)
-                except (json.JSONDecodeError, ValueError, TypeError, RecursionError) as error:
-                    raise StockError("manifest_invalid", "Некорректные машинные данные", 3) from error
-                if not isinstance(row, dict):
-                    raise StockError("manifest_invalid", "Некорректные машинные данные", 3)
-                yield row
-    except StockError:
-        raise
-    except (OSError, UnicodeError) as error:
-        raise StockError("cache_unavailable", "Проверенный кэш недоступен", 7) from error
-
-
-def _read_generation_metadata(files: GenerationFiles) -> dict[str, object]:
-    try:
-        manifest = _parse_json(files.manifest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as error:
-        raise StockError("cache_unavailable", "Проверенный кэш недоступен", 7) from error
-    if not isinstance(manifest, dict):
-        raise StockError("manifest_invalid", "Некорректный manifest", 3)
-    generated_at = manifest.get("generated_at")
-    if manifest.get("generation_id") != files.generation_id or not isinstance(generated_at, str):
-        raise StockError("generation_mismatch", "Поколение данных не согласовано", 5)
-    checked_at = generated_at
-    state_path = files.manifest.parent / "state.json"
-    if state_path.is_file() and not state_path.is_symlink():
+        spool=_Spool()
         try:
-            state = _parse_json(state_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as error:
-            raise StockError("cache_unavailable", "Проверенный кэш недоступен", 7) from error
-        if not isinstance(state, dict) or state.get("generation_id") != files.generation_id:
-            raise StockError("generation_mismatch", "Поколение данных не согласовано", 5)
-        stored_checked_at = state.get("checked_at")
-        if not isinstance(stored_checked_at, str):
-            raise StockError("cache_unavailable", "Проверенный кэш недоступен", 7)
-        checked_at = stored_checked_at
-    return {
-        "id": files.generation_id,
-        "generated_at": generated_at,
-        "checked_at": checked_at,
-        "stale": False,
-    }
+            generation,warnings=_generation(self.files)
+            for row in _rows(self.files.products):
+                assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
+                if _match_product(product,row,query): spool.add_product(product)
+            for row in _rows(self.files.offers):
+                assert_generation(row,self.files.generation_id); ident=_offer_id(row,self.config.offer_product_id_field)
+                if spool.has(ident):
+                    offer=_offer(row)
+                    if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
+            summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
+        finally: spool.close()
 
+def _rows(path: Path):
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    try: value=_parse(line)
+                    except (ValueError,TypeError,OverflowError,RecursionError,json.JSONDecodeError) as error: raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
+                    if not isinstance(value,dict): raise StockError("manifest_invalid","Некорректные машинные данные",3)
+                    yield value
+    except StockError: raise
+    except (OSError,UnicodeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
 
-def _product_from_row(row: dict[str, object], product_id: str) -> Product:
-    name = _required_text(row, "name", "Некорректные данные товаров")
-    article = _required_text(row, "article", "Некорректные данные товаров")
-    product_type = _required_text(row, "product_type", "Некорректные данные товаров")
-    characteristics = row.get("characteristics", {})
-    if not isinstance(characteristics, dict):
-        raise StockError("manifest_invalid", "Некорректные данные товаров", 3)
-    return Product(
-        product_id=product_id,
-        name=name,
-        article=article,
-        product_type=product_type,
-        characteristics=_public_characteristics(characteristics),
-        total_quantity=_nonnegative_int(row.get("total_quantity"), "Некорректные данные товаров"),
-        unknown_characteristics=_unknown_characteristics(product_id, row, characteristics),
-    )
+def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
+    try: manifest=_parse(files.manifest.read_text(encoding="utf-8"))
+    except (OSError,UnicodeError,ValueError,TypeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
+    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not isinstance(manifest.get("generated_at"),str): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
+    state={}; path=files.manifest.parent/"state.json"
+    if path.is_file() and not path.is_symlink(): state=_parse(path.read_text(encoding="utf-8"))
+    stale=isinstance(state,dict) and state.get("stale") is True; code=state.get("warning_code") if isinstance(state,dict) else None
+    return {"id":files.generation_id,"generated_at":manifest["generated_at"],"checked_at":state.get("checked_at",manifest["generated_at"]) if isinstance(state,dict) else manifest["generated_at"],"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and isinstance(code,str) else ())
 
-
-def _matches_product(product: Product, row: dict[str, object], query: SearchQuery) -> bool:
-    if product.total_quantity < query.min_total_quantity:
-        return False
-    if query.size is not None:
-        size = _known_text(row.get("size"))
-        if size is None or normalize_tire_size(size) != query.size:
-            return False
-    for field in _PRODUCT_FILTERS:
-        expected = getattr(query, field)
-        if expected is None:
-            continue
-        actual = product.product_type if field == "product_type" else _known_text(row.get(field))
-        if actual != expected:
-            return False
+def _product(row: dict[str,object], ident: str) -> Product:
+    chars=row.get("characteristics",{});
+    if not isinstance(chars,dict): raise StockError("manifest_invalid","Некорректные данные товаров",3)
+    public={k:v for k,v in chars.items() if k in _PUBLIC_CHARS and isinstance(v,str) and len(v)<=_MAX_TEXT}
+    return Product(ident,_text(row.get("name")),_text(row.get("article")),_text(row.get("product_type")),public,_int(row.get("total_quantity")),_unknown(ident,row,chars))
+def _match_product(p: Product,row: dict[str,object],q: SearchQuery) -> bool:
+    if p.total_quantity<q.min_total_quantity:return False
+    if q.size is not None and (not isinstance(row.get("size"),str) or normalize_tire_size(row["size"])!=q.size):return False
+    for field in ("product_type","season","spikes","run_flat","disk_type","truck_axis","truck_construction"):
+        if (wanted:=getattr(q,field)) is not None and (p.product_type if field=="product_type" else row.get(field))!=wanted:return False
     return True
-
-
-def _resolve_offer_product_id(row: dict[str, object], field: str) -> str:
-    value = row.get(field)
-    if not isinstance(value, (str, int)) or isinstance(value, bool) or str(value) == "":
-        raise StockError("query_invalid", "У предложения отсутствует идентификатор товара", 4)
+def _offer_id(row: dict[str,object],field:str)->str:
+    value=row.get(field)
+    if not isinstance(value,(str,int)) or isinstance(value,bool) or not str(value):raise StockError("query_invalid","У предложения отсутствует идентификатор товара",4)
     return str(value)
-
-
-def _offer_from_row(row: dict[str, object]) -> Offer:
-    price = _decimal(row.get("price"), "Некорректные данные предложений")
-    if price < 0:
-        raise StockError("manifest_invalid", "Некорректные данные предложений", 3)
-    return Offer(
-        supplier=_required_text(row, "supplier", "Некорректные данные предложений"),
-        price=price,
-        delivery_days=_nonnegative_int(row.get("delivery_days"), "Некорректные данные предложений"),
-        quantity=_nonnegative_int(row.get("quantity"), "Некорректные данные предложений"),
-    )
-
-
-def _matches_offer(offer: Offer, query: SearchQuery) -> bool:
-    if query.supplier is not None and offer.supplier != query.supplier:
-        return False
-    if query.max_price is not None and offer.price > query.max_price:
-        return False
-    if query.max_delivery_days is not None and offer.delivery_days > query.max_delivery_days:
-        return False
-    return True
-
-
-def _product_sort_key(product: Product, offers: tuple[Offer, ...]) -> tuple[bool, Decimal, int, str]:
-    if not offers:
-        return True, Decimal(0), -product.total_quantity, product.product_id
-    return False, offers[0].price, -product.total_quantity, product.product_id
-
-
-def _unknown_characteristics(
-    product_id: str, row: dict[str, object], characteristics: dict[str, object]
-) -> tuple[dict[str, str], ...]:
-    unknown: list[dict[str, str]] = []
-    for field in ("spikes", "run_flat", "disk_type", "truck_axis", "truck_construction"):
-        status = _status(row.get(field))
-        if status is not None:
-            unknown.append({"product_id": product_id, "characteristic": field, "status": status})
-    for field, value in characteristics.items():
-        status = _status(value)
-        if status is not None:
-            unknown.append({"product_id": product_id, "characteristic": str(field), "status": status})
-    return tuple(unknown)
-
-
-def _public_characteristics(value: dict[str, object]) -> dict[str, object]:
-    return {str(key): item for key, item in value.items()}
-
-
-def _status(value: object) -> str | None:
-    if not isinstance(value, dict):
-        return None
-    status = value.get("status")
-    return status if isinstance(status, str) and status in _UNKNOWN_STATUSES else None
-
-
-def _known_text(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
+def _offer(row:dict[str,object])->Offer:return Offer(_text(row.get("supplier")),_decimal(row.get("price")),_int(row.get("delivery_days")),_int(row.get("quantity")))
+def _match_offer(o:Offer,q:SearchQuery)->bool:return (q.supplier is None or o.supplier==q.supplier) and (q.max_price is None or o.price<=q.max_price) and (q.max_delivery_days is None or o.delivery_days<=q.max_delivery_days)
+def _unknown(ident:str,row:dict[str,object],chars:dict[str,object])->tuple[dict[str,str],...]:
+    result=[]
+    for field,value in list((x,row.get(x)) for x in ("size","season","spikes","run_flat","disk_type","truck_axis","truck_construction"))+list(chars.items()):
+        if isinstance(value,dict) and value.get("status") in _UNKNOWN:result.append({"product_id":ident,"characteristic":field,"status":value["status"]})
+    return tuple(result)
+def _text(value:object)->str:
+    if not isinstance(value,str) or not value or len(value)>_MAX_TEXT:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return value
-
-
-def _required_text(row: dict[str, object], field: str, message: str) -> str:
-    value = row.get(field)
-    if not isinstance(value, str) or not value:
-        raise StockError("manifest_invalid", message, 3)
-    return value
-
-
-def _nonnegative_int(value: object, message: str) -> int:
-    if isinstance(value, bool):
-        raise StockError("manifest_invalid", message, 3)
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise StockError("manifest_invalid", message, 3) from error
-    if parsed < 0:
-        raise StockError("manifest_invalid", message, 3)
-    return parsed
-
-
-def _decimal(value: object, message: str) -> Decimal:
-    if isinstance(value, bool):
-        raise StockError("manifest_invalid", message, 3)
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as error:
-        raise StockError("manifest_invalid", message, 3) from error
-    if not parsed.is_finite():
-        raise StockError("manifest_invalid", message, 3)
-    return parsed
-
-
-def _decimal_text(value: Decimal) -> str:
-    return format(value.normalize(), "f") if value != value.to_integral() else str(value.quantize(Decimal(1)))
-
-
-def _parse_json(value: str) -> object:
-    return json.loads(value, parse_constant=_reject_nonfinite_json)
-
-
-def _reject_nonfinite_json(value: str) -> object:
-    raise ValueError(f"Unsupported JSON constant: {value}")
+def _int(value:object)->int:
+    try: result=int(value)
+    except (TypeError,ValueError,OverflowError) as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
+    if isinstance(value,bool) or result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    return result
+def _decimal(value:object)->Decimal:
+    try: result=Decimal(str(value))
+    except (InvalidOperation,TypeError,ValueError) as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
+    if not result.is_finite() or result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    return result
+def _price_text(value:Decimal)->str:return format(value,"f")
+def _decimal_compare(a:str,b:str)->int:return (_decimal(a)>_decimal(b))-(_decimal(a)<_decimal(b))
+def _parse(value:str)->object:
+    parsed=json.loads(value,object_pairs_hook=_unique,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
+def _finite(value:object)->None:
+    if isinstance(value,float) and not math.isfinite(value): raise ValueError("non-finite")
+    if isinstance(value,dict):
+        for item in value.values(): _finite(item)
+    elif isinstance(value,list):
+        for item in value: _finite(item)
+def _unique(pairs:list[tuple[str,object]])->dict[str,object]:
+    result={}
+    for key,value in pairs:
+        if key in result:raise ValueError("duplicate")
+        result[key]=value
+    return result

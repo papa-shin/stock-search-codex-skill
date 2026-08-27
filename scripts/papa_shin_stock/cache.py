@@ -116,6 +116,8 @@ class CacheState:
     manifest_last_modified: str | None
     directory_name: str
     files: GenerationFiles
+    stale: bool = False
+    warning_code: str | None = None
 
     @classmethod
     def load(
@@ -161,6 +163,8 @@ class CacheState:
         checked_at = value.get("checked_at")
         manifest_etag = value.get("manifest_etag")
         manifest_last_modified = value.get("manifest_last_modified")
+        stale = value.get("stale", False)
+        warning_code = value.get("warning_code")
         if generation_id != pointer.generation_id:
             raise _cache_unavailable()
         if not isinstance(generated_at, str) or not generated_at:
@@ -173,6 +177,8 @@ class CacheState:
             manifest_last_modified, str
         ):
             raise _cache_unavailable()
+        if not isinstance(stale, bool) or (warning_code is not None and not isinstance(warning_code, str)):
+            raise _cache_unavailable()
         return cls(
             generation_id=generation_id,
             generated_at=generated_at,
@@ -181,6 +187,8 @@ class CacheState:
             manifest_last_modified=manifest_last_modified,
             directory_name=pointer.directory_name,
             files=files,
+            stale=stale,
+            warning_code=warning_code,
         )
 
 
@@ -258,8 +266,8 @@ class RefreshResult:
             generation_id=state.generation_id,
             generated_at=state.generated_at,
             checked_at=state.checked_at,
-            stale=stale,
-            warning_code=warning_code,
+            stale=stale or state.stale,
+            warning_code=warning_code or state.warning_code,
         )
 
     def to_public_dict(self) -> dict[str, object]:
@@ -556,6 +564,7 @@ class StockCache:
         except StockError as error:
             previous = self._load_if_readable()
             if previous is not None:
+                previous = self._record_runtime_status(previous, True, error.code)
                 return RefreshResult.from_state(
                     "stale_cache",
                     previous,
@@ -567,6 +576,7 @@ class StockCache:
             failure = _cache_unavailable()
             previous = self._load_if_readable()
             if previous is not None:
+                previous = self._record_runtime_status(previous, True, failure.code)
                 return RefreshResult.from_state(
                     "stale_cache",
                     previous,
@@ -580,6 +590,26 @@ class StockCache:
         if state is None:
             raise _cache_unavailable()
         return state.files
+
+    def _record_runtime_status(
+        self, state: CacheState, stale: bool, warning_code: str | None
+    ) -> CacheState:
+        _write_json_atomic(
+            state.files.manifest.parent / "state.json",
+            {
+                "generation_id": state.generation_id,
+                "generated_at": state.generated_at,
+                "checked_at": state.checked_at,
+                "manifest_etag": state.manifest_etag,
+                "manifest_last_modified": state.manifest_last_modified,
+                "stale": stale,
+                "warning_code": warning_code,
+            },
+        )
+        refreshed = CacheState.load(self.root)
+        if refreshed is None:
+            raise _cache_unavailable()
+        return refreshed
 
     def _load_if_readable(
         self, progress: Callable[[], None] | None = None
@@ -643,6 +673,8 @@ class StockCache:
             "checked_at": checked_at,
             "manifest_etag": _header(response.headers, "etag"),
             "manifest_last_modified": _header(response.headers, "last-modified"),
+            "stale": False,
+            "warning_code": None,
         }
         _write_json_atomic(staged.manifest.parent / "state.json", state_value)
         _fsync_directory(staged.manifest.parent)
