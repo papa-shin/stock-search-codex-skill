@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -15,6 +16,10 @@ from papa_shin_stock.errors import StockError
 
 
 Origin = tuple[str, str, int | None]
+_SOCKET_TIMEOUT_SECONDS = 30.0
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,16 +37,25 @@ class DownloadReceipt:
 
 def normalized_origin(url: str) -> Origin:
     """Return a canonical URL origin without preserving credentials or paths."""
+    if not isinstance(url, str) or _has_unsafe_url_character(url):
+        raise _invalid_file_url()
     try:
         parsed = urlsplit(url)
         scheme = parsed.scheme.lower()
         hostname = parsed.hostname
         port = parsed.port
-    except (TypeError, ValueError) as error:
-        raise StockError("manifest_invalid", "Некорректный адрес файла", 3) from error
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise _invalid_file_url() from error
 
-    if scheme not in {"http", "https"} or hostname is None:
-        raise StockError("manifest_invalid", "Некорректный адрес файла", 3)
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or port == 0
+    ):
+        raise _invalid_file_url()
 
     normalized_port = None if port in {None, 80 if scheme == "http" else 443} else port
     return scheme, hostname.lower(), normalized_port
@@ -66,7 +80,11 @@ class RejectCrossOriginRedirect(urllib.request.HTTPRedirectHandler):
         headers: object,
         newurl: str,
     ) -> urllib.request.Request | None:
-        if normalized_origin(newurl) != self.allowed_origin:
+        try:
+            redirect_origin = normalized_origin(newurl)
+        except StockError as error:
+            raise _network_error() from error
+        if redirect_origin != self.allowed_origin:
             raise StockError("network_error", "Перенаправление на другой сервер запрещено", 3)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -74,7 +92,10 @@ class RejectCrossOriginRedirect(urllib.request.HTTPRedirectHandler):
 class SafeHttpClient:
     def __init__(self, config: StockConfig) -> None:
         self.config = config
-        self.origin = normalized_origin(config.manifest_url)
+        try:
+            self.origin = normalized_origin(config.manifest_url)
+        except StockError as error:
+            raise StockError("config_invalid", "Некорректная конфигурация", 2) from error
         if self.origin[0] != "https":
             raise StockError("config_invalid", "Для загрузки требуется HTTPS", 2)
         self._opener = urllib.request.build_opener(
@@ -93,15 +114,22 @@ class SafeHttpClient:
     def get_manifest(
         self, etag: str | None = None, last_modified: str | None = None
     ) -> HttpResponse:
-        response = self._open_same_origin(
-            self.config.manifest_url, self._conditional_headers(etag, last_modified)
-        )
-        with response:
-            status = getattr(response, "status", None)
-            if status is None:
-                status = response.getcode()
-            headers = dict(response.headers.items())
-            body = response.read()
+        try:
+            response = self._open_same_origin(
+                self.config.manifest_url,
+                self._conditional_headers(etag, last_modified),
+            )
+            with response:
+                status = _response_status(response)
+                _raise_for_http_status(status, allow_not_modified=True)
+                headers = dict(response.headers.items())
+                body = response.read(_MAX_MANIFEST_BYTES + 1)
+        except StockError:
+            raise
+        except _NETWORK_EXCEPTIONS as error:
+            raise _network_error() from error
+        if len(body) > _MAX_MANIFEST_BYTES:
+            raise StockError("manifest_invalid", "Некорректный manifest", 3)
         return HttpResponse(status=status, headers=headers, body=body)
 
     def download(
@@ -112,31 +140,44 @@ class SafeHttpClient:
         expected_sha256: str,
         progress: Callable[[], None] | None = None,
     ) -> DownloadReceipt:
+        if (
+            type(expected_bytes) is not int
+            or expected_bytes < 0
+            or expected_bytes > _MAX_DOWNLOAD_BYTES
+        ):
+            raise StockError("manifest_invalid", "Некорректный manifest", 3)
         resolved = assert_allowed_download_url(self.config.manifest_url, url)
         digest = hashlib.sha256()
         received = 0
         try:
             with self._open_same_origin(resolved, {}) as response, destination.open("wb") as output:
-                while chunk := response.read(1024 * 1024):
+                _raise_for_http_status(
+                    _response_status(response),
+                    allow_not_modified=False,
+                )
+                while received < expected_bytes:
+                    chunk = response.read(
+                        min(_DOWNLOAD_CHUNK_BYTES, expected_bytes - received)
+                    )
+                    if not chunk:
+                        break
                     output.write(chunk)
                     digest.update(chunk)
                     received += len(chunk)
                     if progress is not None:
                         progress()
+                if received == expected_bytes and response.read(1):
+                    raise _download_integrity_error()
         except StockError:
             destination.unlink(missing_ok=True)
             raise
-        except OSError as error:
+        except _NETWORK_EXCEPTIONS as error:
             destination.unlink(missing_ok=True)
-            raise StockError("network_error", "Не удалось загрузить файл", 3) from error
+            raise _network_error() from error
 
         if received != expected_bytes or digest.hexdigest() != expected_sha256:
             destination.unlink(missing_ok=True)
-            raise StockError(
-                "download_integrity_failed",
-                "Проверка загруженного файла не пройдена",
-                5,
-            )
+            raise _download_integrity_error()
         return DownloadReceipt(bytes=received, sha256=digest.hexdigest())
 
     @staticmethod
@@ -157,12 +198,64 @@ class SafeHttpClient:
         request_headers = dict(headers)
         credentials = f"{self.config.username}:{self.config.password}".encode("utf-8")
         request_headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
-        request = urllib.request.Request(url, headers=request_headers)
         try:
-            return self._opener.open(request)
+            request = urllib.request.Request(url, headers=request_headers)
+            return self._opener.open(request, timeout=_SOCKET_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as error:
             if error.code == 304:
                 return error
-            raise StockError("network_error", "Не удалось выполнить сетевой запрос", 3) from error
-        except (OSError, urllib.error.URLError) as error:
-            raise StockError("network_error", "Не удалось выполнить сетевой запрос", 3) from error
+            if error.code in {401, 403}:
+                raise StockError("auth_failed", "Не удалось подтвердить доступ", 3) from error
+            raise _network_error() from error
+        except StockError:
+            raise
+        except _NETWORK_EXCEPTIONS as error:
+            raise _network_error() from error
+
+
+_NETWORK_EXCEPTIONS = (
+    OSError,
+    ValueError,
+    urllib.error.URLError,
+    http.client.HTTPException,
+)
+
+
+def _response_status(response: object) -> int:
+    status = getattr(response, "status", None)
+    if status is None:
+        status = response.getcode()
+    if type(status) is not int:
+        raise _network_error()
+    return status
+
+
+def _raise_for_http_status(status: int, *, allow_not_modified: bool) -> None:
+    if 200 <= status < 300 or (allow_not_modified and status == 304):
+        return
+    if status in {401, 403}:
+        raise StockError("auth_failed", "Не удалось подтвердить доступ", 3)
+    raise _network_error()
+
+
+def _has_unsafe_url_character(value: str) -> bool:
+    return any(
+        ord(character) <= 32 or 127 <= ord(character) <= 159
+        for character in value
+    )
+
+
+def _invalid_file_url() -> StockError:
+    return StockError("manifest_invalid", "Некорректный адрес файла", 3)
+
+
+def _network_error() -> StockError:
+    return StockError("network_error", "Не удалось выполнить сетевой запрос", 3)
+
+
+def _download_integrity_error() -> StockError:
+    return StockError(
+        "download_integrity_failed",
+        "Проверка загруженного файла не пройдена",
+        5,
+    )

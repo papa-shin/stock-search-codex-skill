@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ from email.message import Message
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 
@@ -37,13 +38,22 @@ class FakeResponse:
         self._body = body
         self.status = status
         self.headers = headers or {}
+        self.bytes_read = 0
+        self.read_sizes: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
         if size < 0:
             result, self._body = self._body, b""
+            self.bytes_read += len(result)
             return result
         result, self._body = self._body[:size], self._body[size:]
+        self.bytes_read += len(result)
         return result
+
+    @property
+    def remaining_bytes(self) -> int:
+        return len(self._body)
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -56,17 +66,30 @@ class RecordingOpener:
     def __init__(self, responses: list[FakeResponse]) -> None:
         self._responses = responses
         self.requests: list[Request] = []
+        self.timeouts: list[float | None] = []
 
     def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
         self.requests.append(request)
+        self.timeouts.append(timeout)
         return self._responses.pop(0)
 
 
 class RaisingOpener:
-    def __init__(self, error: HTTPError) -> None:
+    def __init__(self, error: BaseException) -> None:
         self.error = error
+        self.timeouts: list[float | None] = []
 
     def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
+        self.timeouts.append(timeout)
+        raise self.error
+
+
+class RaisingReadResponse(FakeResponse):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, size: int = -1) -> bytes:
         raise self.error
 
 
@@ -118,6 +141,26 @@ class SafeHttpSecurityTest(unittest.TestCase):
             ("https", "stock.example.test", None),
         )
 
+    def test_download_url_rejects_userinfo_controls_and_invalid_ports(self) -> None:
+        invalid_urls = (
+            "https://user:password@stock.example.test/products.jsonl",
+            "https://stock.example.test/products\tname.jsonl",
+            "https://stock.example.test:invalid/products.jsonl",
+            "https://stock.example.test:65536/products.jsonl",
+            "https://stock.example.test/products\u0085name.jsonl",
+        )
+
+        for candidate_url in invalid_urls:
+            with self.subTest(candidate_url=candidate_url):
+                with self.assertRaisesRegex(StockError, "manifest_invalid") as raised:
+                    assert_allowed_download_url(
+                        self.https_config.manifest_url,
+                        candidate_url,
+                    )
+
+                self.assertNotIn("user:password", str(raised.exception))
+                self.assertNotIn("products", str(raised.exception))
+
     def test_manifest_request_uses_conditional_headers_and_origin_bound_auth(self) -> None:
         opener = RecordingOpener(
             [FakeResponse(b"", status=304, headers={"ETag": '"v2"'})]
@@ -134,6 +177,21 @@ class SafeHttpSecurityTest(unittest.TestCase):
         self.assertEqual(request.get_header("If-modified-since"), "Tue, 01 Sep 2026 00:00:00 GMT")
         expected_authorization = base64.b64encode(b"test-user:test-password").decode("ascii")
         self.assertEqual(request.get_header("Authorization"), f"Basic {expected_authorization}")
+        self.assertEqual(opener.timeouts, [30.0])
+
+    def test_download_request_uses_finite_socket_timeout(self) -> None:
+        payload = b"safe\n"
+        opener = RecordingOpener([FakeResponse(payload)])
+        client = self.client_with_opener(opener)
+
+        client.download(
+            "https://stock.example.test/products.jsonl",
+            self.directory / "products.jsonl",
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+        self.assertEqual(opener.timeouts, [30.0])
 
     def test_manifest_returns_real_http_error_304_as_response(self) -> None:
         headers = Message()
@@ -152,6 +210,106 @@ class SafeHttpSecurityTest(unittest.TestCase):
         self.assertEqual(response.status, 304)
         self.assertEqual(response.headers, {"ETag": '"v2"'})
         self.assertEqual(response.body, b"")
+
+    def test_auth_http_errors_have_distinct_safe_code(self) -> None:
+        for status in (401, 403):
+            with self.subTest(status=status):
+                error = HTTPError(
+                    "https://private.example.test/secret-path",
+                    status,
+                    "private response",
+                    Message(),
+                    BytesIO(b"private body"),
+                )
+                client = self.client_with_opener(RaisingOpener(error))
+
+                with self.assertRaisesRegex(StockError, "auth_failed") as raised:
+                    client.get_manifest()
+
+                self.assertEqual(raised.exception.exit_code, 3)
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_other_http_errors_are_safe_network_errors(self) -> None:
+        for status in (400, 404, 429, 500):
+            with self.subTest(status=status):
+                error = HTTPError(
+                    "https://private.example.test/secret-path",
+                    status,
+                    "private response",
+                    Message(),
+                    BytesIO(b"private body"),
+                )
+                client = self.client_with_opener(RaisingOpener(error))
+
+                with self.assertRaisesRegex(StockError, "network_error") as raised:
+                    client.get_manifest()
+
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_url_lifecycle_errors_are_normalized_without_details(self) -> None:
+        errors = (
+            http.client.InvalidURL("private URL"),
+            http.client.BadStatusLine("private response line"),
+            http.client.HTTPException("private protocol state"),
+            URLError("private network reason"),
+            ValueError("private URL state"),
+            OSError("private socket state"),
+        )
+
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                client = self.client_with_opener(RaisingOpener(error))
+
+                with self.assertRaisesRegex(StockError, "network_error") as raised:
+                    client.get_manifest()
+
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_incomplete_manifest_read_is_normalized_without_details(self) -> None:
+        error = http.client.IncompleteRead(
+            partial=b"private partial body",
+            expected=1024,
+        )
+        client = self.client_with_opener(
+            RecordingOpener([RaisingReadResponse(error)])
+        )
+
+        with self.assertRaisesRegex(StockError, "network_error") as raised:
+            client.get_manifest()
+
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_incomplete_download_read_is_safe_and_removes_partial_file(self) -> None:
+        destination = self.directory / "partial.jsonl"
+        error = http.client.IncompleteRead(
+            partial=b"private partial body",
+            expected=1024,
+        )
+        client = self.client_with_opener(
+            RecordingOpener([RaisingReadResponse(error)])
+        )
+
+        with self.assertRaisesRegex(StockError, "network_error") as raised:
+            client.download(
+                "https://stock.example.test/products.jsonl",
+                destination,
+                expected_bytes=1024,
+                expected_sha256="0" * 64,
+            )
+
+        self.assertNotIn("private", str(raised.exception))
+        self.assertFalse(destination.exists())
+
+    def test_manifest_body_is_bounded_before_full_consumption(self) -> None:
+        payload = b"x" * (3 * 1024 * 1024)
+        response = FakeResponse(payload)
+        client = self.client_with_opener(RecordingOpener([response]))
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            client.get_manifest()
+
+        self.assertEqual(response.bytes_read, 1024 * 1024 + 1)
+        self.assertGreater(response.remaining_bytes, 0)
 
     def test_cross_origin_request_does_not_reach_opener_or_send_credentials(self) -> None:
         opener = RecordingOpener([])
@@ -241,6 +399,51 @@ class SafeHttpSecurityTest(unittest.TestCase):
             )
 
         self.assertFalse(destination.exists())
+
+    def test_download_stops_on_first_byte_over_expected_size(self) -> None:
+        payload = b"x" * (3 * 1024 * 1024)
+        response = FakeResponse(payload)
+        destination = self.directory / "oversized.jsonl"
+        client = self.client_with_opener(RecordingOpener([response]))
+
+        with self.assertRaisesRegex(StockError, "download_integrity_failed"):
+            client.download(
+                "https://stock.example.test/oversized.jsonl",
+                destination,
+                expected_bytes=1,
+                expected_sha256=hashlib.sha256(b"x").hexdigest(),
+            )
+
+        self.assertEqual(response.bytes_read, 2)
+        self.assertEqual(response.remaining_bytes, len(payload) - 2)
+        self.assertFalse(destination.exists())
+
+    def test_download_rejects_absurd_manifest_size_before_request(self) -> None:
+        opener = RecordingOpener([])
+        client = self.client_with_opener(opener)
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            client.download(
+                "https://stock.example.test/products.jsonl",
+                self.directory / "products.jsonl",
+                expected_bytes=1 << 50,
+                expected_sha256="0" * 64,
+            )
+
+        self.assertEqual(opener.requests, [])
+
+    def test_download_allows_large_commercial_dataset_size(self) -> None:
+        client = self.client_with_opener(
+            RaisingOpener(URLError("synthetic offline"))
+        )
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            client.download(
+                "https://stock.example.test/products.jsonl",
+                self.directory / "products.jsonl",
+                expected_bytes=4 * 1024 * 1024 * 1024,
+                expected_sha256="0" * 64,
+            )
 
 
 class FetchStockCliTest(unittest.TestCase):
@@ -362,6 +565,44 @@ class FetchStockCliTest(unittest.TestCase):
             },
         )
         self.assertNotIn("synthetic-password", output.getvalue())
+
+    def test_missing_config_prints_distinct_safe_json_envelope(self) -> None:
+        result = self.run_cli([])
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "status": "error",
+                "error": {
+                    "code": "config_missing",
+                    "message": "Файл конфигурации не найден",
+                },
+            },
+        )
+        self.assertNotIn("absent.env", result.stdout)
+
+    def test_auth_error_prints_safe_json_envelope(self) -> None:
+        output = StringIO()
+        error = StockError("auth_failed", "Не удалось подтвердить доступ", 3)
+
+        with patch.object(fetch_stock, "refresh_default", side_effect=error):
+            with redirect_stdout(output):
+                exit_code = fetch_stock.main()
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "error",
+                "error": {
+                    "code": "auth_failed",
+                    "message": "Не удалось подтвердить доступ",
+                },
+            },
+        )
 
     def test_huge_integer_manifest_is_normalized_to_safe_json_error(self) -> None:
         output = StringIO()

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -55,18 +56,98 @@ class StockConfigTest(unittest.TestCase):
         self.assertNotIn("test-password", str(raised.exception))
 
     def test_load_accepts_comments_quotes_and_optional_cache_directory(self) -> None:
+        cache_directory = self.directory / "cache" / "stock"
         config_path = self.write_env(
             "# literal configuration only\n"
             + self.complete_env(
                 "PAPA_SHIN_STOCK_USERNAME='quoted user'\n"
-                "PAPA_SHIN_STOCK_CACHE_DIR=cache/stock\n"
+                f"PAPA_SHIN_STOCK_CACHE_DIR={cache_directory}\n"
             )
         )
 
         config = StockConfig.load(config_path)
 
         self.assertEqual(config.username, "quoted user")
-        self.assertEqual(config.cache_dir, Path("cache/stock"))
+        self.assertEqual(config.cache_dir, cache_directory.resolve())
+
+    def test_missing_config_file_has_distinct_safe_error(self) -> None:
+        missing_path = self.directory / "private-secret-name.env"
+
+        with self.assertRaisesRegex(StockError, "config_missing") as raised:
+            StockConfig.load(missing_path)
+
+        self.assertEqual(raised.exception.exit_code, 2)
+        self.assertNotIn(str(missing_path), str(raised.exception))
+
+    def test_unreadable_config_file_remains_safe_invalid_error(self) -> None:
+        config_path = self.directory / "private-secret-name.env"
+
+        with patch.object(Path, "read_text", side_effect=PermissionError(config_path)):
+            with self.assertRaisesRegex(StockError, "config_invalid") as raised:
+                StockConfig.load(config_path)
+
+        self.assertNotIn(str(config_path), str(raised.exception))
+
+    def test_manifest_url_is_validated_during_config_load(self) -> None:
+        invalid_urls = (
+            "http://example.test/manifest.json",
+            "https://user:password@example.test/manifest.json",
+            "https://example.test:invalid/manifest.json",
+            "https://example.test:65536/manifest.json",
+            "https://example.test/manifest\tname.json",
+            "https://example.test/manifest\u0085name.json",
+        )
+
+        for manifest_url in invalid_urls:
+            with self.subTest(manifest_url=manifest_url):
+                config_path = self.write_env(
+                    self.complete_env(
+                        f"PAPA_SHIN_STOCK_MANIFEST_URL={manifest_url}\n"
+                    )
+                )
+
+                with self.assertRaisesRegex(StockError, "config_invalid") as raised:
+                    StockConfig.load(config_path)
+
+                self.assertNotIn("user:password", str(raised.exception))
+                self.assertNotIn(manifest_url, str(raised.exception))
+
+    def test_relative_cache_directory_is_rejected_without_path_disclosure(self) -> None:
+        config_path = self.write_env(
+            self.complete_env("PAPA_SHIN_STOCK_CACHE_DIR=relative/private/cache\n")
+        )
+
+        with self.assertRaisesRegex(StockError, "config_invalid") as raised:
+            StockConfig.load(config_path)
+
+        self.assertNotIn("relative/private/cache", str(raised.exception))
+
+    def test_cache_directory_inside_skill_package_is_rejected(self) -> None:
+        private_path = SCRIPTS_DIR.parent / "private-cache"
+        config_path = self.write_env(
+            self.complete_env(f"PAPA_SHIN_STOCK_CACHE_DIR={private_path}\n")
+        )
+
+        with self.assertRaisesRegex(StockError, "config_invalid") as raised:
+            StockConfig.load(config_path)
+
+        self.assertNotIn(str(private_path), str(raised.exception))
+
+    def test_cache_directory_symlink_resolving_inside_skill_is_rejected(self) -> None:
+        package_alias = self.directory / "package-alias"
+        try:
+            package_alias.symlink_to(SCRIPTS_DIR.parent, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlink недоступен: {type(error).__name__}")
+        private_path = package_alias / "private-cache"
+        config_path = self.write_env(
+            self.complete_env(f"PAPA_SHIN_STOCK_CACHE_DIR={private_path}\n")
+        )
+
+        with self.assertRaisesRegex(StockError, "config_invalid") as raised:
+            StockConfig.load(config_path)
+
+        self.assertNotIn(str(private_path), str(raised.exception))
 
     def test_load_rejects_non_assignment_line_with_safe_error(self) -> None:
         config_path = self.write_env(self.complete_env("source unsafe.env\n"))
@@ -83,7 +164,13 @@ class StockConfigTest(unittest.TestCase):
     def test_resolve_product_id_rejects_missing_or_empty_value(self) -> None:
         config = StockConfig.load(self.write_env(self.complete_env()))
 
-        for row in ({}, {"product_id": ""}, {"product_id": None}):
+        for row in (
+            {},
+            {"product_id": ""},
+            {"product_id": None},
+            {"product_id": True},
+            {"product_id": 1.5},
+        ):
             with self.subTest(row=row):
                 with self.assertRaisesRegex(StockError, "query_invalid") as raised:
                     config.resolve_product_id(row)
