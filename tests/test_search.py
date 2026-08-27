@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
@@ -633,11 +633,15 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
     def test_failure_then_304_is_visible_to_search_with_read_only_generation(self) -> None:
         class FailingClient:
-            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+            def get_manifest(
+                self, etag: str | None, modified: str | None
+            ) -> HttpResponse:
                 raise StockError("network_error", "Не удалось обновить данные", 3)
 
         class NotModifiedClient:
-            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+            def get_manifest(
+                self, etag: str | None, modified: str | None
+            ) -> HttpResponse:
                 return HttpResponse(status=304, headers={}, body=b"")
 
         immutable_state = (self.generation / "state.json").read_bytes()
@@ -668,6 +672,155 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.assertEqual(fresh_public["warnings"], [])
         self.assertEqual((self.generation / "state.json").read_bytes(), immutable_state)
 
+    def test_failure_then_304_then_failure_keeps_latest_checked_at(self) -> None:
+        class FailingClient:
+            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+                raise StockError("network_error", "Не удалось обновить данные", 3)
+
+        class NotModifiedClient:
+            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+                return HttpResponse(status=304, headers={}, body=b"")
+
+        initial_checked_at = self.public_search()["generation"]["checked_at"]
+        StockCache(self.cache_root, FailingClient()).refresh(self.config)
+        first_stale = self.public_search()
+        StockCache(self.cache_root, NotModifiedClient()).refresh(self.config)
+        fresh = self.public_search()
+        StockCache(self.cache_root, FailingClient()).refresh(self.config)
+        second_stale = self.public_search()
+
+        self.assertEqual(first_stale["generation"]["checked_at"], initial_checked_at)
+        self.assertNotEqual(fresh["generation"]["checked_at"], initial_checked_at)
+        self.assertFalse(fresh["generation"]["stale"])
+        self.assertEqual(
+            second_stale["generation"]["checked_at"],
+            fresh["generation"]["checked_at"],
+        )
+        self.assertTrue(second_stale["generation"]["stale"])
+
+    def test_runtime_directory_symlink_cannot_read_outside_cache_root(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside-runtime"
+        outside.mkdir()
+        (outside / "generation-existing.json").write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": "2026-08-27T11:00:00+00:00",
+                    "stale": True,
+                    "warning_code": "network_error",
+                }
+            ),
+            encoding="utf-8",
+        )
+        runtime = self.cache_root / "runtime"
+        try:
+            runtime.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+
+    def test_runtime_directory_symlink_cannot_write_outside_cache_root(self) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        outside = Path(self.temp_dir.name) / "outside-runtime"
+        outside.mkdir()
+        runtime = self.cache_root / "runtime"
+        try:
+            runtime.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, object())._record_runtime_status(
+                state, True, "network_error"
+            )
+
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_dangling_runtime_status_symlink_is_rejected(self) -> None:
+        runtime = self.cache_root / "runtime"
+        runtime.mkdir()
+        status = runtime / "generation-existing.json"
+        try:
+            status.symlink_to(runtime / "missing-status.json")
+        except OSError as error:
+            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+
+    def test_runtime_status_symlink_is_rejected_before_write(self) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        runtime = self.cache_root / "runtime"
+        runtime.mkdir()
+        outside = Path(self.temp_dir.name) / "outside-status.json"
+        outside.write_text("sentinel", encoding="utf-8")
+        status = runtime / "generation-existing.json"
+        try:
+            status.symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, object())._record_runtime_status(
+                state, True, "network_error"
+            )
+
+        self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
+
+    def test_runtime_lstat_failure_is_safe_cache_error(self) -> None:
+        runtime = self.cache_root / "runtime"
+        real_lstat = Path.lstat
+
+        def fail_runtime_lstat(path: Path) -> object:
+            if path == runtime:
+                raise PermissionError("/private/cache/runtime")
+            return real_lstat(path)
+
+        with patch.object(Path, "lstat", fail_runtime_lstat):
+            with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:
+                CacheState.load(self.cache_root)
+
+        self.assertNotIn("/private/", str(raised.exception))
+
+    def test_runtime_fstat_and_close_failures_stay_safe(self) -> None:
+        runtime = self.cache_root / "runtime" / "generation-existing.json"
+        runtime.parent.mkdir()
+        runtime.write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "stale": True,
+                    "warning_code": "network_error",
+                }
+            ),
+            encoding="utf-8",
+        )
+        real_close = cache_module.os.close
+
+        def close_then_fail(descriptor: int) -> None:
+            real_close(descriptor)
+            raise PermissionError("/private/cache/runtime/close")
+
+        with patch.object(
+            cache_module.os,
+            "fstat",
+            side_effect=PermissionError("/private/cache/runtime/fstat"),
+        ):
+            with patch.object(cache_module.os, "close", side_effect=close_then_fail):
+                with self.assertRaisesRegex(
+                    StockError, "cache_unavailable"
+                ) as raised:
+                    CacheState.load(self.cache_root)
+
+        self.assertNotIn("/private/", str(raised.exception))
+
     def test_runtime_status_write_failure_is_safe(self) -> None:
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
@@ -697,14 +850,14 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        real_read_text = Path.read_text
+        real_open = cache_module.os.open
 
-        def fail_runtime_read(path: Path, *args: object, **kwargs: object) -> str:
-            if path == runtime:
+        def fail_runtime_read(path: object, flags: int, *args: object) -> int:
+            if Path(path) == runtime:
                 raise PermissionError("/private/cache/runtime/status.json")
-            return real_read_text(path, *args, **kwargs)
+            return real_open(path, flags, *args)
 
-        with patch.object(Path, "read_text", fail_runtime_read):
+        with patch.object(cache_module.os, "open", fail_runtime_read):
             with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:
                 CacheState.load(self.cache_root)
 
@@ -732,6 +885,14 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
                     "checked_at": "2026-08-27T10:02:00+00:00",
                     "stale": False,
                     "warning_code": "network_error",
+                }
+            ),
+            json.dumps(
+                {
+                    "generation_id": "other-generation",
+                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "stale": False,
+                    "warning_code": None,
                 }
             ),
             '{"generation_id":"synthetic-generation",'
@@ -954,6 +1115,47 @@ class SearchStockCliTest(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(exit_code, 4)
         self.assertEqual(result["error"]["code"], "query_invalid")
+
+    def test_decimal_exponent_boundaries_write_json_without_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary) / "synthetic-generation"
+            generation.mkdir()
+            for name in ("manifest.json", "products.jsonl", "offers.jsonl"):
+                (generation / name).write_bytes((FIXTURES_DIR / name).read_bytes())
+            files = GenerationFiles.from_directory(
+                "synthetic-generation", generation
+            )
+            config = StockConfig(
+                manifest_url="https://stock.example.test/manifest.json",
+                username="synthetic-user",
+                password="synthetic-password",
+                product_id_field="private_product_key",
+                offer_product_id_field="private_offer_product_key",
+                cache_dir=Path(temporary) / "cache",
+            )
+            boundaries = (
+                ("1e128", "1" + "0" * 128),
+                ("1e-128", "0." + "0" * 127 + "1"),
+            )
+
+            for raw, expected in boundaries:
+                with self.subTest(raw=raw):
+                    stdout = StringIO()
+                    stderr = StringIO()
+                    with patch.object(search_stock.StockConfig, "load", return_value=config):
+                        with patch.object(
+                            search_stock.StockCache,
+                            "current_generation",
+                            return_value=files,
+                        ):
+                            with redirect_stdout(stdout), redirect_stderr(stderr):
+                                exit_code = search_stock.main(["--max-price", raw])
+
+                    public = json.loads(stdout.getvalue())
+                    self.assertEqual(exit_code, 0)
+                    self.assertEqual(stderr.getvalue(), "")
+                    self.assertEqual(public["filters"]["max_price"], expected)
+                    self.assertEqual(stdout.getvalue().count("\n"), 1)
 
 
 if __name__ == "__main__":

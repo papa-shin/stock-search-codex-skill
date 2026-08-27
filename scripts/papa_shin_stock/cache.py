@@ -197,9 +197,10 @@ class CacheState:
             manifest_last_modified, str
         ):
             raise _cache_unavailable()
-        runtime_path = _runtime_status_path(cache_dir, pointer.directory_name)
-        if runtime_path.exists():
-            runtime_status = load_runtime_status(runtime_path, pointer.generation_id)
+        runtime_status, runtime_path = _load_optional_runtime_status(
+            cache_dir, pointer.directory_name, pointer.generation_id
+        )
+        if runtime_status is not None and runtime_path is not None:
             files = GenerationFiles.from_directory(
                 pointer.generation_id,
                 generation,
@@ -210,7 +211,7 @@ class CacheState:
         return cls(
             generation_id=generation_id,
             generated_at=generated_at,
-            checked_at=checked_at,
+            checked_at=runtime_status.checked_at,
             manifest_etag=manifest_etag,
             manifest_last_modified=manifest_last_modified,
             directory_name=pointer.directory_name,
@@ -260,10 +261,25 @@ def validate_runtime_status(
 
 
 def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatus:
-    if path.is_symlink() or not path.is_file():
+    observed = _lstat_optional(path)
+    if observed is None or not stat.S_ISREG(observed.st_mode):
         raise _cache_unavailable()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
     try:
-        value = _parse_json(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != observed.st_dev
+            or opened.st_ino != observed.st_ino
+        ):
+            raise _cache_unavailable()
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            value = _parse_json(stream.read())
+    except StockError:
+        raise
     except (
         OSError,
         UnicodeError,
@@ -274,6 +290,12 @@ def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatu
         RecursionError,
     ) as error:
         raise _cache_unavailable() from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise _cache_unavailable() from error
     return validate_runtime_status(value, expected_generation_id)
 
 
@@ -592,6 +614,7 @@ class StockCache:
         self.client = client
 
     def refresh(self, config: StockConfig) -> RefreshResult:
+        previous: CacheState | None = None
         try:
             with CacheLock.acquire(self.root) as lock:
                 previous = self._load_if_readable(lock.heartbeat)
@@ -649,27 +672,15 @@ class StockCache:
                     "updated", state, warning_code=cleanup_warning
                 )
         except StockError as error:
-            previous = self._load_if_readable()
-            if previous is not None:
-                previous = self._record_runtime_status(previous, True, error.code)
-                return RefreshResult.from_state(
-                    "stale_cache",
-                    previous,
-                    stale=True,
-                    warning_code=error.code,
-                )
+            fallback = previous if previous is not None else self._load_if_readable()
+            if fallback is not None:
+                return self._stale_fallback(fallback, error.code)
             raise
         except OSError as error:
             failure = _cache_unavailable()
-            previous = self._load_if_readable()
-            if previous is not None:
-                previous = self._record_runtime_status(previous, True, failure.code)
-                return RefreshResult.from_state(
-                    "stale_cache",
-                    previous,
-                    stale=True,
-                    warning_code=failure.code,
-                )
+            fallback = previous if previous is not None else self._load_if_readable()
+            if fallback is not None:
+                return self._stale_fallback(fallback, failure.code)
             raise failure from error
 
     def current_generation(self) -> GenerationFiles:
@@ -681,6 +692,9 @@ class StockCache:
     def _record_runtime_status(
         self, state: CacheState, stale: bool, warning_code: str | None
     ) -> CacheState:
+        current = CacheState.load(self.root)
+        if current is None or not _same_generation(current, state):
+            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         value = {
             "generation_id": state.generation_id,
             "checked_at": (
@@ -694,14 +708,31 @@ class StockCache:
         validate_runtime_status(value, state.generation_id)
         try:
             _write_json_atomic(
-                _runtime_status_path(self.root, state.directory_name), value
+                _runtime_status_path_for_write(self.root, state.directory_name), value
             )
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
             raise _cache_unavailable() from error
         refreshed = CacheState.load(self.root)
-        if refreshed is None:
-            raise _cache_unavailable()
+        if refreshed is None or not _same_generation(refreshed, state):
+            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         return refreshed
+
+    def _stale_fallback(
+        self, state: CacheState, warning_code: str
+    ) -> RefreshResult:
+        persisted = state
+        if warning_code != "cache_locked":
+            try:
+                persisted = self._record_runtime_status(state, True, warning_code)
+            except StockError as error:
+                if error.code != "cache_locked":
+                    raise
+        return RefreshResult.from_state(
+            "stale_cache",
+            persisted,
+            stale=True,
+            warning_code=warning_code,
+        )
 
     def _load_if_readable(
         self, progress: Callable[[], None] | None = None
@@ -787,7 +818,7 @@ class StockCache:
             _fsync_directory(final_directory.parent)
             lock.assert_owned()
             _write_json_atomic(
-                _runtime_status_path(self.root, final_name),
+                _runtime_status_path_for_write(self.root, final_name),
                 {
                     "generation_id": manifest.generation_id,
                     "checked_at": checked_at,
@@ -837,8 +868,13 @@ class StockCache:
             return
         shutil.rmtree(directory, ignore_errors=True)
         try:
-            _runtime_status_path(self.root, directory.name).unlink(missing_ok=True)
-        except OSError:
+            runtime = _runtime_directory(self.root, create=False)
+            if runtime is not None:
+                status_path = runtime / f"{directory.name}.json"
+                observed = _lstat_optional(status_path)
+                if observed is not None and not stat.S_ISDIR(observed.st_mode):
+                    status_path.unlink(missing_ok=True)
+        except (OSError, StockError):
             pass
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
@@ -869,12 +905,10 @@ class StockCache:
                     continue
                 except OSError:
                     cleanup_incomplete = True
-        runtime = self.root / "runtime"
         try:
-            runtime_entries = list(runtime.iterdir())
-        except FileNotFoundError:
-            runtime_entries = []
-        except OSError:
+            runtime = _runtime_directory(self.root, create=False)
+            runtime_entries = list(runtime.iterdir()) if runtime is not None else []
+        except (OSError, StockError):
             cleanup_incomplete = True
             runtime_entries = []
         for entry in runtime_entries:
@@ -1019,8 +1053,66 @@ def _assert_finite_json(value: object) -> None:
             _assert_finite_json(item)
 
 
-def _runtime_status_path(cache_dir: Path, directory_name: str) -> Path:
-    return cache_dir / "runtime" / f"{directory_name}.json"
+def _load_optional_runtime_status(
+    cache_dir: Path,
+    directory_name: str,
+    generation_id: str,
+) -> tuple[RuntimeStatus | None, Path | None]:
+    runtime = _runtime_directory(cache_dir, create=False)
+    if runtime is None:
+        return None, None
+    path = runtime / f"{directory_name}.json"
+    observed = _lstat_optional(path)
+    if observed is None:
+        return None, None
+    if not stat.S_ISREG(observed.st_mode):
+        raise _cache_unavailable()
+    return load_runtime_status(path, generation_id), path
+
+
+def _runtime_status_path_for_write(cache_dir: Path, directory_name: str) -> Path:
+    runtime = _runtime_directory(cache_dir, create=True)
+    if runtime is None:
+        raise _cache_unavailable()
+    path = runtime / f"{directory_name}.json"
+    observed = _lstat_optional(path)
+    if observed is not None and not stat.S_ISREG(observed.st_mode):
+        raise _cache_unavailable()
+    return path
+
+
+def _runtime_directory(cache_dir: Path, *, create: bool) -> Path | None:
+    runtime = cache_dir / "runtime"
+    observed = _lstat_optional(runtime)
+    if observed is None and create:
+        try:
+            runtime.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise _cache_unavailable() from error
+        observed = _lstat_optional(runtime)
+    if observed is None:
+        return None
+    if not stat.S_ISDIR(observed.st_mode):
+        raise _cache_unavailable()
+    return runtime
+
+
+def _lstat_optional(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _cache_unavailable() from error
+
+
+def _same_generation(left: CacheState, right: CacheState) -> bool:
+    return (
+        left.generation_id == right.generation_id
+        and left.directory_name == right.directory_name
+    )
 
 
 def _header(headers: dict[str, str], name: str) -> str | None:

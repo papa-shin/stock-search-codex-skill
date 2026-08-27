@@ -265,6 +265,66 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.warning_code, "cache_locked")
         self.assertEqual(self.fixture.current_generation_id(), "generation-a")
 
+    def test_active_lock_warning_is_not_persisted_into_active_generation(self) -> None:
+        self.fixture.seed_generation()
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            json.dumps({"token": "active-writer", "created_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+        current = CacheState.load(self.cache_root)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertIsNotNone(current)
+        self.assertFalse(current.stale)
+        self.assertIsNone(current.warning_code)
+        self.assertFalse(
+            (self.cache_root / "runtime" / "generation-existing.json").exists()
+        )
+
+    def test_error_status_cas_does_not_mark_concurrent_generation_stale(self) -> None:
+        self.fixture.seed_generation()
+        client = FakeHttpClient()
+        real_release = CacheLock.release
+        activated = False
+
+        def release_then_activate(lock: CacheLock) -> None:
+            nonlocal activated
+            real_release(lock)
+            if not activated:
+                activated = True
+                self.fixture.seed_generation(
+                    generation_id="generation-concurrent",
+                    directory_name="generation-concurrent",
+                )
+
+        with patch.object(
+            client,
+            "get_manifest",
+            side_effect=StockError(
+                "network_error", "Синтетическая ошибка обновления", 3
+            ),
+        ):
+            with patch.object(CacheLock, "release", release_then_activate):
+                result = StockCache(self.cache_root, client).refresh(self.config)
+
+        current = CacheState.load(self.cache_root)
+        self.assertTrue(activated)
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.generation_id, "generation-a")
+        self.assertEqual(result.warning_code, "network_error")
+        self.assertIsNotNone(current)
+        self.assertEqual(current.generation_id, "generation-concurrent")
+        self.assertFalse(current.stale)
+        self.assertIsNone(current.warning_code)
+        self.assertFalse(
+            (self.cache_root / "runtime" / "generation-concurrent.json").exists()
+        )
+
     def test_active_lock_without_cache_is_cache_locked_error(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()

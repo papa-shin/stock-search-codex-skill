@@ -147,4 +147,20 @@ def _price_or_none(value: object) -> Decimal | None:
 
 
 def _decimal_text(value: Decimal) -> str:
-    return format(value.normalize(), "f") if value != value.to_integral() else str(value.quantize(Decimal(1)))
+    if value.is_zero():
+        return "0"
+    sign, digits_tuple, exponent = value.as_tuple()
+    digits = list(digits_tuple)
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    if exponent >= 0:
+        result = coefficient + "0" * exponent
+    else:
+        point = len(coefficient) + exponent
+        if point <= 0:
+            result = "0." + "0" * (-point) + coefficient
+        else:
+            result = coefficient[:point] + "." + coefficient[point:]
+    return "-" + result if sign else result
