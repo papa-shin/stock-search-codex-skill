@@ -796,7 +796,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
         self.assertIn("2026-08-27T11:00:00+00:00", outside.read_text(encoding="utf-8"))
 
-    def test_runtime_status_swap_to_symlink_is_atomically_replaced_on_write(self) -> None:
+    def test_runtime_status_swap_to_symlink_fails_closed_on_write(self) -> None:
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
         outside = Path(self.temp_dir.name) / "outside-runtime.json"
@@ -824,14 +824,14 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
         with patch.object(cache_module, "_write_json_atomic", swap_before_write):
             with cache_module.CacheLock.acquire(self.cache_root) as lock:
-                updated = StockCache(self.cache_root, object())._record_runtime_status(
-                    state, True, "network_error", lock
-                )
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    StockCache(self.cache_root, object())._record_runtime_status(
+                        state, True, "network_error", lock
+                    )
 
-        self.assertTrue(updated.stale)
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
         self.assertTrue(runtime.is_file())
-        self.assertFalse(runtime.is_symlink())
+        self.assertTrue(runtime.is_symlink())
 
     def test_aged_writer_heartbeats_before_runtime_status_write(self) -> None:
         state = CacheState.load(self.cache_root)
@@ -961,7 +961,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         second_errors: list[BaseException] = []
         second_results: list[CacheState] = []
         real_write = cache_module._write_runtime_status_atomic
-        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+        real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
         def pause_first_write(
             root: Path, directory_name: str, value: object
@@ -975,7 +975,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         def observe_second_wait(root: Path) -> object:
             if threading.current_thread().name == "second-runtime-writer":
                 second_waiting.set()
-            return real_commit_acquire(root)
+            return real_publish_acquire(root)
 
         def run_first() -> None:
             try:
@@ -1005,7 +1005,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             cache_module, "_write_runtime_status_atomic", side_effect=pause_first_write
         ):
             with patch.object(
-                cache_module.RuntimeCommitLock,
+                cache_module._RefreshLockPublishLock,
                 "acquire",
                 side_effect=observe_second_wait,
             ):

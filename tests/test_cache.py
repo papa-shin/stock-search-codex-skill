@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -13,6 +14,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -206,6 +208,200 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(
             result.to_public_dict()["generation"]["id"], "generation-b"
         )
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_refresh_creates_private_cache_tree_under_umask_022(self) -> None:
+        previous_umask = os.umask(0o022)
+        try:
+            result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(result.status, "updated")
+        generation = StockCache(
+            self.cache_root, FakeHttpClient()
+        ).current_generation().manifest.parent
+        directories = [
+            self.cache_root,
+            self.cache_root / "generations",
+            generation,
+        ]
+        files = [
+            self.cache_root / ".runtime-status.commit.lock",
+            self.cache_root / "current.json",
+            self.cache_root / f".runtime-status-{generation.name}.json",
+            generation / "manifest.json",
+            generation / "products.jsonl",
+            generation / "offers.jsonl",
+            generation / "state.json",
+        ]
+
+        self.assertTrue(all(path.exists() for path in directories + files))
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in directories},
+            {path: 0o700 for path in directories},
+        )
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in files},
+            {path: 0o600 for path in files},
+        )
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_lock_creation_uses_private_modes_under_umask_022(self) -> None:
+        previous_umask = os.umask(0o022)
+        try:
+            lock = CacheLock.acquire(self.cache_root)
+        finally:
+            os.umask(previous_umask)
+        self.addCleanup(lock.release)
+
+        self.assertEqual(stat.S_IMODE(self.cache_root.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(lock.path.stat().st_mode), 0o700)
+        self.assertEqual(
+            stat.S_IMODE((lock.path / "owner.json").stat().st_mode), 0o600
+        )
+        self.assertEqual(
+            stat.S_IMODE((lock.path / f"heartbeat-{lock.token}").stat().st_mode),
+            0o600,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_load_hardens_existing_private_cache_artifacts(self) -> None:
+        self.fixture.seed_generation()
+        generation = self.cache_root / "generations" / "generation-existing"
+        directories = [self.cache_root, self.cache_root / "generations", generation]
+        files = [
+            self.cache_root / "current.json",
+            generation / "manifest.json",
+            generation / "products.jsonl",
+            generation / "offers.jsonl",
+            generation / "state.json",
+        ]
+        for path in directories:
+            os.chmod(path, 0o777)
+        for path in files:
+            os.chmod(path, 0o666)
+
+        state = CacheState.load(self.cache_root)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in directories},
+            {path: 0o700 for path in directories},
+        )
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in files},
+            {path: 0o600 for path in files},
+        )
+
+    @unittest.skipUnless(os.name == "posix", "Symlink race проверяется на POSIX")
+    def test_pointer_swap_to_symlink_fails_without_chmod_target(self) -> None:
+        self.fixture.seed_generation()
+        current = self.cache_root / "current.json"
+        original = self.cache_root / "current.original.json"
+        outside = Path(self.temp_dir.name) / "outside-current.json"
+        outside.write_bytes(current.read_bytes())
+        os.chmod(outside, 0o666)
+        outside_mode = stat.S_IMODE(outside.stat().st_mode)
+        real_lstat = Path.lstat
+        swapped = False
+
+        def swap_after_lstat(path: Path) -> os.stat_result:
+            nonlocal swapped
+            observed = real_lstat(path)
+            if path == current and not swapped:
+                swapped = True
+                os.rename(current, original)
+                os.symlink(outside, current)
+            return observed
+
+        with patch.object(Path, "lstat", swap_after_lstat):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                CacheState.load(self.cache_root)
+
+        self.assertTrue(swapped)
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), outside_mode)
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_generations_symlink_is_rejected_without_external_writes(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside-generations"
+        outside.mkdir()
+        (self.cache_root / "generations").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_windows_permission_hardening_is_explicit_best_effort(self) -> None:
+        artifact = self.cache_root / "windows-best-effort.json"
+        artifact.write_text("{}", encoding="utf-8")
+        descriptor = os.open(artifact, os.O_RDONLY)
+        self.addCleanup(os.close, descriptor)
+
+        with patch.object(cache_module.os, "name", "nt"):
+            with patch.object(
+                cache_module.os,
+                "fchmod",
+                side_effect=AssertionError("Windows branch must not promise POSIX modes"),
+            ):
+                cache_module._harden_private_descriptor(
+                    descriptor, stat.S_IFREG, 0o600
+                )
+
+    def test_windows_directory_validation_does_not_require_directory_fd(self) -> None:
+        with patch.object(cache_module.os, "name", "nt"):
+            with patch.object(
+                cache_module.os,
+                "open",
+                side_effect=AssertionError("Windows cannot portably open directories"),
+            ):
+                cache_module._ensure_private_directory(self.cache_root)
+
+    def test_windows_311_directory_reparse_point_is_rejected_without_is_junction(
+        self,
+    ) -> None:
+        path_without_is_junction = SimpleNamespace()
+        observed = SimpleNamespace(
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        self.assertTrue(
+            cache_module._is_windows_directory_reparse_point(
+                path_without_is_junction, observed
+            )
+        )
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_download_symlink_swap_does_not_overwrite_external_file(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside-download.jsonl"
+        outside.write_bytes(b"outside-safe")
+
+        class SwappingHttpClient(FakeHttpClient):
+            def download(
+                nested_self,
+                url: str,
+                destination: Path,
+                expected_bytes: int,
+                expected_sha256: str,
+                progress: object | None = None,
+            ) -> DownloadReceipt:
+                if destination.name == "products.jsonl":
+                    destination_path = Path(os.fspath(destination))
+                    destination_path.unlink()
+                    destination_path.symlink_to(outside)
+                return super().download(
+                    url,
+                    destination,
+                    expected_bytes,
+                    expected_sha256,
+                    progress,
+                )
+
+        with self.assertRaises(StockError):
+            StockCache(self.cache_root, SwappingHttpClient()).refresh(self.config)
+
+        self.assertEqual(outside.read_bytes(), b"outside-safe")
 
     def test_corrupt_download_returns_stale_cache_without_replacing_current(self) -> None:
         self.fixture.seed_generation()
@@ -631,6 +827,152 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.status, "updated")
         self.assertFalse(lock.exists())
 
+    def test_displaced_ownerless_creator_cannot_write_successor_lock(self) -> None:
+        creator_paused = threading.Event()
+        allow_creator = threading.Event()
+        creator_locks: list[CacheLock] = []
+        creator_errors: list[BaseException] = []
+        real_mkdir = Path.mkdir
+        paused = False
+
+        def pause_creator_after_lock_mkdir(
+            path: Path, *args: object, **kwargs: object
+        ) -> None:
+            nonlocal paused
+            real_mkdir(path, *args, **kwargs)
+            if (
+                threading.current_thread().name == "displaced-creator"
+                and path.name.startswith(".refresh.lock")
+                and not paused
+            ):
+                paused = True
+                creator_paused.set()
+                if not allow_creator.wait(timeout=5):
+                    raise AssertionError("creator pause timeout")
+
+        def acquire_as_creator() -> None:
+            try:
+                creator_locks.append(CacheLock.acquire(self.cache_root))
+            except BaseException as error:
+                creator_errors.append(error)
+
+        with patch.object(Path, "mkdir", pause_creator_after_lock_mkdir):
+            creator = threading.Thread(
+                target=acquire_as_creator, name="displaced-creator"
+            )
+            creator.start()
+            self.assertTrue(creator_paused.wait(timeout=5))
+            initialized = next(
+                path
+                for path in self.cache_root.iterdir()
+                if path.name.startswith(".refresh.lock") and path.is_dir()
+            )
+            stale_time = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+            os.utime(initialized, (stale_time, stale_time))
+
+            successor = CacheLock.acquire(self.cache_root)
+            self.addCleanup(successor.release)
+            allow_creator.set()
+            creator.join(timeout=5)
+
+        self.assertFalse(creator.is_alive())
+        self.assertEqual(creator_locks, [])
+        self.assertEqual(len(creator_errors), 1)
+        self.assertIsInstance(creator_errors[0], StockError)
+        self.assertEqual(creator_errors[0].code, "cache_locked")
+        successor.assert_owned()
+
+    def test_stale_lock_init_directory_is_boundedly_reclaimed(self) -> None:
+        token = "a" * 32
+        candidate = self.cache_root / f".refresh.lock.init-{token}"
+        candidate.mkdir()
+        stale_time = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+        (candidate / "owner.json").write_text(
+            json.dumps({"token": token, "created_at": stale_time}),
+            encoding="utf-8",
+        )
+        heartbeat = candidate / f"heartbeat-{token}"
+        heartbeat.write_bytes(b"")
+        os.utime(heartbeat, (stale_time, stale_time))
+
+        lock = CacheLock.acquire(self.cache_root)
+        self.addCleanup(lock.release)
+
+        self.assertFalse(candidate.exists())
+        lock.assert_owned()
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_unsafe_stale_lock_init_directory_fails_closed(self) -> None:
+        token = "b" * 32
+        candidate = self.cache_root / f".refresh.lock.init-{token}"
+        candidate.mkdir()
+        outside_owner = Path(self.temp_dir.name) / "outside-init-owner.json"
+        outside_owner.write_text(
+            json.dumps(
+                {
+                    "token": token,
+                    "created_at": time.time() - cache_module._LOCK_TTL_SECONDS - 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (candidate / "owner.json").symlink_to(outside_owner)
+        stale_time = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+        os.utime(candidate, (stale_time, stale_time))
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(candidate.is_dir())
+        self.assertTrue((candidate / "owner.json").is_symlink())
+        self.assertTrue(outside_owner.is_file())
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_symlink_owner_is_not_reclaimed_as_ownerless_lock(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        outside_owner = Path(self.temp_dir.name) / "outside-owner.json"
+        outside_owner.write_text(
+            json.dumps(
+                {
+                    "token": "outside-owner",
+                    "created_at": time.time() - cache_module._LOCK_TTL_SECONDS - 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (lock / "owner.json").symlink_to(outside_owner)
+        stale_time = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+        os.utime(lock, (stale_time, stale_time))
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(lock.is_dir())
+        self.assertTrue((lock / "owner.json").is_symlink())
+        self.assertTrue(outside_owner.is_file())
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_symlink_heartbeat_is_not_reclaimed_as_stale_lock(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        token = "stale-writer"
+        stale_time = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+        (lock / "owner.json").write_text(
+            json.dumps({"token": token, "created_at": stale_time}),
+            encoding="utf-8",
+        )
+        outside_heartbeat = Path(self.temp_dir.name) / "outside-heartbeat"
+        outside_heartbeat.write_bytes(b"")
+        (lock / f"heartbeat-{token}").symlink_to(outside_heartbeat)
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(lock.is_dir())
+        self.assertTrue((lock / f"heartbeat-{token}").is_symlink())
+        self.assertTrue(outside_heartbeat.is_file())
+
     def test_nan_owner_timestamp_does_not_bypass_directory_ttl(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()
@@ -832,7 +1174,7 @@ class StockCacheTest(unittest.TestCase):
         second_errors: list[BaseException] = []
         second_results: list[object] = []
         real_write_json = cache_module._write_json_atomic
-        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+        real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
         def pause_first_pointer(path: Path, value: object) -> None:
             if (
@@ -847,7 +1189,7 @@ class StockCacheTest(unittest.TestCase):
         def observe_second_wait(root: Path) -> object:
             if threading.current_thread().name == "second-activation":
                 second_waiting.set()
-            return real_commit_acquire(root)
+            return real_publish_acquire(root)
 
         def run_first() -> None:
             try:
@@ -877,7 +1219,7 @@ class StockCacheTest(unittest.TestCase):
             cache_module, "_write_json_atomic", side_effect=pause_first_pointer
         ):
             with patch.object(
-                cache_module.RuntimeCommitLock,
+                cache_module._RefreshLockPublishLock,
                 "acquire",
                 side_effect=observe_second_wait,
             ):
@@ -918,7 +1260,7 @@ class StockCacheTest(unittest.TestCase):
         second_results: list[object] = []
         real_load = CacheState.load
         real_write_bytes = cache_module._write_bytes_atomic
-        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+        real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
         def fail_delayed_validation(
             cache_dir: Path, progress: object | None = None
@@ -947,7 +1289,7 @@ class StockCacheTest(unittest.TestCase):
         def observe_second_wait(root: Path) -> object:
             if threading.current_thread().name == "rollback-successor":
                 second_waiting.set()
-            return real_commit_acquire(root)
+            return real_publish_acquire(root)
 
         def run_delayed() -> None:
             try:
@@ -978,7 +1320,7 @@ class StockCacheTest(unittest.TestCase):
                 cache_module, "_write_bytes_atomic", side_effect=pause_rollback
             ):
                 with patch.object(
-                    cache_module.RuntimeCommitLock,
+                    cache_module._RefreshLockPublishLock,
                     "acquire",
                     side_effect=observe_second_wait,
                 ):

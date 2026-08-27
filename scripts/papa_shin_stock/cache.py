@@ -45,7 +45,10 @@ _RUNTIME_STATUS_TEMP = re.compile(
     r"\.\.runtime-status-(?P<directory>[A-Za-z0-9][A-Za-z0-9._-]*)"
     r"\.json\.[0-9a-f]{32}\.tmp\Z"
 )
+_LOCK_INIT_DIRECTORY = re.compile(r"\.refresh\.lock\.init-[0-9a-f]{32}\Z")
 _MAX_STATUS_TEXT = 256
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
     errno.EINVAL,
@@ -79,15 +82,15 @@ class GenerationFiles:
 
     def assert_readable(self) -> None:
         directory = self.manifest.parent
-        if directory.is_symlink() or not directory.is_dir():
-            raise _cache_unavailable()
+        _ensure_private_directory(directory)
         for path in (self.manifest, self.products, self.offers):
-            if path.is_symlink() or not path.is_file():
-                raise _cache_unavailable()
             try:
-                with path.open("rb") as stream:
-                    stream.read(1)
-            except OSError as error:
+                descriptor = _open_private_regular_file(path)
+                try:
+                    os.read(descriptor, 1)
+                finally:
+                    os.close(descriptor)
+            except (OSError, StockError) as error:
                 raise _cache_unavailable() from error
 
 
@@ -100,7 +103,7 @@ class CurrentPointer:
     @classmethod
     def load(cls, path: Path) -> "CurrentPointer":
         try:
-            value = _parse_json(path.read_text(encoding="utf-8"))
+            value = _parse_json(_read_private_text(path))
         except (
             OSError,
             UnicodeError,
@@ -158,18 +161,26 @@ class CacheState:
         cache_dir: Path,
         progress: Callable[[], None] | None = None,
     ) -> "CacheState | None":
-        pointer_path = cache_dir / "current.json"
-        if not pointer_path.exists():
+        root = _lstat_optional(cache_dir)
+        if root is None:
             return None
-        if pointer_path.is_symlink():
+        _ensure_private_directory(cache_dir)
+        pointer_path = cache_dir / "current.json"
+        pointer_entry = _lstat_optional(pointer_path)
+        if pointer_entry is None:
+            return None
+        if not stat.S_ISREG(pointer_entry.st_mode):
             raise _cache_unavailable()
 
         pointer = CurrentPointer.load(pointer_path)
-        generation = cache_dir / "generations" / pointer.directory_name
+        generations = cache_dir / "generations"
+        _ensure_private_directory(generations)
+        generation = generations / pointer.directory_name
+        _ensure_private_directory(generation)
         files = GenerationFiles.from_directory(pointer.generation_id, generation)
         files.assert_readable()
         try:
-            manifest = Manifest.parse(files.manifest.read_bytes())
+            manifest = Manifest.parse(_read_private_bytes(files.manifest))
             if manifest.generation_id != pointer.generation_id:
                 raise _cache_unavailable()
             _verify_file(files.products, manifest.products, progress)
@@ -182,10 +193,8 @@ class CacheState:
             raise _cache_unavailable() from error
 
         state_path = generation / "state.json"
-        if state_path.is_symlink() or not state_path.is_file():
-            raise _cache_unavailable()
         try:
-            value = _parse_json(state_path.read_text(encoding="utf-8"))
+            value = _parse_json(_read_private_text(state_path))
         except (
             OSError,
             UnicodeError,
@@ -287,24 +296,9 @@ def validate_runtime_status(
 
 
 def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatus:
-    observed = _lstat_optional(path)
-    if observed is None or not stat.S_ISREG(observed.st_mode):
-        raise _cache_unavailable()
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = -1
     try:
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or observed.st_ino <= 0
-            or opened.st_ino <= 0
-            or observed.st_dev < 0
-            or opened.st_dev < 0
-            or opened.st_dev != observed.st_dev
-            or opened.st_ino != observed.st_ino
-        ):
-            raise _cache_unavailable()
+        descriptor = _open_private_regular_file(path)
         with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
             descriptor = -1
             value = _parse_json(stream.read())
@@ -439,47 +433,7 @@ class RuntimeCommitLock:
 
     @classmethod
     def acquire(cls, root: Path) -> "RuntimeCommitLock":
-        path = root / ".runtime-status.commit.lock"
-        descriptor = -1
-        try:
-            observed = _lstat_optional(path)
-            if observed is not None and not stat.S_ISREG(observed.st_mode):
-                raise _cache_unavailable()
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags, 0o600)
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise _cache_unavailable()
-            if (
-                observed is not None
-                and observed.st_ino > 0
-                and opened.st_ino > 0
-                and (
-                    observed.st_dev != opened.st_dev
-                    or observed.st_ino != opened.st_ino
-                )
-            ):
-                raise _cache_unavailable()
-            if opened.st_size == 0:
-                os.write(descriptor, b"\0")
-                os.fsync(descriptor)
-            _lock_commit_descriptor(descriptor)
-            return cls(descriptor)
-        except StockError:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            raise
-        except (OSError, ValueError, TypeError) as error:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            raise _cache_unavailable() from error
+        return cls(_acquire_runtime_commit_descriptor(root))
 
     def release(self, *, suppress_errors: bool = False) -> None:
         if self.descriptor < 0:
@@ -511,75 +465,208 @@ class RuntimeCommitLock:
         self.release(suppress_errors=exc_type is not None)
 
 
+class _RefreshLockPublishLock(RuntimeCommitLock):
+    @classmethod
+    def acquire(cls, root: Path) -> "_RefreshLockPublishLock":
+        return cls(_acquire_runtime_commit_descriptor(root))
+
+
+class _PrivateDownloadDestination:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.descriptor = _open_private_regular_file(
+            path,
+            flags=os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            create=True,
+        )
+        self.identity = os.fstat(self.descriptor)
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def parents(self) -> Any:
+        return self.path.parents
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def open(self, mode: str = "r", *args: object, **kwargs: object) -> Any:
+        if mode != "wb" or args or kwargs:
+            raise _cache_unavailable()
+        self.assert_path_owned()
+        duplicate = -1
+        try:
+            duplicate = os.dup(self.descriptor)
+            os.ftruncate(duplicate, 0)
+            os.lseek(duplicate, 0, os.SEEK_SET)
+            return os.fdopen(duplicate, "wb")
+        except (OSError, ValueError, TypeError) as error:
+            if duplicate >= 0:
+                try:
+                    os.close(duplicate)
+                except OSError:
+                    pass
+            raise _cache_unavailable() from error
+
+    def write_bytes(self, payload: bytes) -> int:
+        with self.open("wb") as stream:
+            return stream.write(payload)
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        observed = _lstat_optional(self.path)
+        if observed is None:
+            if missing_ok:
+                return
+            raise _cache_unavailable()
+        if not stat.S_ISREG(observed.st_mode) or not _same_file_identity(
+            self.identity, observed
+        ):
+            raise _cache_unavailable()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+    def assert_path_owned(self) -> None:
+        if self.descriptor < 0:
+            raise _cache_unavailable()
+        opened = os.fstat(self.descriptor)
+        observed = _lstat_optional(self.path)
+        if (
+            observed is None
+            or not stat.S_ISREG(observed.st_mode)
+            or not _same_file_identity(self.identity, opened)
+            or not _same_file_identity(opened, observed)
+        ):
+            raise _cache_unavailable()
+
+    def fsync(self) -> None:
+        self.assert_path_owned()
+        os.fsync(self.descriptor)
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        os.close(descriptor)
+
+
+def _acquire_runtime_commit_descriptor(root: Path) -> int:
+    descriptor = -1
+    try:
+        if _lstat_optional(root) is None:
+            _ensure_private_directory(root, create=True, parents=True)
+        else:
+            _ensure_private_directory(root)
+        path = root / ".runtime-status.commit.lock"
+        descriptor = _open_private_regular_file(
+            path, flags=os.O_RDWR | os.O_CREAT, create=True
+        )
+        opened = os.fstat(descriptor)
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        _lock_commit_descriptor(descriptor)
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
 class CacheLock:
-    def __init__(self, path: Path, token: str) -> None:
+    def __init__(self, path: Path, token: str, identity: tuple[int, int]) -> None:
         self.path = path
         self.token = token
+        self.identity = identity
 
     @classmethod
     def acquire(cls, root: Path) -> "CacheLock":
         try:
-            root.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
+            _ensure_private_directory(root, create=True, parents=True)
+        except (OSError, StockError) as error:
             raise StockError(
                 "cache_locked", "Не удалось установить блокировку кэша", 6
             ) from error
         path = root / ".refresh.lock"
         token = uuid.uuid4().hex
-        for _ in range(2):
+        candidate = root / f".refresh.lock.init-{token}"
+        published = False
+        try:
             try:
-                path.mkdir()
-            except FileExistsError:
-                with RuntimeCommitLock.acquire(root):
-                    try:
-                        observed_lock = path.lstat()
-                    except FileNotFoundError:
-                        continue
-                    except OSError as error:
-                        raise StockError(
-                            "cache_locked",
-                            "Не удалось установить блокировку кэша",
-                            6,
-                        ) from error
+                candidate.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+                _ensure_private_directory(candidate)
+                owner = {"token": token, "created_at": time.time()}
+                _write_json_atomic(candidate / "owner.json", owner)
+                _write_bytes_fsync(candidate / f"heartbeat-{token}", b"")
+                _fsync_directory(candidate)
+            except StockError as error:
+                raise StockError(
+                    "cache_locked", "Не удалось установить блокировку кэша", 6
+                ) from error
+            except OSError as error:
+                raise StockError(
+                    "cache_locked", "Не удалось установить блокировку кэша", 6
+                ) from error
+            candidate_identity = cls._directory_fencing_identity(candidate)
+            if candidate_identity is None:
+                raise StockError(
+                    "cache_locked", "Не удалось установить блокировку кэша", 6
+                )
+
+            with _RefreshLockPublishLock.acquire(root):
+                cls._cleanup_stale_init_directories(root, candidate.name)
+                observed_lock = _lstat_optional(path)
+                if observed_lock is not None:
                     if not stat.S_ISDIR(observed_lock.st_mode):
                         raise StockError(
                             "cache_locked", "Обновление кэша уже выполняется", 6
                         )
+                    _ensure_private_directory(path)
                     if not cls._reclaim_stale(path):
-                        try:
-                            path.lstat()
-                        except FileNotFoundError:
-                            continue
-                        except OSError as error:
+                        remaining = _lstat_optional(path)
+                        if remaining is not None:
                             raise StockError(
-                                "cache_locked",
-                                "Не удалось установить блокировку кэша",
-                                6,
-                            ) from error
-                        raise StockError(
-                            "cache_locked", "Обновление кэша уже выполняется", 6
-                        )
-                continue
-            except OSError as error:
-                raise StockError(
-                    "cache_locked", "Не удалось установить блокировку кэша", 6
-                ) from error
+                                "cache_locked", "Обновление кэша уже выполняется", 6
+                            )
+                try:
+                    os.rename(candidate, path)
+                except OSError as error:
+                    raise StockError(
+                        "cache_locked", "Не удалось установить блокировку кэша", 6
+                    ) from error
+                published = True
+                _fsync_directory(root)
 
-            owner = {"token": token, "created_at": time.time()}
-            try:
-                _write_json_atomic(path / "owner.json", owner)
-                _write_bytes_fsync(path / f"heartbeat-{token}", b"")
-                _fsync_directory(path)
-            except OSError as error:
-                shutil.rmtree(path, ignore_errors=True)
+            if cls._directory_fencing_identity(path) != candidate_identity:
                 raise StockError(
-                    "cache_locked", "Не удалось установить блокировку кэша", 6
-                ) from error
-            return cls(path, token)
-        raise StockError("cache_locked", "Обновление кэша уже выполняется", 6)
+                    "cache_locked", "Право на обновление кэша было утрачено", 6
+                )
+            acquired = cls(path, token, candidate_identity)
+            acquired.assert_owned()
+            return acquired
+        finally:
+            if not published:
+                _remove_private_directory(candidate)
 
     @classmethod
     def _reclaim_stale(cls, path: Path) -> bool:
+        if cls._contains_unsafe_lock_artifact(path):
+            return False
         observed = cls._read_owner(path)
         if observed is None:
             return cls._reclaim_stale_ownerless(path)
@@ -652,10 +739,67 @@ class CacheLock:
         return value.st_dev, value.st_ino, value.st_mtime_ns
 
     @staticmethod
+    def _directory_fencing_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            value = path.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(value.st_mode):
+            return None
+        return value.st_dev, value.st_ino
+
+    @staticmethod
+    def _contains_unsafe_lock_artifact(path: Path) -> bool:
+        try:
+            entries = list(path.iterdir())
+        except OSError:
+            return True
+        for entry in entries:
+            if entry.name != "owner.json" and not entry.name.startswith("heartbeat-"):
+                continue
+            try:
+                observed = entry.lstat()
+            except OSError:
+                return True
+            if not stat.S_ISREG(observed.st_mode):
+                return True
+        return False
+
+    @classmethod
+    def _cleanup_stale_init_directories(
+        cls, root: Path, current_candidate_name: str
+    ) -> None:
+        try:
+            entries = list(root.iterdir())
+        except OSError as error:
+            raise StockError(
+                "cache_locked", "Не удалось установить блокировку кэша", 6
+            ) from error
+        for entry in entries:
+            if (
+                entry.name == current_candidate_name
+                or not _LOCK_INIT_DIRECTORY.fullmatch(entry.name)
+            ):
+                continue
+            observed = _lstat_optional(entry)
+            if observed is None:
+                continue
+            if not stat.S_ISDIR(observed.st_mode):
+                raise StockError(
+                    "cache_locked", "Обновление кэша уже выполняется", 6
+                )
+            _ensure_private_directory(entry)
+            if cls._contains_unsafe_lock_artifact(entry):
+                raise StockError(
+                    "cache_locked", "Обновление кэша уже выполняется", 6
+                )
+            cls._reclaim_stale(entry)
+
+    @staticmethod
     def _read_owner(path: Path) -> tuple[str, float] | None:
         try:
-            value = json.loads((path / "owner.json").read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            value = json.loads(_read_private_text(path / "owner.json"))
+        except (OSError, StockError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(value, dict):
             return None
@@ -679,12 +823,10 @@ class CacheLock:
             return None
         heartbeat_path = path / f"heartbeat-{token}"
         try:
-            heartbeat = heartbeat_path.stat(follow_symlinks=False)
-        except OSError:
+            heartbeat = _stat_private_regular_file(heartbeat_path)
+        except (OSError, StockError):
             heartbeat = None
         if heartbeat is not None:
-            if not stat.S_ISREG(heartbeat.st_mode):
-                return None
             heartbeat_timestamp = heartbeat.st_mtime
             if (
                 not math.isfinite(heartbeat_timestamp)
@@ -695,6 +837,10 @@ class CacheLock:
         return token, timestamp
 
     def assert_owned(self) -> None:
+        if self._directory_fencing_identity(self.path) != self.identity:
+            raise StockError(
+                "cache_locked", "Право на обновление кэша было утрачено", 6
+            )
         owner = self._read_owner(self.path)
         if owner is None or owner[0] != self.token:
             raise StockError(
@@ -704,14 +850,16 @@ class CacheLock:
     def heartbeat(self) -> None:
         self.assert_owned()
         try:
-            os.utime(self.path / f"heartbeat-{self.token}", None)
-        except OSError as error:
+            _touch_private_regular_file(self.path / f"heartbeat-{self.token}")
+        except (OSError, StockError) as error:
             raise StockError(
                 "cache_locked", "Право на обновление кэша было утрачено", 6
             ) from error
         self.assert_owned()
 
     def release(self) -> None:
+        if self._directory_fencing_identity(self.path) != self.identity:
+            return
         owner = self._read_owner(self.path)
         if owner is None or owner[0] != self.token:
             return
@@ -724,6 +872,13 @@ class CacheLock:
         except OSError:
             return
 
+        if self._directory_fencing_identity(quarantine) != self.identity:
+            try:
+                if not self.path.exists():
+                    os.rename(quarantine, self.path)
+            except OSError:
+                pass
+            return
         moved = self._read_owner(quarantine)
         if moved is not None and moved[0] == self.token:
             shutil.rmtree(quarantine, ignore_errors=True)
@@ -924,33 +1079,53 @@ class StockCache:
         self, manifest: Manifest, config: StockConfig, lock: CacheLock
     ) -> GenerationFiles:
         generations = self.root / "generations"
-        generations.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(generations, create=True)
         directory = generations / f".staging-{uuid.uuid4().hex}"
-        directory.mkdir()
+        directory.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+        _ensure_private_directory(directory)
         staged = GenerationFiles.from_directory(manifest.generation_id, directory)
         try:
             _write_bytes_fsync(staged.manifest, manifest.body)
-            self.client.download(
+            self._download_private_file(
                 _resolve_download_url(config.manifest_url, manifest.products.url),
                 staged.products,
                 manifest.products.bytes,
                 manifest.products.sha256,
-                progress=lock.heartbeat,
+                lock,
             )
-            self.client.download(
+            self._download_private_file(
                 _resolve_download_url(config.manifest_url, manifest.offers.url),
                 staged.offers,
                 manifest.offers.bytes,
                 manifest.offers.sha256,
-                progress=lock.heartbeat,
+                lock,
             )
-            for path in (staged.products, staged.offers):
-                _fsync_file(path)
             _fsync_directory(directory)
             return staged
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
             raise
+
+    def _download_private_file(
+        self,
+        url: str,
+        path: Path,
+        expected_bytes: int,
+        expected_sha256: str,
+        lock: CacheLock,
+    ) -> None:
+        destination = _PrivateDownloadDestination(path)
+        try:
+            self.client.download(
+                url,
+                destination,
+                expected_bytes,
+                expected_sha256,
+                progress=lock.heartbeat,
+            )
+            destination.fsync()
+        finally:
+            destination.close()
 
     def _verify_generation(
         self, staged: GenerationFiles, manifest: Manifest, lock: CacheLock
@@ -1249,19 +1424,40 @@ def _verify_file(
 ) -> None:
     digest = hashlib.sha256()
     received = 0
+    descriptor = -1
     try:
-        with path.open("rb") as stream:
+        descriptor = _open_private_regular_file(path)
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
             while chunk := stream.read(1024 * 1024):
                 received += len(chunk)
                 digest.update(chunk)
                 if progress is not None:
                     progress()
+    except StockError as error:
+        if error.code == "cache_locked":
+            raise
+        raise StockError(
+            "download_integrity_failed",
+            "Проверка загруженного файла не пройдена",
+            5,
+        ) from error
     except OSError as error:
         raise StockError(
             "download_integrity_failed",
             "Проверка загруженного файла не пройдена",
             5,
         ) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise StockError(
+                    "download_integrity_failed",
+                    "Проверка загруженного файла не пройдена",
+                    5,
+                ) from error
     if received != expected.bytes or digest.hexdigest() != expected.sha256:
         raise StockError(
             "download_integrity_failed",
@@ -1392,6 +1588,227 @@ def _lstat_optional(path: Path) -> os.stat_result | None:
         raise _cache_unavailable() from error
 
 
+def _harden_private_descriptor(
+    descriptor: int, expected_type: int, expected_mode: int
+) -> os.stat_result:
+    try:
+        opened = os.fstat(descriptor)
+        if stat.S_IFMT(opened.st_mode) != expected_type:
+            raise _cache_unavailable()
+        if os.name == "posix":
+            os.fchmod(descriptor, expected_mode)
+            opened = os.fstat(descriptor)
+            if (
+                stat.S_IFMT(opened.st_mode) != expected_type
+                or stat.S_IMODE(opened.st_mode) != expected_mode
+            ):
+                raise _cache_unavailable()
+        return opened
+    except StockError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _is_windows_directory_reparse_point(path: object, observed: object) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    attributes = getattr(observed, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _open_private_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    parents: bool = False,
+) -> int | None:
+    descriptor = -1
+    try:
+        if create:
+            path.mkdir(
+                mode=_PRIVATE_DIRECTORY_MODE,
+                parents=parents,
+                exist_ok=True,
+            )
+        observed = path.lstat()
+        if not stat.S_ISDIR(observed.st_mode) or (
+            os.name == "nt"
+            and _is_windows_directory_reparse_point(path, observed)
+        ):
+            raise _cache_unavailable()
+        if os.name != "posix":
+            confirmed = path.lstat()
+            if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+                observed, confirmed
+            ):
+                raise _cache_unavailable()
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
+        opened = _harden_private_descriptor(
+            descriptor, stat.S_IFDIR, _PRIVATE_DIRECTORY_MODE
+        )
+        confirmed = path.lstat()
+        if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
+def _ensure_private_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    parents: bool = False,
+) -> None:
+    descriptor = _open_private_directory(path, create=create, parents=parents)
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        raise _cache_unavailable() from error
+
+
+def _open_private_regular_file(
+    path: Path,
+    *,
+    flags: int = os.O_RDONLY,
+    create: bool = False,
+) -> int:
+    descriptor = -1
+    observed = _lstat_optional(path)
+    if observed is not None and not stat.S_ISREG(observed.st_mode):
+        raise _cache_unavailable()
+    if observed is None and not create:
+        raise _cache_unavailable()
+    secure_flags = flags | getattr(os, "O_CLOEXEC", 0)
+    secure_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, secure_flags, _PRIVATE_FILE_MODE)
+        opened = _harden_private_descriptor(
+            descriptor, stat.S_IFREG, _PRIVATE_FILE_MODE
+        )
+        if observed is not None and not _same_file_identity(observed, opened):
+            raise _cache_unavailable()
+        confirmed = path.lstat()
+        if not stat.S_ISREG(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
+def _read_private_bytes(path: Path) -> bytes:
+    descriptor = _open_private_regular_file(path)
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    except (OSError, ValueError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise _cache_unavailable() from error
+
+
+def _read_private_text(path: Path) -> str:
+    try:
+        return _read_private_bytes(path).decode("utf-8")
+    except UnicodeError as error:
+        raise _cache_unavailable() from error
+
+
+def _stat_private_regular_file(path: Path) -> os.stat_result:
+    descriptor = _open_private_regular_file(path)
+    try:
+        return os.fstat(descriptor)
+    except OSError as error:
+        raise _cache_unavailable() from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise _cache_unavailable() from error
+
+
+def _touch_private_regular_file(path: Path) -> None:
+    descriptor = _open_private_regular_file(path, flags=os.O_RDWR)
+    try:
+        opened = os.fstat(descriptor)
+        if os.name == "posix":
+            os.utime(descriptor, None)
+        else:  # Windows stdlib does not provide POSIX mode/dir-fd guarantees.
+            os.utime(path, None, follow_symlinks=False)
+        confirmed = path.lstat()
+        if not stat.S_ISREG(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+    except StockError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise _cache_unavailable() from error
+
+
+def _remove_private_directory(path: Path) -> None:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if not stat.S_ISDIR(observed.st_mode):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _lock_commit_descriptor(descriptor: int) -> None:
     if _fcntl is not None:
         _fcntl.flock(descriptor, _fcntl.LOCK_EX)
@@ -1446,40 +1863,69 @@ def _write_json_atomic(path: Path, value: object) -> None:
 
 
 def _write_bytes_atomic(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(path.parent, create=True, parents=True)
+    observed = _lstat_optional(path)
+    if observed is not None:
+        descriptor = _open_private_regular_file(path)
+        os.close(descriptor)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         _write_bytes_fsync(temporary, payload)
+        observed = _lstat_optional(path)
+        if observed is not None:
+            descriptor = _open_private_regular_file(path)
+            os.close(descriptor)
         os.replace(temporary, path)
+        descriptor = _open_private_regular_file(path)
+        os.close(descriptor)
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _write_bytes_fsync(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
+    descriptor = _open_private_regular_file(
+        path,
+        flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        create=True,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except (OSError, ValueError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise _cache_unavailable() from error
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+    descriptor = _open_private_regular_file(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS or (
-            os.name == "nt" and error.errno in {errno.EACCES, errno.EPERM}
+        descriptor = _open_private_directory(path)
+    except (OSError, StockError) as error:
+        cause = error.__cause__ if isinstance(error, StockError) else error
+        error_number = getattr(cause, "errno", None)
+        if error_number in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS or (
+            os.name == "nt" and error_number in {errno.EACCES, errno.EPERM}
         ):
             return
         raise
+    if descriptor is None:
+        return
     try:
         os.fsync(descriptor)
     except OSError as error:
@@ -1490,10 +1936,9 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _read_optional_bytes(path: Path) -> bytes | None:
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
+    if _lstat_optional(path) is None:
         return None
+    return _read_private_bytes(path)
 
 
 def _manifest_invalid() -> StockError:
