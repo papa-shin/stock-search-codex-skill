@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
+from papa_shin_stock.cache import Manifest
 from papa_shin_stock.http_client import (
     RejectCrossOriginRedirect,
     SafeHttpClient,
@@ -265,6 +266,30 @@ class FetchStockCliTest(unittest.TestCase):
             },
         )
         self.assertNotIn("synthetic-password", output.getvalue())
+
+    def test_huge_integer_manifest_is_normalized_to_safe_json_error(self) -> None:
+        output = StringIO()
+        body = b'{"generation_id":' + b"9" * 5000 + b"}"
+
+        def parse_manifest() -> dict[str, object]:
+            Manifest.parse(body)
+            return {}
+
+        with patch.object(fetch_stock, "refresh_default", side_effect=parse_manifest):
+            with redirect_stdout(output):
+                exit_code = fetch_stock.main()
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "error",
+                "error": {
+                    "code": "manifest_invalid",
+                    "message": "Некорректный manifest",
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

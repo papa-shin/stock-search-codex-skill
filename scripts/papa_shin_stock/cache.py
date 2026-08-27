@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -22,6 +24,12 @@ from papa_shin_stock.http_client import HttpResponse, SafeHttpClient
 _LOCK_TTL_SECONDS = 30 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
+    errno.EBADF,
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +126,14 @@ class CacheState:
         generation = cache_dir / "generations" / pointer.directory_name
         files = GenerationFiles.from_directory(pointer.generation_id, generation)
         files.assert_readable()
+        try:
+            manifest = Manifest.parse(files.manifest.read_bytes())
+            if manifest.generation_id != pointer.generation_id:
+                raise _cache_unavailable()
+            _verify_file(files.products, manifest.products)
+            _verify_file(files.offers, manifest.offers)
+        except (OSError, StockError) as error:
+            raise _cache_unavailable() from error
 
         state_path = generation / "state.json"
         if state_path.is_symlink() or not state_path.is_file():
@@ -176,9 +192,16 @@ class Manifest:
     def parse(cls, body: bytes) -> "Manifest":
         try:
             value = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
-        except (UnicodeError, json.JSONDecodeError, StockError) as error:
-            if isinstance(error, StockError):
-                raise
+        except StockError:
+            raise
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
             raise _manifest_invalid() from error
         if not isinstance(value, dict):
             raise _manifest_invalid()
@@ -240,10 +263,15 @@ class RefreshResult:
             "warnings": [],
         }
         if self.warning_code is not None:
+            message = (
+                "Не удалось удалить часть неактивного кэша"
+                if self.warning_code == "cache_cleanup_incomplete"
+                else "Не удалось обновить данные; используется предыдущее поколение"
+            )
             result["warnings"] = [
                 {
                     "code": self.warning_code,
-                    "message": "Не удалось обновить данные; используется предыдущее поколение",
+                    "message": message,
                 }
             ]
         return result
@@ -288,7 +316,7 @@ class CacheLock:
     def _reclaim_stale(cls, path: Path) -> bool:
         observed = cls._read_owner(path)
         if observed is None:
-            return False
+            return cls._reclaim_stale_ownerless(path)
         observed_token, created_at = observed
         if time.time() - created_at <= _LOCK_TTL_SECONDS:
             return False
@@ -313,6 +341,41 @@ class CacheLock:
             return False
         shutil.rmtree(quarantine, ignore_errors=True)
         return True
+
+    @classmethod
+    def _reclaim_stale_ownerless(cls, path: Path) -> bool:
+        observed = cls._directory_identity(path)
+        if observed is None or time.time_ns() - observed[2] <= int(
+            _LOCK_TTL_SECONDS * 1_000_000_000
+        ):
+            return False
+        if cls._directory_identity(path) != observed:
+            return False
+
+        quarantine = path.with_name(f"{path.name}.reclaim-{uuid.uuid4().hex}")
+        try:
+            os.rename(path, quarantine)
+        except OSError:
+            return False
+        if cls._directory_identity(quarantine) != observed:
+            try:
+                if not path.exists():
+                    os.rename(quarantine, path)
+            except OSError:
+                pass
+            return False
+        shutil.rmtree(quarantine, ignore_errors=True)
+        return True
+
+    @staticmethod
+    def _directory_identity(path: Path) -> tuple[int, int, int] | None:
+        try:
+            value = path.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(value.st_mode):
+            return None
+        return value.st_dev, value.st_ino, value.st_mtime_ns
 
     @staticmethod
     def _read_owner(path: Path) -> tuple[str, float] | None:
@@ -342,8 +405,26 @@ class CacheLock:
 
     def release(self) -> None:
         owner = self._read_owner(self.path)
-        if owner is not None and owner[0] == self.token:
-            shutil.rmtree(self.path, ignore_errors=True)
+        if owner is None or owner[0] != self.token:
+            return
+
+        quarantine = self.path.with_name(
+            f"{self.path.name}.release-{self.token}-{uuid.uuid4().hex}"
+        )
+        try:
+            os.rename(self.path, quarantine)
+        except OSError:
+            return
+
+        moved = self._read_owner(quarantine)
+        if moved is not None and moved[0] == self.token:
+            shutil.rmtree(quarantine, ignore_errors=True)
+            return
+        try:
+            if not self.path.exists():
+                os.rename(quarantine, self.path)
+        except OSError:
+            pass
 
     def __enter__(self) -> "CacheLock":
         return self
@@ -387,8 +468,10 @@ class StockCache:
                 except BaseException:
                     self._remove_generation_if_inactive(staged.manifest.parent)
                     raise
-                self._cleanup_inactive_generations(state.directory_name)
-                return RefreshResult.from_state("updated", state)
+                cleanup_warning = self._cleanup_inactive_generations(lock)
+                return RefreshResult.from_state(
+                    "updated", state, warning_code=cleanup_warning
+                )
         except StockError as error:
             previous = self._load_if_readable()
             if previous is not None:
@@ -492,16 +575,16 @@ class StockCache:
             lock.assert_owned()
             _write_json_atomic(current_path, pointer.to_dict())
             lock.assert_owned()
+            state = CacheState.load(self.root)
+            if state is None:
+                raise _cache_unavailable()
+            lock.assert_owned()
         except BaseException:
             self._rollback_pointer_if_owned(
                 current_path, pointer.activation_token, previous_pointer
             )
             self._remove_generation_if_inactive(final_directory)
             raise
-
-        state = CacheState.load(self.root)
-        if state is None:
-            raise _cache_unavailable()
         return state
 
     def _rollback_pointer_if_owned(
@@ -531,17 +614,32 @@ class StockCache:
             return
         shutil.rmtree(directory, ignore_errors=True)
 
-    def _cleanup_inactive_generations(self, active_name: str) -> None:
+    def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
+        lock.assert_owned()
+        pointer = CurrentPointer.load(self.root / "current.json")
         generations = self.root / "generations"
         try:
             entries = list(generations.iterdir())
         except OSError:
-            return
+            return "cache_cleanup_incomplete"
+        cleanup_incomplete = False
         for entry in entries:
-            if entry.name == active_name or entry.is_symlink():
+            lock.assert_owned()
+            pointer = CurrentPointer.load(self.root / "current.json")
+            if entry.name == pointer.directory_name or entry.is_symlink():
                 continue
             if entry.name.startswith(("generation-", ".staging-")):
-                shutil.rmtree(entry, ignore_errors=True)
+                lock.assert_owned()
+                pointer = CurrentPointer.load(self.root / "current.json")
+                if entry.name == pointer.directory_name:
+                    continue
+                try:
+                    shutil.rmtree(entry)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    cleanup_incomplete = True
+        return "cache_cleanup_incomplete" if cleanup_incomplete else None
 
 
 def _manifest_file(value: object) -> ManifestFile:
@@ -662,12 +760,17 @@ def _fsync_directory(path: Path) -> None:
         flags |= os.O_DIRECTORY
     try:
         descriptor = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as error:
+        if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS or (
+            os.name == "nt" and error.errno in {errno.EACCES, errno.EPERM}
+        ):
+            return
+        raise
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            raise
     finally:
         os.close(descriptor)
 

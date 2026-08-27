@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -14,7 +16,7 @@ from unittest.mock import patch
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from papa_shin_stock.cache import CacheState, StockCache
+from papa_shin_stock.cache import CacheLock, CacheState, StockCache, _fsync_directory
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import DownloadReceipt, HttpResponse
@@ -269,6 +271,35 @@ class StockCacheTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "cache_locked"):
             StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
+    def test_release_does_not_delete_lock_whose_owner_changed_after_read(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        real_read_owner = CacheLock._read_owner
+        owner_changed = False
+
+        def read_then_replace_owner(path: Path) -> tuple[str, float] | None:
+            nonlocal owner_changed
+            owner = real_read_owner(path)
+            if path == lock.path and not owner_changed:
+                owner_changed = True
+                (path / "owner.json").write_text(
+                    json.dumps(
+                        {"token": "replacement-writer", "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+            return owner
+
+        with patch.object(CacheLock, "_read_owner", side_effect=read_then_replace_owner):
+            lock.release()
+
+        self.assertTrue(lock.path.is_dir())
+        self.assertEqual(
+            json.loads((lock.path / "owner.json").read_text(encoding="utf-8"))[
+                "token"
+            ],
+            "replacement-writer",
+        )
+
     def test_lock_older_than_thirty_minutes_is_reclaimed(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()
@@ -278,6 +309,17 @@ class StockCacheTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertFalse(lock.exists())
+
+    def test_ownerless_lock_older_than_thirty_minutes_is_reclaimed(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        stale_time = time.time() - 30 * 60 - 1
+        os.utime(lock, (stale_time, stale_time))
 
         result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
@@ -351,6 +393,31 @@ class StockCacheTest(unittest.TestCase):
             ["generation-existing"],
         )
 
+    def test_post_replace_validation_failure_restores_previous_pointer(self) -> None:
+        self.fixture.seed_generation()
+        real_load = CacheState.load
+
+        def reject_new_current(cache_dir: Path) -> CacheState | None:
+            pointer = json.loads(
+                (cache_dir / "current.json").read_text(encoding="utf-8")
+            )
+            if pointer["generation_id"] == "generation-b":
+                raise StockError(
+                    "cache_unavailable", "Синтетическая ошибка validation", 7
+                )
+            return real_load(cache_dir)
+
+        with patch.object(CacheState, "load", side_effect=reject_new_current):
+            result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_unavailable")
+        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(
+            sorted(path.name for path in (self.cache_root / "generations").iterdir()),
+            ["generation-existing"],
+        )
+
     def test_success_removes_inactive_generation_after_activation(self) -> None:
         self.fixture.seed_generation()
 
@@ -363,12 +430,127 @@ class StockCacheTest(unittest.TestCase):
             [active.manifest.parent],
         )
 
+    def test_inactive_cleanup_failure_is_observable_without_rollback(self) -> None:
+        self.fixture.seed_generation()
+        real_rmtree = shutil.rmtree
+
+        def fail_for_previous_generation(path: Path, *args: object, **kwargs: object) -> None:
+            if Path(path).name == "generation-existing":
+                raise PermissionError("synthetic Windows cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with patch(
+            "papa_shin_stock.cache.shutil.rmtree",
+            side_effect=fail_for_previous_generation,
+        ):
+            result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(
+            result.to_public_dict()["warnings"][0]["code"],
+            "cache_cleanup_incomplete",
+        )
+        self.assertEqual(self.fixture.current_generation_id(), "generation-b")
+        self.assertTrue(
+            (self.cache_root / "generations" / "generation-existing").is_dir()
+        )
+
+    def test_displaced_writer_cannot_cleanup_new_current_generation(self) -> None:
+        self.fixture.seed_generation()
+        cache = StockCache(self.cache_root, FakeHttpClient())
+        original_cleanup = cache._cleanup_inactive_generations
+
+        def displace_before_cleanup(*args: object) -> str | None:
+            current = json.loads(
+                (self.cache_root / "current.json").read_text(encoding="utf-8")
+            )
+            current_directory = self.cache_root / "generations" / current["directory_name"]
+            replacement_name = "generation-new-owner"
+            replacement = self.cache_root / "generations" / replacement_name
+            shutil.copytree(current_directory, replacement)
+            (replacement / "manifest.json").write_bytes(manifest_bytes("generation-c"))
+            state_path = replacement / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["generation_id"] = "generation-c"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            (self.cache_root / "current.json").write_text(
+                json.dumps(
+                    {
+                        "generation_id": "generation-c",
+                        "directory_name": replacement_name,
+                        "activation_token": "replacement-writer",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (self.cache_root / ".refresh.lock" / "owner.json").write_text(
+                json.dumps(
+                    {"token": "replacement-writer", "created_at": time.time()}
+                ),
+                encoding="utf-8",
+            )
+            return original_cleanup(*args)
+
+        with patch.object(
+            cache,
+            "_cleanup_inactive_generations",
+            side_effect=displace_before_cleanup,
+        ):
+            result = cache.refresh(self.config)
+
+        current = CacheState.load(self.cache_root)
+        self.assertIsNotNone(current)
+        self.assertEqual(current.generation_id, "generation-c")
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_locked")
+
     def test_cache_state_rejects_pointer_to_incomplete_generation(self) -> None:
         self.fixture.seed_generation()
         StockCache(self.cache_root, FakeHttpClient()).current_generation().offers.unlink()
 
         with self.assertRaisesRegex(StockError, "cache_unavailable"):
             CacheState.load(self.cache_root)
+
+    def test_cache_state_rejects_malformed_stored_manifest(self) -> None:
+        self.fixture.seed_generation()
+        generation = self.cache_root / "generations" / "generation-existing"
+        (generation / "manifest.json").write_text("not-json", encoding="utf-8")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+
+    def test_cache_state_rejects_stored_manifest_generation_mismatch(self) -> None:
+        self.fixture.seed_generation()
+        generation = self.cache_root / "generations" / "generation-existing"
+        (generation / "manifest.json").write_bytes(manifest_bytes("generation-c"))
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+
+    def test_cache_state_rejects_readable_file_with_wrong_checksum(self) -> None:
+        self.fixture.seed_generation()
+        generation = self.cache_root / "generations" / "generation-existing"
+        (generation / "products.jsonl").write_bytes(b"readable-but-corrupt\n")
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            CacheState.load(self.cache_root)
+
+    def test_corrupt_readable_previous_cache_cannot_be_stale_fallback(self) -> None:
+        self.fixture.seed_generation()
+        generation = self.cache_root / "generations" / "generation-existing"
+        (generation / "products.jsonl").write_bytes(b"readable-but-corrupt\n")
+        client = FakeHttpClient()
+
+        with patch.object(
+            client,
+            "get_manifest",
+            side_effect=StockError("network_error", "Синтетическая ошибка сети", 3),
+        ):
+            with self.assertRaisesRegex(StockError, "network_error") as raised:
+                StockCache(self.cache_root, client).refresh(self.config)
+
+        self.assertNotEqual(raised.exception.exit_code, 0)
 
     def test_refresh_recovers_from_invalid_pointer_when_new_download_succeeds(self) -> None:
         (self.cache_root / "current.json").write_text("not-json", encoding="utf-8")
@@ -393,6 +575,24 @@ class StockCacheTest(unittest.TestCase):
             StockCache(self.cache_root, client).refresh(self.config)
 
         self.assertEqual(client.manifest_calls, [(None, None)])
+
+    def test_directory_fsync_propagates_storage_failures(self) -> None:
+        real_open = os.open
+
+        for error_number in (errno.EIO, errno.ENOSPC):
+            with self.subTest(errno=error_number):
+                with patch(
+                    "papa_shin_stock.cache.os.open",
+                    side_effect=lambda path, flags: real_open(path, flags),
+                ):
+                    with patch(
+                        "papa_shin_stock.cache.os.fsync",
+                        side_effect=OSError(error_number, "synthetic fsync failure"),
+                    ):
+                        with self.assertRaises(OSError) as raised:
+                            _fsync_directory(self.cache_root)
+
+                self.assertEqual(raised.exception.errno, error_number)
 
 
 if __name__ == "__main__":
