@@ -3,12 +3,14 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import stat
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from papa_shin_stock.http_client import HttpResponse, SafeHttpClient
 
 
 _LOCK_TTL_SECONDS = 30 * 60
+_LOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
@@ -115,7 +118,11 @@ class CacheState:
     files: GenerationFiles
 
     @classmethod
-    def load(cls, cache_dir: Path) -> "CacheState | None":
+    def load(
+        cls,
+        cache_dir: Path,
+        progress: Callable[[], None] | None = None,
+    ) -> "CacheState | None":
         pointer_path = cache_dir / "current.json"
         if not pointer_path.exists():
             return None
@@ -130,9 +137,13 @@ class CacheState:
             manifest = Manifest.parse(files.manifest.read_bytes())
             if manifest.generation_id != pointer.generation_id:
                 raise _cache_unavailable()
-            _verify_file(files.products, manifest.products)
-            _verify_file(files.offers, manifest.offers)
-        except (OSError, StockError) as error:
+            _verify_file(files.products, manifest.products, progress)
+            _verify_file(files.offers, manifest.offers, progress)
+        except StockError as error:
+            if error.code == "cache_locked":
+                raise
+            raise _cache_unavailable() from error
+        except OSError as error:
             raise _cache_unavailable() from error
 
         state_path = generation / "state.json"
@@ -304,6 +315,8 @@ class CacheLock:
             owner = {"token": token, "created_at": time.time()}
             try:
                 _write_json_atomic(path / "owner.json", owner)
+                _write_bytes_fsync(path / f"heartbeat-{token}", b"")
+                _fsync_directory(path)
             except OSError as error:
                 shutil.rmtree(path, ignore_errors=True)
                 raise StockError(
@@ -322,7 +335,11 @@ class CacheLock:
             return False
 
         confirmed = cls._read_owner(path)
-        if confirmed is None or confirmed[0] != observed_token:
+        if (
+            confirmed is None
+            or confirmed[0] != observed_token
+            or time.time() - confirmed[1] <= _LOCK_TTL_SECONDS
+        ):
             return False
 
         quarantine = path.with_name(f"{path.name}.reclaim-{uuid.uuid4().hex}")
@@ -332,7 +349,11 @@ class CacheLock:
             return False
 
         moved = cls._read_owner(quarantine)
-        if moved is None or moved[0] != observed_token:
+        if (
+            moved is None
+            or moved[0] != observed_token
+            or time.time() - moved[1] <= _LOCK_TTL_SECONDS
+        ):
             try:
                 if not path.exists():
                     os.rename(quarantine, path)
@@ -394,7 +415,28 @@ class CacheLock:
             or isinstance(created_at, bool)
         ):
             return None
-        return token, float(created_at)
+        timestamp = float(created_at)
+        if (
+            not math.isfinite(timestamp)
+            or timestamp > time.time() + _LOCK_FUTURE_SKEW_SECONDS
+        ):
+            return None
+        heartbeat_path = path / f"heartbeat-{token}"
+        try:
+            heartbeat = heartbeat_path.stat(follow_symlinks=False)
+        except OSError:
+            heartbeat = None
+        if heartbeat is not None:
+            if not stat.S_ISREG(heartbeat.st_mode):
+                return None
+            heartbeat_timestamp = heartbeat.st_mtime
+            if (
+                not math.isfinite(heartbeat_timestamp)
+                or heartbeat_timestamp > time.time() + _LOCK_FUTURE_SKEW_SECONDS
+            ):
+                return None
+            timestamp = max(timestamp, heartbeat_timestamp)
+        return token, timestamp
 
     def assert_owned(self) -> None:
         owner = self._read_owner(self.path)
@@ -402,6 +444,16 @@ class CacheLock:
             raise StockError(
                 "cache_locked", "Право на обновление кэша было утрачено", 6
             )
+
+    def heartbeat(self) -> None:
+        self.assert_owned()
+        try:
+            os.utime(self.path / f"heartbeat-{self.token}", None)
+        except OSError as error:
+            raise StockError(
+                "cache_locked", "Право на обновление кэша было утрачено", 6
+            ) from error
+        self.assert_owned()
 
     def release(self) -> None:
         owner = self._read_owner(self.path)
@@ -446,7 +498,7 @@ class StockCache:
     def refresh(self, config: StockConfig) -> RefreshResult:
         try:
             with CacheLock.acquire(self.root) as lock:
-                previous = self._load_if_readable()
+                previous = self._load_if_readable(lock.heartbeat)
                 response = self.client.get_manifest(
                     previous.manifest_etag if previous else None,
                     previous.manifest_last_modified if previous else None,
@@ -454,16 +506,41 @@ class StockCache:
                 if response.status == 304:
                     if previous is None:
                         raise _cache_unavailable()
-                    return RefreshResult.from_state("not_modified", previous)
+                    lock.assert_owned()
+                    current = CacheState.load(self.root, lock.heartbeat)
+                    if (
+                        current is None
+                        or current.generation_id != previous.generation_id
+                        or current.directory_name != previous.directory_name
+                    ):
+                        raise StockError(
+                            "cache_locked", "Активное поколение кэша изменилось", 6
+                        )
+                    lock.assert_owned()
+                    return RefreshResult.from_state("not_modified", current)
                 if response.status != 200:
                     raise StockError(
                         "network_error", "Не удалось получить manifest", 3
                     )
 
                 manifest = Manifest.parse(response.body)
-                staged = self._download_generation(manifest, config)
+                if previous is not None:
+                    cleanup_warning = self._cleanup_inactive_generations(lock)
+                    if cleanup_warning is not None:
+                        current = CacheState.load(self.root, lock.heartbeat)
+                        if current is None:
+                            raise _cache_unavailable()
+                        lock.assert_owned()
+                        return RefreshResult.from_state(
+                            "stale_cache",
+                            current,
+                            stale=True,
+                            warning_code=cleanup_warning,
+                        )
+                lock.heartbeat()
+                staged = self._download_generation(manifest, config, lock)
                 try:
-                    self._verify_generation(staged, manifest)
+                    self._verify_generation(staged, manifest, lock)
                     state = self._activate(staged, manifest, response, lock)
                 except BaseException:
                     self._remove_generation_if_inactive(staged.manifest.parent)
@@ -500,14 +577,18 @@ class StockCache:
             raise _cache_unavailable()
         return state.files
 
-    def _load_if_readable(self) -> CacheState | None:
+    def _load_if_readable(
+        self, progress: Callable[[], None] | None = None
+    ) -> CacheState | None:
         try:
-            return CacheState.load(self.root)
-        except StockError:
+            return CacheState.load(self.root, progress)
+        except StockError as error:
+            if error.code == "cache_locked":
+                raise
             return None
 
     def _download_generation(
-        self, manifest: Manifest, config: StockConfig
+        self, manifest: Manifest, config: StockConfig, lock: CacheLock
     ) -> GenerationFiles:
         generations = self.root / "generations"
         generations.mkdir(parents=True, exist_ok=True)
@@ -521,12 +602,14 @@ class StockCache:
                 staged.products,
                 manifest.products.bytes,
                 manifest.products.sha256,
+                progress=lock.heartbeat,
             )
             self.client.download(
                 _resolve_download_url(config.manifest_url, manifest.offers.url),
                 staged.offers,
                 manifest.offers.bytes,
                 manifest.offers.sha256,
+                progress=lock.heartbeat,
             )
             for path in (staged.products, staged.offers):
                 _fsync_file(path)
@@ -536,9 +619,11 @@ class StockCache:
             shutil.rmtree(directory, ignore_errors=True)
             raise
 
-    def _verify_generation(self, staged: GenerationFiles, manifest: Manifest) -> None:
-        _verify_file(staged.products, manifest.products)
-        _verify_file(staged.offers, manifest.offers)
+    def _verify_generation(
+        self, staged: GenerationFiles, manifest: Manifest, lock: CacheLock
+    ) -> None:
+        _verify_file(staged.products, manifest.products, lock.heartbeat)
+        _verify_file(staged.offers, manifest.offers, lock.heartbeat)
 
     def _activate(
         self,
@@ -575,7 +660,7 @@ class StockCache:
             lock.assert_owned()
             _write_json_atomic(current_path, pointer.to_dict())
             lock.assert_owned()
-            state = CacheState.load(self.root)
+            state = CacheState.load(self.root, lock.heartbeat)
             if state is None:
                 raise _cache_unavailable()
             lock.assert_owned()
@@ -686,7 +771,11 @@ def _resolve_download_url(manifest_url: str, candidate: str) -> str:
     return urljoin(manifest_url, candidate)
 
 
-def _verify_file(path: Path, expected: ManifestFile) -> None:
+def _verify_file(
+    path: Path,
+    expected: ManifestFile,
+    progress: Callable[[], None] | None = None,
+) -> None:
     digest = hashlib.sha256()
     received = 0
     try:
@@ -694,6 +783,8 @@ def _verify_file(path: Path, expected: ManifestFile) -> None:
             while chunk := stream.read(1024 * 1024):
                 received += len(chunk)
                 digest.update(chunk)
+                if progress is not None:
+                    progress()
     except OSError as error:
         raise StockError(
             "download_integrity_failed",

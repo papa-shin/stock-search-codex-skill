@@ -4,6 +4,7 @@ import base64
 import hashlib
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -109,6 +110,7 @@ class SafeHttpClient:
         destination: Path,
         expected_bytes: int,
         expected_sha256: str,
+        progress: Callable[[], None] | None = None,
     ) -> DownloadReceipt:
         resolved = assert_allowed_download_url(self.config.manifest_url, url)
         digest = hashlib.sha256()
@@ -119,6 +121,8 @@ class SafeHttpClient:
                     output.write(chunk)
                     digest.update(chunk)
                     received += len(chunk)
+                    if progress is not None:
+                        progress()
         except StockError:
             destination.unlink(missing_ok=True)
             raise

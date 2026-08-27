@@ -73,6 +73,7 @@ class FakeHttpClient:
         self.interrupt_offers = interrupt_offers
         self.displace_lock = displace_lock
         self.manifest_calls: list[tuple[str | None, str | None]] = []
+        self.download_calls: list[str] = []
 
     def get_manifest(
         self, etag: str | None = None, last_modified: str | None = None
@@ -86,7 +87,9 @@ class FakeHttpClient:
         destination: Path,
         expected_bytes: int,
         expected_sha256: str,
+        progress: object | None = None,
     ) -> DownloadReceipt:
+        self.download_calls.append(url)
         if destination.name == "products.jsonl":
             payload = b"corrupt" if self.corrupt_products else PRODUCTS
         else:
@@ -96,6 +99,8 @@ class FakeHttpClient:
                 raise StockError("network_error", "Синтетический обрыв загрузки", 3)
 
         destination.write_bytes(payload)
+        if callable(progress):
+            progress()
         if self.displace_lock and destination.name == "offers.jsonl":
             owner_path = destination.parents[2] / ".refresh.lock" / "owner.json"
             owner_path.write_text(
@@ -271,6 +276,127 @@ class StockCacheTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "cache_locked"):
             StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
+    def test_heartbeat_prevents_reclaim_after_original_timestamp_expires(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        (lock.path / "owner.json").write_text(
+            json.dumps(
+                {"token": lock.token, "created_at": time.time() - 30 * 60 - 1}
+            ),
+            encoding="utf-8",
+        )
+        stale_time = time.time() - 30 * 60 - 1
+        os.utime(lock.path / f"heartbeat-{lock.token}", (stale_time, stale_time))
+
+        lock.heartbeat()
+
+        self.assertFalse(CacheLock._reclaim_stale(lock.path))
+        lock.assert_owned()
+        lock.release()
+
+    def test_heartbeat_during_reclaim_restores_moved_lock(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        stale_time = time.time() - 30 * 60 - 1
+        (lock.path / "owner.json").write_text(
+            json.dumps({"token": lock.token, "created_at": stale_time}),
+            encoding="utf-8",
+        )
+        heartbeat_path = lock.path / f"heartbeat-{lock.token}"
+        os.utime(heartbeat_path, (stale_time, stale_time))
+        real_rename = os.rename
+        first_rename = True
+
+        def heartbeat_then_rename(source: Path, destination: Path) -> None:
+            nonlocal first_rename
+            if first_rename:
+                first_rename = False
+                os.utime(heartbeat_path, None)
+            real_rename(source, destination)
+
+        with patch(
+            "papa_shin_stock.cache.os.rename",
+            side_effect=heartbeat_then_rename,
+        ):
+            reclaimed = CacheLock._reclaim_stale(lock.path)
+
+        self.assertFalse(reclaimed)
+        lock.assert_owned()
+        lock.release()
+
+    def test_previous_cache_hashing_emits_lock_heartbeats(self) -> None:
+        self.fixture.seed_generation()
+        beats: list[str] = []
+
+        def record_heartbeat(lock: CacheLock) -> None:
+            beats.append(lock.token)
+
+        with patch.object(
+            CacheLock, "heartbeat", record_heartbeat, create=True
+        ):
+            result = StockCache(
+                self.cache_root,
+                FakeHttpClient(
+                    response=HttpResponse(status=304, headers={}, body=b"")
+                ),
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "not_modified")
+        self.assertGreaterEqual(len(beats), 2)
+
+    def test_displacement_during_previous_hashing_stops_before_http(self) -> None:
+        self.fixture.seed_generation()
+        client = FakeHttpClient(
+            response=HttpResponse(status=304, headers={}, body=b"")
+        )
+        real_heartbeat = CacheLock.heartbeat
+        displaced = False
+
+        def displace_on_heartbeat(lock: CacheLock) -> None:
+            nonlocal displaced
+            if not displaced:
+                displaced = True
+                (lock.path / "owner.json").write_text(
+                    json.dumps(
+                        {"token": "replacement-writer", "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+            real_heartbeat(lock)
+
+        with patch.object(CacheLock, "heartbeat", displace_on_heartbeat):
+            result = StockCache(self.cache_root, client).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(client.manifest_calls, [])
+
+    def test_displaced_owner_cannot_return_not_modified_success(self) -> None:
+        self.fixture.seed_generation()
+        cache_root = self.cache_root
+
+        class DisplacingManifestClient(FakeHttpClient):
+            def get_manifest(
+                self, etag: str | None = None, last_modified: str | None = None
+            ) -> HttpResponse:
+                response = super().get_manifest(etag, last_modified)
+                (cache_root / ".refresh.lock" / "owner.json").write_text(
+                    json.dumps(
+                        {"token": "replacement-writer", "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+                return response
+
+        result = StockCache(
+            self.cache_root,
+            DisplacingManifestClient(
+                response=HttpResponse(status=304, headers={}, body=b"")
+            ),
+        ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+
     def test_release_does_not_delete_lock_whose_owner_changed_after_read(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
         real_read_owner = CacheLock._read_owner
@@ -318,6 +444,51 @@ class StockCacheTest(unittest.TestCase):
     def test_ownerless_lock_older_than_thirty_minutes_is_reclaimed(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()
+        stale_time = time.time() - 30 * 60 - 1
+        os.utime(lock, (stale_time, stale_time))
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertFalse(lock.exists())
+
+    def test_nan_owner_timestamp_does_not_bypass_directory_ttl(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            json.dumps({"token": "corrupt-writer", "created_at": float("nan")}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertTrue(lock.is_dir())
+
+    def test_infinite_owner_timestamp_uses_stale_directory_ttl(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            json.dumps({"token": "corrupt-writer", "created_at": float("inf")}),
+            encoding="utf-8",
+        )
+        stale_time = time.time() - 30 * 60 - 1
+        os.utime(lock, (stale_time, stale_time))
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertFalse(lock.exists())
+
+    def test_far_future_owner_timestamp_uses_stale_directory_ttl(self) -> None:
+        lock = self.cache_root / ".refresh.lock"
+        lock.mkdir()
+        (lock / "owner.json").write_text(
+            json.dumps(
+                {"token": "corrupt-writer", "created_at": time.time() + 24 * 60 * 60}
+            ),
+            encoding="utf-8",
+        )
         stale_time = time.time() - 30 * 60 - 1
         os.utime(lock, (stale_time, stale_time))
 
@@ -397,7 +568,10 @@ class StockCacheTest(unittest.TestCase):
         self.fixture.seed_generation()
         real_load = CacheState.load
 
-        def reject_new_current(cache_dir: Path) -> CacheState | None:
+        def reject_new_current(
+            cache_dir: Path,
+            progress: object | None = None,
+        ) -> CacheState | None:
             pointer = json.loads(
                 (cache_dir / "current.json").read_text(encoding="utf-8")
             )
@@ -405,7 +579,7 @@ class StockCacheTest(unittest.TestCase):
                 raise StockError(
                     "cache_unavailable", "Синтетическая ошибка validation", 7
                 )
-            return real_load(cache_dir)
+            return real_load(cache_dir, progress if callable(progress) else None)
 
         with patch.object(CacheState, "load", side_effect=reject_new_current):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
@@ -455,6 +629,44 @@ class StockCacheTest(unittest.TestCase):
         self.assertTrue(
             (self.cache_root / "generations" / "generation-existing").is_dir()
         )
+
+    def test_repeated_cleanup_failure_does_not_accumulate_generations(self) -> None:
+        self.fixture.seed_generation()
+        client = FakeHttpClient()
+        real_rmtree = shutil.rmtree
+        generations = self.cache_root / "generations"
+
+        def fail_for_generation(path: Path, *args: object, **kwargs: object) -> None:
+            if Path(path).parent == generations:
+                raise PermissionError("synthetic persistent cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with patch(
+            "papa_shin_stock.cache.shutil.rmtree",
+            side_effect=fail_for_generation,
+        ):
+            first = StockCache(self.cache_root, client).refresh(self.config)
+            pointer_after_first = (self.cache_root / "current.json").read_bytes()
+            directories_after_first = sorted(
+                path.name for path in generations.iterdir() if path.is_dir()
+            )
+            downloads_after_first = len(client.download_calls)
+
+            second = StockCache(self.cache_root, client).refresh(self.config)
+
+        self.assertEqual(first.status, "updated")
+        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.status, "stale_cache")
+        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(
+            (self.cache_root / "current.json").read_bytes(), pointer_after_first
+        )
+        self.assertEqual(len(client.download_calls), downloads_after_first)
+        self.assertEqual(
+            sorted(path.name for path in generations.iterdir() if path.is_dir()),
+            directories_after_first,
+        )
+        self.assertEqual(len(directories_after_first), 2)
 
     def test_displaced_writer_cannot_cleanup_new_current_generation(self) -> None:
         self.fixture.seed_generation()

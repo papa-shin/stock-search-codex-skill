@@ -209,6 +209,23 @@ class SafeHttpSecurityTest(unittest.TestCase):
         self.assertEqual(receipt.bytes, len(payload))
         self.assertEqual(receipt.sha256, hashlib.sha256(payload).hexdigest())
 
+    def test_download_calls_progress_for_each_streamed_chunk(self) -> None:
+        payload = b"x" * (2 * 1024 * 1024 + 1)
+        opener = RecordingOpener([FakeResponse(payload)])
+        client = self.client_with_opener(opener)
+        destination = self.directory / "products-large.jsonl"
+        heartbeats: list[None] = []
+
+        client.download(
+            "https://stock.example.test/products-large.jsonl",
+            destination,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+            progress=lambda: heartbeats.append(None),
+        )
+
+        self.assertEqual(len(heartbeats), 3)
+
     def test_download_removes_payload_that_fails_integrity_check(self) -> None:
         destination = self.directory / "products.jsonl"
         client = self.client_with_opener(RecordingOpener([FakeResponse(b"altered")]))
