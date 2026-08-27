@@ -987,18 +987,21 @@ class StockCache:
             directory_name=final_name,
             activation_token=lock.token,
         )
+        runtime_value = {
+            "generation_id": manifest.generation_id,
+            "checked_at": checked_at,
+            "stale": False,
+            "warning_code": None,
+            "revision": uuid.uuid4().hex,
+        }
+        expected_runtime = validate_runtime_status(
+            runtime_value, manifest.generation_id
+        )
 
         lock.assert_owned()
         os.replace(staged.manifest.parent, final_directory)
         try:
             _fsync_directory(final_directory.parent)
-            runtime_value = {
-                "generation_id": manifest.generation_id,
-                "checked_at": checked_at,
-                "stale": False,
-                "warning_code": None,
-                "revision": uuid.uuid4().hex,
-            }
             lock.heartbeat()
             with RuntimeCommitLock.acquire(self.root):
                 lock.assert_owned()
@@ -1039,7 +1042,7 @@ class StockCache:
             lock.assert_owned()
         except BaseException:
             self._rollback_pointer_if_owned(
-                current_path, pointer, previous_pointer
+                current_path, pointer, expected_runtime, previous_pointer
             )
             self._remove_generation_if_inactive(final_directory)
             raise
@@ -1049,12 +1052,16 @@ class StockCache:
         self,
         current_path: Path,
         expected_pointer: CurrentPointer,
+        expected_runtime: RuntimeStatus,
         previous_pointer: bytes | None,
     ) -> None:
         try:
             with RuntimeCommitLock.acquire(self.root):
                 self._rollback_pointer_if_owned_locked(
-                    current_path, expected_pointer, previous_pointer
+                    current_path,
+                    expected_pointer,
+                    expected_runtime,
+                    previous_pointer,
                 )
         except StockError:
             return
@@ -1063,6 +1070,7 @@ class StockCache:
         self,
         current_path: Path,
         expected_pointer: CurrentPointer,
+        expected_runtime: RuntimeStatus,
         previous_pointer: bytes | None,
     ) -> None:
         try:
@@ -1070,6 +1078,17 @@ class StockCache:
         except StockError:
             return
         if current != expected_pointer:
+            return
+        try:
+            current_runtime = load_runtime_status(
+                _runtime_status_path(
+                    self.root, expected_pointer.directory_name
+                ),
+                expected_pointer.generation_id,
+            )
+        except StockError:
+            return
+        if current_runtime != expected_runtime:
             return
         if previous_pointer is None:
             current_path.unlink(missing_ok=True)
@@ -1079,19 +1098,37 @@ class StockCache:
 
     def _remove_generation_if_inactive(self, directory: Path) -> None:
         try:
-            state = CacheState.load(self.root)
-        except StockError:
-            state = None
-        if state is not None and state.files.manifest.parent == directory:
-            return
-        shutil.rmtree(directory, ignore_errors=True)
-        try:
-            status_path = _runtime_status_path(self.root, directory.name)
-            observed = _lstat_optional(status_path)
-            if observed is not None and not stat.S_ISDIR(observed.st_mode):
-                status_path.unlink(missing_ok=True)
+            with RuntimeCommitLock.acquire(self.root):
+                current_path = self.root / "current.json"
+                observed_current = _lstat_optional(current_path)
+                if observed_current is None:
+                    pointer = None
+                elif not stat.S_ISREG(observed_current.st_mode):
+                    return
+                else:
+                    try:
+                        pointer = CurrentPointer.load(current_path)
+                    except StockError:
+                        return
+                if (
+                    pointer is not None
+                    and pointer.directory_name == directory.name
+                ):
+                    return
+                shutil.rmtree(directory, ignore_errors=True)
+                try:
+                    status_path = _runtime_status_path(
+                        self.root, directory.name
+                    )
+                except StockError:
+                    return
+                observed_status = _lstat_optional(status_path)
+                if observed_status is not None and not stat.S_ISDIR(
+                    observed_status.st_mode
+                ):
+                    status_path.unlink(missing_ok=True)
         except (OSError, StockError):
-            pass
+            return
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
         lock.assert_owned()

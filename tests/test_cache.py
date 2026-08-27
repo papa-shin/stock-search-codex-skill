@@ -180,7 +180,10 @@ class StockCacheTest(unittest.TestCase):
         )
 
     def _expire_current_refresh_lock(self) -> None:
-        lock_path = self.cache_root / ".refresh.lock"
+        self._expire_refresh_lock_at(self.cache_root)
+
+    def _expire_refresh_lock_at(self, root: Path) -> None:
+        lock_path = root / ".refresh.lock"
         owner_path = lock_path / "owner.json"
         owner = json.loads(owner_path.read_text(encoding="utf-8"))
         expired = time.time() - cache_module._LOCK_TTL_SECONDS - 1
@@ -1008,6 +1011,142 @@ class StockCacheTest(unittest.TestCase):
         active = CacheState.load(self.cache_root)
         self.assertIsNotNone(active)
         self.assertTrue(active.files.manifest.parent.is_dir())
+
+    def test_activation_rollback_never_overwrites_successor_304_runtime_revision(
+        self,
+    ) -> None:
+        for iteration in range(20):
+            with self.subTest(iteration=iteration):
+                root = Path(self.temp_dir.name) / f"revision-race-{iteration}"
+                root.mkdir()
+                fixture = CacheFixture(root)
+                fixture.seed_generation()
+                config = StockConfig(
+                    manifest_url="https://stock.example.test/manifest.json",
+                    username="synthetic-user",
+                    password="synthetic-password",
+                    product_id_field="product_id",
+                    offer_product_id_field="product_id",
+                    cache_dir=root,
+                )
+                published = threading.Event()
+                allow_failed_validation = threading.Event()
+                delayed_errors: list[BaseException] = []
+                real_load = CacheState.load
+                post_publish_failed = False
+
+                def pause_post_publish(
+                    cache_dir: Path, progress: object | None = None
+                ) -> CacheState | None:
+                    nonlocal post_publish_failed
+                    pointer = CurrentPointer.load(cache_dir / "current.json")
+                    if (
+                        cache_dir == root
+                        and not post_publish_failed
+                        and threading.current_thread().name
+                        == f"revision-race-{iteration}"
+                        and pointer.generation_id == "generation-b"
+                    ):
+                        post_publish_failed = True
+                        published.set()
+                        if not allow_failed_validation.wait(timeout=5):
+                            raise AssertionError("post publish timeout")
+                        raise StockError(
+                            "cache_unavailable",
+                            "Синтетическая ошибка post-publish",
+                            7,
+                        )
+                    return real_load(
+                        cache_dir, progress if callable(progress) else None
+                    )
+
+                def run_delayed() -> None:
+                    try:
+                        StockCache(root, FakeHttpClient()).refresh(config)
+                    except BaseException as error:
+                        delayed_errors.append(error)
+
+                with patch.object(
+                    CacheState, "load", side_effect=pause_post_publish
+                ):
+                    delayed = threading.Thread(
+                        target=run_delayed, name=f"revision-race-{iteration}"
+                    )
+                    delayed.start()
+                    self.assertTrue(published.wait(timeout=5))
+                    self._expire_refresh_lock_at(root)
+                    successor = StockCache(
+                        root,
+                        FakeHttpClient(
+                            response=HttpResponse(status=304, headers={}, body=b"")
+                        ),
+                    ).refresh(config)
+                    successor_state = CacheState.load(root)
+                    self.assertIsNotNone(successor_state)
+                    allow_failed_validation.set()
+                    delayed.join(timeout=5)
+
+                self.assertFalse(delayed.is_alive())
+                self.assertEqual(delayed_errors, [])
+                self.assertEqual(successor.status, "not_modified")
+                final = CacheState.load(root)
+                self.assertIsNotNone(final)
+                self.assertEqual(final.generation_id, "generation-b")
+                self.assertEqual(
+                    final.runtime_revision, successor_state.runtime_revision
+                )
+                self.assertTrue(final.files.manifest.parent.is_dir())
+
+    def test_failed_post_publish_check_preserves_pointer_target_when_cleanup_unproven(
+        self,
+    ) -> None:
+        self.fixture.seed_generation()
+        real_load = CacheState.load
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+        publish_commit_completed = False
+
+        def fail_persistently_after_publish(
+            cache_dir: Path, progress: object | None = None
+        ) -> CacheState | None:
+            pointer = CurrentPointer.load(cache_dir / "current.json")
+            if pointer.generation_id == "generation-b":
+                raise StockError(
+                    "post_publish_failure",
+                    "Синтетическая ошибка post-publish",
+                    7,
+                )
+            return real_load(cache_dir, progress if callable(progress) else None)
+
+        def fail_rollback_and_cleanup_lock(root: Path) -> object:
+            nonlocal publish_commit_completed
+            if not publish_commit_completed:
+                publish_commit_completed = True
+                return real_commit_acquire(root)
+            raise StockError(
+                "cache_unavailable", "Синтетическая ошибка commit lock", 7
+            )
+
+        with patch.object(CacheState, "load", side_effect=fail_persistently_after_publish):
+            with patch.object(
+                cache_module.RuntimeCommitLock,
+                "acquire",
+                side_effect=fail_rollback_and_cleanup_lock,
+            ):
+                with self.assertRaises(StockError) as raised:
+                    StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(raised.exception.code, "post_publish_failure")
+        pointer = CurrentPointer.load(self.cache_root / "current.json")
+        self.assertEqual(pointer.generation_id, "generation-b")
+        target = self.cache_root / "generations" / pointer.directory_name
+        self.assertTrue(target.is_dir())
+        self.assertTrue((target / "manifest.json").is_file())
+        self.assertTrue(
+            (
+                self.cache_root
+                / f".runtime-status-{pointer.directory_name}.json"
+            ).is_file()
+        )
 
     def test_interrupted_pointer_replace_rolls_back_to_previous_generation(self) -> None:
         self.fixture.seed_generation()
