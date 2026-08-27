@@ -71,18 +71,23 @@ class RejectCrossOriginRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SafeHttpClient:
-    def __init__(self, config: StockConfig, opener: object) -> None:
+    def __init__(self, config: StockConfig) -> None:
         self.config = config
-        self.opener = opener
         self.origin = normalized_origin(config.manifest_url)
+        if self.origin[0] != "https":
+            raise StockError("config_invalid", "Для загрузки требуется HTTPS", 2)
+        self._opener = urllib.request.build_opener(
+            RejectCrossOriginRedirect(self.origin)
+        )
 
     @classmethod
     def for_config(cls, config: StockConfig) -> "SafeHttpClient":
-        origin = normalized_origin(config.manifest_url)
-        if origin[0] != "https":
-            raise StockError("config_invalid", "Для загрузки требуется HTTPS", 2)
-        redirect_handler = RejectCrossOriginRedirect(origin)
-        return cls(config=config, opener=urllib.request.build_opener(redirect_handler))
+        return cls(config=config)
+
+    @property
+    def opener(self) -> urllib.request.OpenerDirector:
+        """Expose the constructed opener for diagnostics without accepting injections."""
+        return self._opener
 
     def get_manifest(
         self, etag: str | None = None, last_modified: str | None = None
@@ -150,7 +155,7 @@ class SafeHttpClient:
         request_headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
         request = urllib.request.Request(url, headers=request_headers)
         try:
-            return self.opener.open(request)
+            return self._opener.open(request)
         except urllib.error.HTTPError as error:
             if error.code == 304:
                 return error

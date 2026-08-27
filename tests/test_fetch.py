@@ -5,7 +5,10 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request
 
 
@@ -52,6 +55,14 @@ class RecordingOpener:
         return self._responses.pop(0)
 
 
+class RaisingOpener:
+    def __init__(self, error: HTTPError) -> None:
+        self.error = error
+
+    def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
+        raise self.error
+
+
 class SafeHttpSecurityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -74,6 +85,11 @@ class SafeHttpSecurityTest(unittest.TestCase):
             cache_dir=self.directory,
         )
 
+    def client_with_opener(self, opener: object) -> SafeHttpClient:
+        client = SafeHttpClient.for_config(self.https_config)
+        client._opener = opener
+        return client
+
     def test_cross_origin_download_is_rejected(self) -> None:
         with self.assertRaisesRegex(StockError, "manifest_invalid"):
             assert_allowed_download_url(
@@ -85,6 +101,10 @@ class SafeHttpSecurityTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "config_invalid"):
             SafeHttpClient.for_config(self.http_config)
 
+    def test_direct_construction_rejects_http_config_before_credentials_can_be_sent(self) -> None:
+        with self.assertRaisesRegex(StockError, "config_invalid"):
+            SafeHttpClient(self.http_config)
+
     def test_normalized_origin_treats_default_https_port_as_same_origin(self) -> None:
         self.assertEqual(
             normalized_origin("https://STOCK.example.test:443/manifest.json"),
@@ -95,7 +115,7 @@ class SafeHttpSecurityTest(unittest.TestCase):
         opener = RecordingOpener(
             [FakeResponse(b"", status=304, headers={"ETag": '"v2"'})]
         )
-        client = SafeHttpClient(self.https_config, opener)
+        client = self.client_with_opener(opener)
 
         response = client.get_manifest(etag='"v1"', last_modified="Tue, 01 Sep 2026 00:00:00 GMT")
 
@@ -108,9 +128,27 @@ class SafeHttpSecurityTest(unittest.TestCase):
         expected_authorization = base64.b64encode(b"test-user:test-password").decode("ascii")
         self.assertEqual(request.get_header("Authorization"), f"Basic {expected_authorization}")
 
+    def test_manifest_returns_real_http_error_304_as_response(self) -> None:
+        headers = Message()
+        headers["ETag"] = '"v2"'
+        error = HTTPError(
+            self.https_config.manifest_url,
+            304,
+            "Not Modified",
+            headers,
+            BytesIO(b""),
+        )
+        client = self.client_with_opener(RaisingOpener(error))
+
+        response = client.get_manifest()
+
+        self.assertEqual(response.status, 304)
+        self.assertEqual(response.headers, {"ETag": '"v2"'})
+        self.assertEqual(response.body, b"")
+
     def test_cross_origin_request_does_not_reach_opener_or_send_credentials(self) -> None:
         opener = RecordingOpener([])
-        client = SafeHttpClient(self.https_config, opener)
+        client = self.client_with_opener(opener)
 
         with self.assertRaisesRegex(StockError, "manifest_invalid"):
             client._open_same_origin("https://other.example.test/products.jsonl", {})
@@ -131,10 +169,28 @@ class SafeHttpSecurityTest(unittest.TestCase):
                 "https://other.example.test/manifest.json",
             )
 
+    def test_factory_opener_has_cross_origin_redirect_protection(self) -> None:
+        client = SafeHttpClient.for_config(self.https_config)
+        handler = next(
+            handler
+            for handler in client.opener.handlers
+            if isinstance(handler, RejectCrossOriginRedirect)
+        )
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            handler.redirect_request(
+                Request(self.https_config.manifest_url),
+                None,
+                302,
+                "Found",
+                {},
+                "https://other.example.test/manifest.json",
+            )
+
     def test_download_writes_verified_payload_and_returns_receipt(self) -> None:
         payload = b'{"product_id":"A-12"}\n'
         opener = RecordingOpener([FakeResponse(payload)])
-        client = SafeHttpClient(self.https_config, opener)
+        client = self.client_with_opener(opener)
         destination = self.directory / "products.jsonl"
 
         receipt = client.download(
@@ -150,7 +206,7 @@ class SafeHttpSecurityTest(unittest.TestCase):
 
     def test_download_removes_payload_that_fails_integrity_check(self) -> None:
         destination = self.directory / "products.jsonl"
-        client = SafeHttpClient(self.https_config, RecordingOpener([FakeResponse(b"altered")]))
+        client = self.client_with_opener(RecordingOpener([FakeResponse(b"altered")]))
 
         with self.assertRaisesRegex(StockError, "download_integrity_failed"):
             client.download(
