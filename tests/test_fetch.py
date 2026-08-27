@@ -244,33 +244,61 @@ class SafeHttpSecurityTest(unittest.TestCase):
 
 
 class FetchStockCliTest(unittest.TestCase):
-    def test_unknown_argument_prints_one_safe_json_document(self) -> None:
+    def run_cli(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             environment = dict(os.environ)
             environment["PAPA_SHIN_STOCK_CONFIG"] = str(
                 Path(directory) / "absent.env"
             )
-            result = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "fetch_stock.py"), "--unknown"],
+            return subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "fetch_stock.py"), *arguments],
                 env=environment,
                 capture_output=True,
                 text=True,
                 check=False,
             )
 
-        self.assertEqual(result.returncode, 4)
-        self.assertEqual(result.stderr, "")
-        self.assertEqual(result.stdout.count("\n"), 1)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "status": "error",
-                "error": {
-                    "code": "query_invalid",
-                    "message": "Некорректные параметры обновления",
-                },
-            },
+    def test_exact_single_help_argument_is_the_only_non_json_path(self) -> None:
+        for arguments in (["-h"], ["--help"]):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(arguments)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "")
+                self.assertIn("usage:", result.stdout)
+                self.assertIn("-h, --help", result.stdout)
+
+    def test_invalid_argument_forms_print_one_safe_json_document(self) -> None:
+        invalid_arguments = (
+            ["--unknown"],
+            ["-hvalue"],
+            ["-hx"],
+            ["--h"],
+            ["--unknown", "--help"],
+            ["--help", "--unknown"],
+            ["--help", "--help"],
+            ["-h", "-h"],
+            ["-h", "--help"],
         )
+        expected = {
+            "status": "error",
+            "error": {
+                "code": "query_invalid",
+                "message": "Некорректные параметры обновления",
+            },
+        }
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(list(arguments))
+
+                self.assertEqual(result.returncode, 4)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout.count("\n"), 1)
+                self.assertEqual(
+                    json.loads(result.stdout),
+                    expected,
+                )
 
     def test_help_exits_zero_without_config_or_refresh_side_effects(self) -> None:
         output = StringIO()

@@ -12,11 +12,15 @@ from papa_shin_stock.http_client import SafeHttpClient
 
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        raise StockError(
-            "query_invalid",
-            "Некорректные параметры обновления",
-            4,
-        )
+        raise _query_invalid()
+
+
+def _query_invalid() -> StockError:
+    return StockError(
+        "query_invalid",
+        "Некорректные параметры обновления",
+        4,
+    )
 
 
 def refresh_default() -> dict[str, object]:
@@ -26,19 +30,35 @@ def refresh_default() -> dict[str, object]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    return SafeArgumentParser(
-        description="Обновление локального проверенного кэша"
+    parser = SafeArgumentParser(
+        description="Обновление локального проверенного кэша",
+        add_help=False,
+        allow_abbrev=False,
     )
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        dest="help_requested",
+        help="show this help message and exit",
+    )
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = [] if argv is None else argv
+    parser = build_parser()
+    if arguments == ["-h"] or arguments == ["--help"]:
+        parser.print_help()
+        return 0
+
     try:
-        build_parser().parse_args([] if argv is None else argv)
+        namespace = parser.parse_args(arguments)
+        if namespace.help_requested:
+            raise _query_invalid()
         result = refresh_default()
         exit_code = 0
-    except SystemExit as error:
-        if error.code == 0:
-            return 0
+    except SystemExit:
         result = {
             "status": "error",
             "error": {
