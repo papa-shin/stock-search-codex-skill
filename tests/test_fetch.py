@@ -40,6 +40,7 @@ class FakeResponse:
         self.headers = headers or {}
         self.bytes_read = 0
         self.read_sizes: list[int] = []
+        self.closed = False
 
     def read(self, size: int = -1) -> bytes:
         self.read_sizes.append(size)
@@ -59,7 +60,24 @@ class FakeResponse:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
         return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TrackingBody(BytesIO):
+    def __init__(self, body: bytes) -> None:
+        super().__init__(body)
+        self.bytes_read = 0
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        result = super().read(size)
+        self.bytes_read += len(result)
+        return result
 
 
 class RecordingOpener:
@@ -82,6 +100,38 @@ class RaisingOpener:
     def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
         self.timeouts.append(timeout)
         raise self.error
+
+
+class RedirectingOpener:
+    def __init__(
+        self,
+        handler: RejectCrossOriginRedirect,
+        responses: list[FakeResponse],
+    ) -> None:
+        self.handler = handler
+        self.handler.add_parent(self)
+        self._responses = list(responses)
+        self.requests: list[Request] = []
+        self.timeouts: list[float | None] = []
+
+    def open(self, request: Request, timeout: float | None = None) -> FakeResponse:
+        request.timeout = timeout
+        self.requests.append(request)
+        self.timeouts.append(timeout)
+        response = self._responses.pop(0)
+        if response.status in {301, 302, 303, 307, 308}:
+            redirect = getattr(self.handler, f"http_error_{response.status}")
+            headers = Message()
+            for name, value in response.headers.items():
+                headers[name] = value
+            return redirect(
+                request,
+                response,
+                response.status,
+                "Synthetic redirect",
+                headers,
+            )
+        return response
 
 
 class RaisingReadResponse(FakeResponse):
@@ -211,6 +261,48 @@ class SafeHttpSecurityTest(unittest.TestCase):
         self.assertEqual(response.headers, {"ETag": '"v2"'})
         self.assertEqual(response.body, b"")
 
+    def test_non_returned_http_errors_close_body_without_reading_it(self) -> None:
+        for status, expected_code in (
+            (401, "auth_failed"),
+            (403, "auth_failed"),
+            (404, "network_error"),
+            (500, "network_error"),
+        ):
+            with self.subTest(status=status):
+                body = TrackingBody(b"x" * (3 * 1024 * 1024))
+                error = HTTPError(
+                    self.https_config.manifest_url,
+                    status,
+                    "Synthetic error",
+                    Message(),
+                    body,
+                )
+                client = self.client_with_opener(RaisingOpener(error))
+
+                with self.assertRaisesRegex(StockError, expected_code):
+                    client.get_manifest()
+
+                self.assertTrue(body.closed)
+                self.assertEqual(body.bytes_read, 0)
+
+    def test_http_error_304_remains_open_until_caller_closes_it(self) -> None:
+        body = TrackingBody(b"not modified")
+        error = HTTPError(
+            self.https_config.manifest_url,
+            304,
+            "Not Modified",
+            Message(),
+            body,
+        )
+        client = self.client_with_opener(RaisingOpener(error))
+
+        response = client._open_same_origin(self.https_config.manifest_url, {})
+
+        self.assertIs(response, error)
+        self.assertFalse(body.closed)
+        response.close()
+        self.assertTrue(body.closed)
+
     def test_auth_http_errors_have_distinct_safe_code(self) -> None:
         for status in (401, 403):
             with self.subTest(status=status):
@@ -333,6 +425,165 @@ class SafeHttpSecurityTest(unittest.TestCase):
                 {},
                 "https://other.example.test/manifest.json",
             )
+
+    def test_same_origin_redirect_preserves_method_body_and_headers(self) -> None:
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        request = Request(
+            "https://stock.example.test/source",
+            data=b"synthetic body",
+            headers={
+                "Authorization": "Basic synthetic",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            307,
+            "Temporary Redirect",
+            Message(),
+            "https://stock.example.test/target",
+        )
+
+        self.assertIsNotNone(redirected)
+        self.assertEqual(redirected.get_method(), "POST")
+        self.assertEqual(redirected.data, b"synthetic body")
+        self.assertEqual(redirected.get_header("Authorization"), "Basic synthetic")
+        self.assertEqual(redirected.get_header("Content-type"), "application/json")
+
+    def test_cross_origin_redirect_closes_body_without_reading_or_following(self) -> None:
+        redirect_body = FakeResponse(
+            b"x" * (3 * 1024 * 1024),
+            status=302,
+            headers={"Location": "https://other.example.test/manifest.json"},
+        )
+        final = FakeResponse(b"must not be requested")
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, [redirect_body, final])
+        client = self.client_with_opener(opener)
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            client.get_manifest()
+
+        self.assertEqual(len(opener.requests), 1)
+        self.assertTrue(redirect_body.closed)
+        self.assertEqual(redirect_body.bytes_read, 0)
+        self.assertEqual(redirect_body.remaining_bytes, 3 * 1024 * 1024)
+
+    def test_redirect_without_location_closes_body_without_reading(self) -> None:
+        redirect_body = FakeResponse(b"private redirect body", status=302)
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, [redirect_body])
+        client = self.client_with_opener(opener)
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            client.get_manifest()
+
+        self.assertTrue(redirect_body.closed)
+        self.assertEqual(redirect_body.bytes_read, 0)
+
+    def test_manifest_redirect_does_not_drain_body_and_preserves_request(self) -> None:
+        redirect_body = FakeResponse(
+            b"x" * (3 * 1024 * 1024),
+            status=302,
+            headers={"Location": "/current/manifest.json"},
+        )
+        final = FakeResponse(b"{}", headers={"ETag": '"v3"'})
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, [redirect_body, final])
+        client = self.client_with_opener(opener)
+
+        response = client.get_manifest(etag='"v2"')
+
+        self.assertEqual(response.body, b"{}")
+        self.assertEqual(redirect_body.bytes_read, 0)
+        self.assertEqual(redirect_body.remaining_bytes, 3 * 1024 * 1024)
+        self.assertTrue(redirect_body.closed)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(
+            [request.get_method() for request in opener.requests],
+            ["GET", "GET"],
+        )
+        self.assertEqual(
+            [request.get_header("If-none-match") for request in opener.requests],
+            ['"v2"', '"v2"'],
+        )
+        self.assertTrue(
+            all(request.get_header("Authorization") for request in opener.requests)
+        )
+        self.assertEqual(opener.timeouts, [30.0, 30.0])
+
+    def test_download_redirect_does_not_drain_body(self) -> None:
+        redirect_body = FakeResponse(
+            b"x" * (3 * 1024 * 1024),
+            status=307,
+            headers={"Location": "/current/products.jsonl"},
+        )
+        payload = b"safe payload\n"
+        final = FakeResponse(payload)
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, [redirect_body, final])
+        client = self.client_with_opener(opener)
+
+        client.download(
+            "https://stock.example.test/products.jsonl",
+            self.directory / "products.jsonl",
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+        self.assertEqual(redirect_body.bytes_read, 0)
+        self.assertEqual(redirect_body.remaining_bytes, 3 * 1024 * 1024)
+        self.assertTrue(redirect_body.closed)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(opener.timeouts, [30.0, 30.0])
+
+    def test_redirect_loop_is_rejected_after_second_response(self) -> None:
+        first = FakeResponse(
+            b"first",
+            status=302,
+            headers={"Location": "/next/manifest.json"},
+        )
+        second = FakeResponse(
+            b"second",
+            status=302,
+            headers={"Location": self.https_config.manifest_url},
+        )
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, [first, second])
+        client = self.client_with_opener(opener)
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            client.get_manifest()
+
+        self.assertEqual(len(opener.requests), 2)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertEqual(first.bytes_read + second.bytes_read, 0)
+
+    def test_redirect_count_is_finite_and_all_bodies_are_closed(self) -> None:
+        redirect_count = RejectCrossOriginRedirect.max_redirections + 1
+        responses = [
+            FakeResponse(
+                b"redirect",
+                status=302,
+                headers={"Location": f"/hop-{index}/manifest.json"},
+            )
+            for index in range(redirect_count)
+        ]
+        handler = RejectCrossOriginRedirect(("https", "stock.example.test", None))
+        opener = RedirectingOpener(handler, responses)
+        client = self.client_with_opener(opener)
+
+        with self.assertRaisesRegex(StockError, "network_error"):
+            client.get_manifest()
+
+        self.assertEqual(len(opener.requests), redirect_count)
+        self.assertTrue(all(response.closed for response in responses))
+        self.assertTrue(all(response.bytes_read == 0 for response in responses))
+        self.assertTrue(all(timeout == 30.0 for timeout in opener.timeouts))
 
     def test_factory_opener_has_cross_origin_redirect_protection(self) -> None:
         client = SafeHttpClient.for_config(self.https_config)

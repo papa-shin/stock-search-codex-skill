@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
@@ -67,6 +67,12 @@ def assert_allowed_download_url(manifest_url: str, candidate_url: str) -> str:
     return candidate_url
 
 
+class _FollowRedirect(Exception):
+    def __init__(self, request: urllib.request.Request) -> None:
+        self.request = request
+        super().__init__()
+
+
 class RejectCrossOriginRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self, allowed_origin: Origin) -> None:
         self.allowed_origin = allowed_origin
@@ -80,13 +86,58 @@ class RejectCrossOriginRedirect(urllib.request.HTTPRedirectHandler):
         headers: object,
         newurl: str,
     ) -> urllib.request.Request | None:
+        if code not in {301, 302, 303, 307, 308}:
+            raise _network_error()
         try:
             redirect_origin = normalized_origin(newurl)
         except StockError as error:
             raise _network_error() from error
         if redirect_origin != self.allowed_origin:
             raise StockError("network_error", "Перенаправление на другой сервер запрещено", 3)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return urllib.request.Request(
+            newurl,
+            data=req.data,
+            headers=dict(req.header_items()),
+            origin_req_host=req.origin_req_host,
+            unverifiable=True,
+            method=req.get_method(),
+        )
+
+    def http_error_302(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+    ) -> None:
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            if (
+                not isinstance(location, str)
+                or not location
+                or _has_unsafe_url_character(location)
+            ):
+                raise _network_error()
+            try:
+                newurl = urljoin(req.full_url, location)
+            except (TypeError, ValueError, UnicodeError) as error:
+                raise _network_error() from error
+            redirected = self.redirect_request(
+                req,
+                fp,
+                code,
+                msg,
+                headers,
+                newurl,
+            )
+            if redirected is None:
+                raise _network_error()
+            raise _FollowRedirect(redirected)
+        finally:
+            _close_response(fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 class SafeHttpClient:
@@ -198,19 +249,37 @@ class SafeHttpClient:
         request_headers = dict(headers)
         credentials = f"{self.config.username}:{self.config.password}".encode("utf-8")
         request_headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
-        try:
-            request = urllib.request.Request(url, headers=request_headers)
-            return self._opener.open(request, timeout=_SOCKET_TIMEOUT_SECONDS)
-        except urllib.error.HTTPError as error:
-            if error.code == 304:
-                return error
-            if error.code in {401, 403}:
-                raise StockError("auth_failed", "Не удалось подтвердить доступ", 3) from error
-            raise _network_error() from error
-        except StockError:
-            raise
-        except _NETWORK_EXCEPTIONS as error:
-            raise _network_error() from error
+        request = urllib.request.Request(url, headers=request_headers)
+        visited = {request.full_url}
+        redirect_count = 0
+        while True:
+            try:
+                return self._opener.open(request, timeout=_SOCKET_TIMEOUT_SECONDS)
+            except _FollowRedirect as redirect:
+                next_request = redirect.request
+                if (
+                    redirect_count >= RejectCrossOriginRedirect.max_redirections
+                    or next_request.full_url in visited
+                ):
+                    raise _network_error()
+                redirect_count += 1
+                visited.add(next_request.full_url)
+                request = next_request
+            except urllib.error.HTTPError as error:
+                if error.code == 304:
+                    return error
+                _close_response(error)
+                if error.code in {401, 403}:
+                    raise StockError(
+                        "auth_failed",
+                        "Не удалось подтвердить доступ",
+                        3,
+                    ) from error
+                raise _network_error() from error
+            except StockError:
+                raise
+            except _NETWORK_EXCEPTIONS as error:
+                raise _network_error() from error
 
 
 _NETWORK_EXCEPTIONS = (
@@ -228,6 +297,15 @@ def _response_status(response: object) -> int:
     if type(status) is not int:
         raise _network_error()
     return status
+
+
+def _close_response(response: object) -> None:
+    try:
+        response.close()
+    except StockError:
+        raise
+    except _NETWORK_EXCEPTIONS as error:
+        raise _network_error() from error
 
 
 def _raise_for_http_status(status: int, *, allow_not_modified: bool) -> None:
