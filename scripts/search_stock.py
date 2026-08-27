@@ -10,9 +10,12 @@ from papa_shin_stock.http_client import SafeHttpClient
 from papa_shin_stock.query import SearchQuery
 from papa_shin_stock.schema import StockSearcher
 
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise StockError("query_invalid", "Некорректные параметры поиска", 4)
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Поиск по локальному проверенному кэшу")
+    parser = SafeArgumentParser(description="Поиск по локальному проверенному кэшу")
     parser.add_argument("--product-type")
     parser.add_argument("--size")
     parser.add_argument("--season")
@@ -42,7 +45,9 @@ def main(argv: list[str] | None = None) -> int:
         namespace = build_parser().parse_args(argv)
         result = search_default(namespace)
         exit_code = 0
-    except SystemExit:
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
         result = {"status": "error", "error": {"code": "query_invalid", "message": "Некорректные параметры поиска"}}
         exit_code = 4
     except StockError as error:

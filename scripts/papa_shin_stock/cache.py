@@ -528,6 +528,7 @@ class StockCache:
                             "cache_locked", "Активное поколение кэша изменилось", 6
                         )
                     lock.assert_owned()
+                    current = self._record_runtime_status(current, False, None)
                     return RefreshResult.from_state("not_modified", current)
                 if response.status != 200:
                     raise StockError(
@@ -542,6 +543,7 @@ class StockCache:
                         if current is None:
                             raise _cache_unavailable()
                         lock.assert_owned()
+                        current = self._record_runtime_status(current, True, cleanup_warning)
                         return RefreshResult.from_state(
                             "stale_cache",
                             current,
@@ -599,7 +601,7 @@ class StockCache:
             {
                 "generation_id": state.generation_id,
                 "generated_at": state.generated_at,
-                "checked_at": state.checked_at,
+                "checked_at": datetime.now(timezone.utc).isoformat() if not stale else state.checked_at,
                 "manifest_etag": state.manifest_etag,
                 "manifest_last_modified": state.manifest_last_modified,
                 "stale": stale,

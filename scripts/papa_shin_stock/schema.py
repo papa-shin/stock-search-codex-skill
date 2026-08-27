@@ -49,7 +49,9 @@ class SearchResult:
         for product in self.products:
             result["products"].append(product.to_public_dict(self.offers[product.product_id])); result["unknown_characteristics"].extend(product.unknown_characteristics)
             if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > _MAX_OUTPUT:
-                result["products"].pop(); del result["unknown_characteristics"][-len(product.unknown_characteristics):]; result["warnings"].append({"code":"output_truncated","message":"Вывод ограничен"}); break
+                result["products"].pop()
+                if product.unknown_characteristics: del result["unknown_characteristics"][-len(product.unknown_characteristics):]
+                result["warnings"].append({"code":"output_truncated","message":"Вывод ограничен"}); break
         return result
 
 class _Spool:
@@ -107,7 +109,10 @@ def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str
     except (OSError,UnicodeError,ValueError,TypeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
     if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not isinstance(manifest.get("generated_at"),str): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
     state={}; path=files.manifest.parent/"state.json"
-    if path.is_file() and not path.is_symlink(): state=_parse(path.read_text(encoding="utf-8"))
+    if path.is_file() and not path.is_symlink():
+        try: state=_parse(path.read_text(encoding="utf-8"))
+        except (OSError,UnicodeError,ValueError,TypeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
+    if state and (not isinstance(state,dict) or state.get("generation_id") != files.generation_id or not isinstance(state.get("checked_at"),str) or len(state["checked_at"])>_MAX_TEXT or not isinstance(state.get("stale",False),bool) or (state.get("warning_code") is not None and (not isinstance(state["warning_code"],str) or len(state["warning_code"])>_MAX_TEXT))): raise StockError("cache_unavailable","Проверенный кэш недоступен",7)
     stale=isinstance(state,dict) and state.get("stale") is True; code=state.get("warning_code") if isinstance(state,dict) else None
     return {"id":files.generation_id,"generated_at":manifest["generated_at"],"checked_at":state.get("checked_at",manifest["generated_at"]) if isinstance(state,dict) else manifest["generated_at"],"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and isinstance(code,str) else ())
 
@@ -130,7 +135,7 @@ def _offer(row:dict[str,object])->Offer:return Offer(_text(row.get("supplier")),
 def _match_offer(o:Offer,q:SearchQuery)->bool:return (q.supplier is None or o.supplier==q.supplier) and (q.max_price is None or o.price<=q.max_price) and (q.max_delivery_days is None or o.delivery_days<=q.max_delivery_days)
 def _unknown(ident:str,row:dict[str,object],chars:dict[str,object])->tuple[dict[str,str],...]:
     result=[]
-    for field,value in list((x,row.get(x)) for x in ("size","season","spikes","run_flat","disk_type","truck_axis","truck_construction"))+list(chars.items()):
+    for field,value in list((x,row.get(x)) for x in ("size","season","spikes","run_flat","disk_type","truck_axis","truck_construction"))+[(x,chars[x]) for x in sorted(_PUBLIC_CHARS) if x in chars]:
         if isinstance(value,dict) and value.get("status") in _UNKNOWN:result.append({"product_id":ident,"characteristic":field,"status":value["status"]})
     return tuple(result)
 def _text(value:object)->str:
@@ -144,7 +149,7 @@ def _int(value:object)->int:
 def _decimal(value:object)->Decimal:
     try: result=Decimal(str(value))
     except (InvalidOperation,TypeError,ValueError) as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
-    if not result.is_finite() or result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    if not result.is_finite() or result<0 or result.adjusted()>12:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return result
 def _price_text(value:Decimal)->str:return format(value,"f")
 def _decimal_compare(a:str,b:str)->int:return (_decimal(a)>_decimal(b))-(_decimal(a)<_decimal(b))

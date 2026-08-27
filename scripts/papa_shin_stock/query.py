@@ -8,13 +8,15 @@ from decimal import Decimal, InvalidOperation
 from papa_shin_stock.errors import StockError
 
 
-_TIRE_SIZE = re.compile(r"^(?P<width>\d{3})(?:/|\s)(?P<profile>\d{2,3})(?:R|r|\sR?|\s)(?P<rim>\d{2})$")
+_TIRE_SIZE = re.compile(r"^(?P<width>[0-9]{3})(?:/| )(?P<profile>[0-9]{2,3})(?:R|r| R?| )(?P<rim>[0-9]{2})$")
 _MAX_LIMIT = 100
 _MAX_OFFERS_LIMIT = 25
 
 
 def normalize_tire_size(value: str) -> str:
     if not isinstance(value, str):
+        raise StockError("query_invalid", "Некорректный типоразмер", 4)
+    if any(character in value for character in "\t\n\r"):
         raise StockError("query_invalid", "Некорректный типоразмер", 4)
     match = _TIRE_SIZE.fullmatch(value.strip())
     if match is None:
@@ -100,7 +102,7 @@ class SearchQuery:
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 256:
         raise StockError("query_invalid", "Некорректный фильтр поиска", 4)
     return value.strip()
 
