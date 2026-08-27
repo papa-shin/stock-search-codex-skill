@@ -28,6 +28,13 @@ _LOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 _RUNTIME_REVISION = re.compile(r"[0-9a-f]{32}\Z")
+_RUNTIME_STATUS_FILE = re.compile(
+    r"\.runtime-status-(?P<directory>[A-Za-z0-9][A-Za-z0-9._-]*)\.json\Z"
+)
+_RUNTIME_STATUS_TEMP = re.compile(
+    r"\.\.runtime-status-(?P<directory>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"\.json\.[0-9a-f]{32}\.tmp\Z"
+)
 _MAX_STATUS_TEXT = 256
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
@@ -280,6 +287,10 @@ def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatu
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
+            or observed.st_ino <= 0
+            or opened.st_ino <= 0
+            or observed.st_dev < 0
+            or opened.st_dev < 0
             or opened.st_dev != observed.st_dev
             or opened.st_ino != observed.st_ino
         ):
@@ -419,7 +430,12 @@ class CacheLock:
 
     @classmethod
     def acquire(cls, root: Path) -> "CacheLock":
-        root.mkdir(parents=True, exist_ok=True)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise StockError(
+                "cache_locked", "Не удалось установить блокировку кэша", 6
+            ) from error
         path = root / ".refresh.lock"
         token = uuid.uuid4().hex
         for _ in range(2):
@@ -708,7 +724,7 @@ class StockCache:
         lock: CacheLock,
     ) -> CacheState:
         lock.assert_owned()
-        current = CacheState.load(self.root)
+        current = CacheState.load(self.root, lock.heartbeat)
         if current is None or not _same_runtime_revision(current, state):
             raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         value = {
@@ -724,13 +740,18 @@ class StockCache:
         }
         validate_runtime_status(value, state.generation_id)
         try:
-            lock.assert_owned()
+            lock.heartbeat()
             _write_runtime_status_atomic(self.root, state.directory_name, value)
             lock.assert_owned()
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
             raise _cache_unavailable() from error
-        refreshed = CacheState.load(self.root)
-        if refreshed is None or not _same_generation(refreshed, state):
+        refreshed = CacheState.load(self.root, lock.heartbeat)
+        lock.assert_owned()
+        if (
+            refreshed is None
+            or not _same_generation(refreshed, state)
+            or refreshed.runtime_revision != value["revision"]
+        ):
             raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         return refreshed
 
@@ -927,31 +948,32 @@ class StockCache:
                     cleanup_incomplete = True
         try:
             runtime_entries = [
-                entry
+                (entry, parsed)
                 for entry in self.root.iterdir()
-                if entry.name.startswith(".runtime-status-")
-                and entry.name.endswith(".json")
+                if (parsed := _parse_runtime_cleanup_name(entry.name)) is not None
             ]
         except OSError:
             cleanup_incomplete = True
             runtime_entries = []
-        for entry in runtime_entries:
+        for entry, (directory_name, temporary) in runtime_entries:
             lock.assert_owned()
             pointer = self._load_current_pointer_for_cleanup()
-            active_name = (
-                f".runtime-status-{pointer.directory_name}.json"
-                if pointer is not None
-                else None
-            )
-            if entry.name == active_name or entry.is_symlink():
+            if (
+                not temporary
+                and pointer is not None
+                and directory_name == pointer.directory_name
+            ):
                 continue
-            if entry.name.endswith(".json") or entry.name.startswith("."):
-                try:
-                    entry.unlink()
-                except FileNotFoundError:
-                    continue
-                except OSError:
+            try:
+                observed = entry.lstat()
+                if stat.S_ISDIR(observed.st_mode):
                     cleanup_incomplete = True
+                    continue
+                entry.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                cleanup_incomplete = True
         return "cache_cleanup_incomplete" if cleanup_incomplete else None
 
     def _load_current_pointer_for_cleanup(self) -> CurrentPointer | None:
@@ -1100,6 +1122,16 @@ def _runtime_status_path(cache_dir: Path, directory_name: str) -> Path:
     ):
         raise _cache_unavailable()
     return cache_dir / f".runtime-status-{directory_name}.json"
+
+
+def _parse_runtime_cleanup_name(name: str) -> tuple[str, bool] | None:
+    status = _RUNTIME_STATUS_FILE.fullmatch(name)
+    if status is not None:
+        return status.group("directory"), False
+    temporary = _RUNTIME_STATUS_TEMP.fullmatch(name)
+    if temporary is not None:
+        return temporary.group("directory"), True
+    return None
 
 
 def _write_runtime_status_atomic(

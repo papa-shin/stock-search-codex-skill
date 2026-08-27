@@ -12,6 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -831,6 +832,105 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
         self.assertTrue(runtime.is_file())
         self.assertFalse(runtime.is_symlink())
+
+    def test_aged_writer_heartbeats_before_runtime_status_write(self) -> None:
+        state = CacheState.load(self.cache_root)
+        self.assertIsNotNone(state)
+        cache = StockCache(self.cache_root, object())
+        competing_writers: list[str] = []
+        real_write = cache_module._write_runtime_status_atomic
+
+        with cache_module.CacheLock.acquire(self.cache_root) as lock:
+            owner = lock.path / "owner.json"
+            owner.write_text(
+                json.dumps(
+                    {
+                        "token": lock.token,
+                        "created_at": cache_module.time.time()
+                        - cache_module._LOCK_TTL_SECONDS
+                        - 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heartbeat = lock.path / f"heartbeat-{lock.token}"
+            expired = (
+                cache_module.time.time()
+                - cache_module._LOCK_TTL_SECONDS
+                - 1
+            )
+            cache_module.os.utime(heartbeat, (expired, expired))
+
+            def try_reclaim_then_write(
+                root: Path, directory_name: str, value: object
+            ) -> None:
+                try:
+                    with cache_module.CacheLock.acquire(root):
+                        competing_writers.append("acquired")
+                except StockError as error:
+                    self.assertEqual(error.code, "cache_locked")
+                real_write(root, directory_name, value)
+
+            with patch.object(
+                cache_module,
+                "_write_runtime_status_atomic",
+                side_effect=try_reclaim_then_write,
+            ):
+                updated = cache._record_runtime_status(
+                    state, True, "network_error", lock
+                )
+
+        self.assertEqual(competing_writers, [])
+        self.assertTrue(updated.stale)
+        self.assertEqual(updated.warning_code, "network_error")
+
+    def test_runtime_read_rejects_zero_identity_without_nofollow(self) -> None:
+        runtime = self.runtime_status_path()
+        runtime.write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "stale": False,
+                    "warning_code": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        outside = Path(self.temp_dir.name) / "outside-runtime.json"
+        outside.write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": "2026-08-27T11:00:00+00:00",
+                    "stale": True,
+                    "warning_code": "network_error",
+                }
+            ),
+            encoding="utf-8",
+        )
+        identity = SimpleNamespace(
+            st_mode=cache_module.stat.S_IFREG,
+            st_dev=0,
+            st_ino=0,
+        )
+        real_open = cache_module.os.open
+
+        def open_outside(path: object, flags: int, *args: object) -> int:
+            if Path(path) == runtime:
+                return real_open(outside, flags, *args)
+            return real_open(path, flags, *args)
+
+        with patch.object(cache_module, "_lstat_optional", return_value=identity):
+            with patch.object(cache_module.os, "O_NOFOLLOW", 0, create=True):
+                with patch.object(cache_module.os, "open", open_outside):
+                    with patch.object(cache_module.os, "fstat", return_value=identity):
+                        with self.assertRaisesRegex(
+                            StockError, "cache_unavailable"
+                        ):
+                            cache_module.load_runtime_status(
+                                runtime, "synthetic-generation"
+                            )
 
     def test_dangling_runtime_status_symlink_is_rejected(self) -> None:
         status = self.runtime_status_path()

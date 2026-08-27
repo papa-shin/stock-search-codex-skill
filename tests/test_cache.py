@@ -9,6 +9,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +22,7 @@ from papa_shin_stock.cache import CacheLock, CacheState, StockCache, _fsync_dire
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import DownloadReceipt, HttpResponse
+import fetch_stock
 
 
 PRODUCTS = b'{"product_id":"synthetic-product","content_generation_id":"generation-b"}\n'
@@ -324,6 +327,76 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(
             (self.cache_root / ".runtime-status-generation-concurrent.json").exists()
         )
+
+    def test_fallback_lock_root_mkdir_error_stays_safe_json(self) -> None:
+        self.fixture.seed_generation()
+        client = FakeHttpClient()
+        real_mkdir = Path.mkdir
+        root_mkdir_calls = 0
+
+        def fail_second_root_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal root_mkdir_calls
+            if path == self.cache_root:
+                root_mkdir_calls += 1
+                if root_mkdir_calls == 2:
+                    raise PermissionError("/private/cache/root")
+            real_mkdir(path, *args, **kwargs)
+
+        def refresh_with_fallback() -> dict[str, object]:
+            return (
+                StockCache(self.cache_root, client)
+                .refresh(self.config)
+                .to_public_dict()
+            )
+
+        output = StringIO()
+        errors = StringIO()
+        with patch.object(
+            client,
+            "get_manifest",
+            side_effect=StockError(
+                "network_error", "Синтетическая ошибка обновления", 3
+            ),
+        ):
+            with patch.object(Path, "mkdir", fail_second_root_mkdir):
+                with patch.object(
+                    fetch_stock, "refresh_default", side_effect=refresh_with_fallback
+                ):
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = fetch_stock.main()
+
+        public = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(public["status"], "stale_cache")
+        self.assertEqual(public["warnings"][0]["code"], "network_error")
+        self.assertEqual(output.getvalue().count("\n"), 1)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("/private/", output.getvalue())
+
+    def test_cleanup_removes_only_exact_runtime_status_orphan_names(self) -> None:
+        self.fixture.seed_generation()
+        exact_status = self.cache_root / ".runtime-status-generation-old.json"
+        exact_temp = (
+            self.cache_root
+            / "..runtime-status-generation-old.json.0123456789abcdef0123456789abcdef.tmp"
+        )
+        ambiguous = (
+            self.cache_root / "..runtime-status-generation-old.json.short.tmp"
+        )
+        unrelated = self.cache_root / ".runtime-status-generation-old.json.backup"
+        for path in (exact_status, exact_temp, ambiguous, unrelated):
+            path.write_text("synthetic", encoding="utf-8")
+
+        with CacheLock.acquire(self.cache_root) as lock:
+            warning = StockCache(
+                self.cache_root, FakeHttpClient()
+            )._cleanup_inactive_generations(lock)
+
+        self.assertIsNone(warning)
+        self.assertFalse(exact_status.exists())
+        self.assertFalse(exact_temp.exists())
+        self.assertTrue(ambiguous.exists())
+        self.assertTrue(unrelated.exists())
 
     def test_active_lock_without_cache_is_cache_locked_error(self) -> None:
         lock = self.cache_root / ".refresh.lock"
