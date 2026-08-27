@@ -10,6 +10,15 @@ from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import SafeHttpClient
 
 
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise StockError(
+            "query_invalid",
+            "Некорректные параметры обновления",
+            4,
+        )
+
+
 def refresh_default() -> dict[str, object]:
     config = StockConfig.load()
     client = SafeHttpClient.for_config(config)
@@ -17,7 +26,7 @@ def refresh_default() -> dict[str, object]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(
+    return SafeArgumentParser(
         description="Обновление локального проверенного кэша"
     )
 
@@ -25,12 +34,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         build_parser().parse_args([] if argv is None else argv)
-    except SystemExit as error:
-        return int(error.code)
-
-    try:
         result = refresh_default()
         exit_code = 0
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
+        result = {
+            "status": "error",
+            "error": {
+                "code": "query_invalid",
+                "message": "Некорректные параметры обновления",
+            },
+        }
+        exit_code = 4
     except StockError as error:
         result = {
             "status": "error",

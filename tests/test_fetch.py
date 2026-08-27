@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -243,6 +244,34 @@ class SafeHttpSecurityTest(unittest.TestCase):
 
 
 class FetchStockCliTest(unittest.TestCase):
+    def test_unknown_argument_prints_one_safe_json_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ)
+            environment["PAPA_SHIN_STOCK_CONFIG"] = str(
+                Path(directory) / "absent.env"
+            )
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "fetch_stock.py"), "--unknown"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "status": "error",
+                "error": {
+                    "code": "query_invalid",
+                    "message": "Некорректные параметры обновления",
+                },
+            },
+        )
+
     def test_help_exits_zero_without_config_or_refresh_side_effects(self) -> None:
         output = StringIO()
         errors = StringIO()
