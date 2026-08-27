@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
@@ -631,6 +632,9 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         query = SearchQuery.from_args(argparse.Namespace())
         return StockSearcher(files, self.config).search(query).to_public_dict()
 
+    def runtime_status_path(self) -> Path:
+        return self.cache_root / ".runtime-status-generation-existing.json"
+
     def test_failure_then_304_is_visible_to_search_with_read_only_generation(self) -> None:
         class FailingClient:
             def get_manifest(
@@ -698,10 +702,71 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(second_stale["generation"]["stale"])
 
-    def test_runtime_directory_symlink_cannot_read_outside_cache_root(self) -> None:
-        outside = Path(self.temp_dir.name) / "outside-runtime"
-        outside.mkdir()
-        (outside / "generation-existing.json").write_text(
+    def test_delayed_failure_cannot_overwrite_later_same_generation_304(self) -> None:
+        entered_fallback = threading.Event()
+        allow_fallback = threading.Event()
+        real_datetime = cache_module.datetime
+
+        class FixedDateTime:
+            @classmethod
+            def now(cls, tz: object) -> object:
+                return real_datetime.fromisoformat("2026-08-27T10:01:00+00:00")
+
+        class FailingClient:
+            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+                raise StockError("network_error", "Не удалось обновить данные", 3)
+
+        class NotModifiedClient:
+            def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
+                return HttpResponse(status=304, headers={}, body=b"")
+
+        class DelayedFallbackCache(StockCache):
+            def _stale_fallback(
+                self, state: CacheState, warning_code: str, *args: object
+            ) -> object:
+                entered_fallback.set()
+                if not allow_fallback.wait(timeout=5):
+                    raise AssertionError("fallback release timeout")
+                return super()._stale_fallback(state, warning_code, *args)
+
+        first_results: list[object] = []
+        first_errors: list[BaseException] = []
+
+        def run_first_refresh() -> None:
+            try:
+                first_results.append(
+                    DelayedFallbackCache(self.cache_root, FailingClient()).refresh(
+                        self.config
+                    )
+                )
+            except BaseException as error:
+                first_errors.append(error)
+
+        first = threading.Thread(target=run_first_refresh)
+        with patch.object(cache_module, "datetime", FixedDateTime):
+            first.start()
+            self.assertTrue(entered_fallback.wait(timeout=5))
+
+            second = StockCache(self.cache_root, NotModifiedClient()).refresh(self.config)
+            allow_fallback.set()
+            first.join(timeout=5)
+            if second.warning_code == "cache_locked":
+                second = StockCache(self.cache_root, NotModifiedClient()).refresh(
+                    self.config
+                )
+
+        self.assertFalse(first.is_alive())
+        self.assertEqual(first_errors, [])
+        self.assertEqual(len(first_results), 1)
+
+        final = self.public_search()
+        self.assertEqual(second.status, "not_modified")
+        self.assertFalse(final["generation"]["stale"])
+        self.assertEqual(final["warnings"], [])
+
+    def test_runtime_status_swap_to_symlink_cannot_read_outside_cache_root(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside-runtime.json"
+        outside.write_text(
             json.dumps(
                 {
                     "generation_id": "synthetic-generation",
@@ -712,39 +777,65 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        runtime = self.cache_root / "runtime"
-        try:
-            runtime.symlink_to(outside, target_is_directory=True)
-        except OSError as error:
-            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
 
-        with self.assertRaisesRegex(StockError, "cache_unavailable"):
-            CacheState.load(self.cache_root)
+        runtime = self.runtime_status_path()
+        runtime.write_text(outside.read_text(encoding="utf-8"), encoding="utf-8")
+        original = runtime.with_suffix(".original")
+        real_open = cache_module.os.open
 
-    def test_runtime_directory_symlink_cannot_write_outside_cache_root(self) -> None:
+        def swap_before_open(path: object, flags: int, *args: object) -> int:
+            if Path(path) == runtime:
+                runtime.rename(original)
+                runtime.symlink_to(outside)
+            return real_open(path, flags, *args)
+
+        with patch.object(cache_module.os, "open", swap_before_open):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                CacheState.load(self.cache_root)
+
+        self.assertIn("2026-08-27T11:00:00+00:00", outside.read_text(encoding="utf-8"))
+
+    def test_runtime_status_swap_to_symlink_is_atomically_replaced_on_write(self) -> None:
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
-        outside = Path(self.temp_dir.name) / "outside-runtime"
-        outside.mkdir()
-        runtime = self.cache_root / "runtime"
-        try:
-            runtime.symlink_to(outside, target_is_directory=True)
-        except OSError as error:
-            self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
+        outside = Path(self.temp_dir.name) / "outside-runtime.json"
+        outside.write_text("sentinel", encoding="utf-8")
+        runtime = self.runtime_status_path()
+        runtime.write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "checked_at": state.checked_at,
+                    "stale": False,
+                    "warning_code": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        original = runtime.with_suffix(".original")
+        real_write = cache_module._write_json_atomic
 
-        with self.assertRaisesRegex(StockError, "cache_unavailable"):
-            StockCache(self.cache_root, object())._record_runtime_status(
-                state, True, "network_error"
-            )
+        def swap_before_write(path: Path, value: object) -> None:
+            if path == runtime:
+                runtime.rename(original)
+                runtime.symlink_to(outside)
+            real_write(path, value)
 
-        self.assertEqual(list(outside.iterdir()), [])
+        with patch.object(cache_module, "_write_json_atomic", swap_before_write):
+            with cache_module.CacheLock.acquire(self.cache_root) as lock:
+                updated = StockCache(self.cache_root, object())._record_runtime_status(
+                    state, True, "network_error", lock
+                )
+
+        self.assertTrue(updated.stale)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
+        self.assertTrue(runtime.is_file())
+        self.assertFalse(runtime.is_symlink())
 
     def test_dangling_runtime_status_symlink_is_rejected(self) -> None:
-        runtime = self.cache_root / "runtime"
-        runtime.mkdir()
-        status = runtime / "generation-existing.json"
+        status = self.runtime_status_path()
         try:
-            status.symlink_to(runtime / "missing-status.json")
+            status.symlink_to(self.cache_root / "missing-status.json")
         except OSError as error:
             self.skipTest(f"symlink недоступен: {error.__class__.__name__}")
 
@@ -754,11 +845,9 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
     def test_runtime_status_symlink_is_rejected_before_write(self) -> None:
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
-        runtime = self.cache_root / "runtime"
-        runtime.mkdir()
         outside = Path(self.temp_dir.name) / "outside-status.json"
         outside.write_text("sentinel", encoding="utf-8")
-        status = runtime / "generation-existing.json"
+        status = self.runtime_status_path()
         try:
             status.symlink_to(outside)
         except OSError as error:
@@ -767,14 +856,15 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "cache_unavailable"):
             CacheState.load(self.cache_root)
         with self.assertRaisesRegex(StockError, "cache_unavailable"):
-            StockCache(self.cache_root, object())._record_runtime_status(
-                state, True, "network_error"
-            )
+            with cache_module.CacheLock.acquire(self.cache_root) as lock:
+                StockCache(self.cache_root, object())._record_runtime_status(
+                    state, True, "network_error", lock
+                )
 
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
 
     def test_runtime_lstat_failure_is_safe_cache_error(self) -> None:
-        runtime = self.cache_root / "runtime"
+        runtime = self.runtime_status_path()
         real_lstat = Path.lstat
 
         def fail_runtime_lstat(path: Path) -> object:
@@ -789,8 +879,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.assertNotIn("/private/", str(raised.exception))
 
     def test_runtime_fstat_and_close_failures_stay_safe(self) -> None:
-        runtime = self.cache_root / "runtime" / "generation-existing.json"
-        runtime.parent.mkdir()
+        runtime = self.runtime_status_path()
         runtime.write_text(
             json.dumps(
                 {
@@ -828,17 +917,17 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
         with patch.object(
             cache_module,
-            "_write_json_atomic",
+            "_write_runtime_status_atomic",
             side_effect=PermissionError("/private/cache/runtime/status.json"),
         ):
             with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:
-                cache._record_runtime_status(state, True, "network_error")
+                with cache_module.CacheLock.acquire(self.cache_root) as lock:
+                    cache._record_runtime_status(state, True, "network_error", lock)
 
         self.assertNotIn("/private/", str(raised.exception))
 
     def test_runtime_status_read_failure_is_safe(self) -> None:
-        runtime = self.cache_root / "runtime" / "generation-existing.json"
-        runtime.parent.mkdir()
+        runtime = self.runtime_status_path()
         runtime.write_text(
             json.dumps(
                 {
@@ -864,8 +953,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.assertNotIn("/private/", str(raised.exception))
 
     def test_cache_and_search_share_strict_runtime_status_validation(self) -> None:
-        runtime = self.cache_root / "runtime" / "generation-existing.json"
-        runtime.parent.mkdir()
+        runtime = self.runtime_status_path()
         invalid_values = (
             "[]",
             "{}",

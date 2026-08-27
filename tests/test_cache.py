@@ -283,7 +283,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(current.stale)
         self.assertIsNone(current.warning_code)
         self.assertFalse(
-            (self.cache_root / "runtime" / "generation-existing.json").exists()
+            (self.cache_root / ".runtime-status-generation-existing.json").exists()
         )
 
     def test_error_status_cas_does_not_mark_concurrent_generation_stale(self) -> None:
@@ -322,7 +322,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(current.stale)
         self.assertIsNone(current.warning_code)
         self.assertFalse(
-            (self.cache_root / "runtime" / "generation-concurrent.json").exists()
+            (self.cache_root / ".runtime-status-generation-concurrent.json").exists()
         )
 
     def test_active_lock_without_cache_is_cache_locked_error(self) -> None:

@@ -27,6 +27,7 @@ _LOCK_TTL_SECONDS = 30 * 60
 _LOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_RUNTIME_REVISION = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_STATUS_TEXT = 256
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
@@ -130,6 +131,7 @@ class CacheState:
     manifest_last_modified: str | None
     directory_name: str
     files: GenerationFiles
+    runtime_revision: str | None = None
     stale: bool = False
     warning_code: str | None = None
 
@@ -216,6 +218,7 @@ class CacheState:
             manifest_last_modified=manifest_last_modified,
             directory_name=pointer.directory_name,
             files=files,
+            runtime_revision=runtime_status.revision,
             stale=runtime_status.stale,
             warning_code=runtime_status.warning_code,
         )
@@ -227,6 +230,7 @@ class RuntimeStatus:
     checked_at: str
     stale: bool
     warning_code: str | None
+    revision: str | None
 
 
 def validate_runtime_status(
@@ -238,6 +242,7 @@ def validate_runtime_status(
     checked_at = value.get("checked_at")
     stale = value.get("stale", False)
     warning_code = value.get("warning_code")
+    revision = value.get("revision")
     if generation_id != expected_generation_id:
         raise _cache_unavailable()
     if (
@@ -257,7 +262,11 @@ def validate_runtime_status(
             raise _cache_unavailable()
     elif warning_code is not None:
         raise _cache_unavailable()
-    return RuntimeStatus(generation_id, checked_at, stale, warning_code)
+    if revision is not None and (
+        not isinstance(revision, str) or not _RUNTIME_REVISION.fullmatch(revision)
+    ):
+        raise _cache_unavailable()
+    return RuntimeStatus(generation_id, checked_at, stale, warning_code, revision)
 
 
 def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatus:
@@ -636,7 +645,7 @@ class StockCache:
                             "cache_locked", "Активное поколение кэша изменилось", 6
                         )
                     lock.assert_owned()
-                    current = self._record_runtime_status(current, False, None)
+                    current = self._record_runtime_status(current, False, None, lock)
                     return RefreshResult.from_state("not_modified", current)
                 if response.status != 200:
                     raise StockError(
@@ -651,7 +660,9 @@ class StockCache:
                         if current is None:
                             raise _cache_unavailable()
                         lock.assert_owned()
-                        current = self._record_runtime_status(current, True, cleanup_warning)
+                        current = self._record_runtime_status(
+                            current, True, cleanup_warning, lock
+                        )
                         return RefreshResult.from_state(
                             "stale_cache",
                             current,
@@ -690,10 +701,15 @@ class StockCache:
         return state.files
 
     def _record_runtime_status(
-        self, state: CacheState, stale: bool, warning_code: str | None
+        self,
+        state: CacheState,
+        stale: bool,
+        warning_code: str | None,
+        lock: CacheLock,
     ) -> CacheState:
+        lock.assert_owned()
         current = CacheState.load(self.root)
-        if current is None or not _same_generation(current, state):
+        if current is None or not _same_runtime_revision(current, state):
             raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         value = {
             "generation_id": state.generation_id,
@@ -704,12 +720,13 @@ class StockCache:
             ),
             "stale": stale,
             "warning_code": warning_code,
+            "revision": uuid.uuid4().hex,
         }
         validate_runtime_status(value, state.generation_id)
         try:
-            _write_json_atomic(
-                _runtime_status_path_for_write(self.root, state.directory_name), value
-            )
+            lock.assert_owned()
+            _write_runtime_status_atomic(self.root, state.directory_name, value)
+            lock.assert_owned()
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
             raise _cache_unavailable() from error
         refreshed = CacheState.load(self.root)
@@ -723,7 +740,10 @@ class StockCache:
         persisted = state
         if warning_code != "cache_locked":
             try:
-                persisted = self._record_runtime_status(state, True, warning_code)
+                with CacheLock.acquire(self.root) as lock:
+                    persisted = self._record_runtime_status(
+                        state, True, warning_code, lock
+                    )
             except StockError as error:
                 if error.code != "cache_locked":
                     raise
@@ -817,13 +837,15 @@ class StockCache:
         try:
             _fsync_directory(final_directory.parent)
             lock.assert_owned()
-            _write_json_atomic(
-                _runtime_status_path_for_write(self.root, final_name),
+            _write_runtime_status_atomic(
+                self.root,
+                final_name,
                 {
                     "generation_id": manifest.generation_id,
                     "checked_at": checked_at,
                     "stale": False,
                     "warning_code": None,
+                    "revision": uuid.uuid4().hex,
                 },
             )
             lock.assert_owned()
@@ -868,12 +890,10 @@ class StockCache:
             return
         shutil.rmtree(directory, ignore_errors=True)
         try:
-            runtime = _runtime_directory(self.root, create=False)
-            if runtime is not None:
-                status_path = runtime / f"{directory.name}.json"
-                observed = _lstat_optional(status_path)
-                if observed is not None and not stat.S_ISDIR(observed.st_mode):
-                    status_path.unlink(missing_ok=True)
+            status_path = _runtime_status_path(self.root, directory.name)
+            observed = _lstat_optional(status_path)
+            if observed is not None and not stat.S_ISDIR(observed.st_mode):
+                status_path.unlink(missing_ok=True)
         except (OSError, StockError):
             pass
 
@@ -906,16 +926,22 @@ class StockCache:
                 except OSError:
                     cleanup_incomplete = True
         try:
-            runtime = _runtime_directory(self.root, create=False)
-            runtime_entries = list(runtime.iterdir()) if runtime is not None else []
-        except (OSError, StockError):
+            runtime_entries = [
+                entry
+                for entry in self.root.iterdir()
+                if entry.name.startswith(".runtime-status-")
+                and entry.name.endswith(".json")
+            ]
+        except OSError:
             cleanup_incomplete = True
             runtime_entries = []
         for entry in runtime_entries:
             lock.assert_owned()
             pointer = self._load_current_pointer_for_cleanup()
             active_name = (
-                f"{pointer.directory_name}.json" if pointer is not None else None
+                f".runtime-status-{pointer.directory_name}.json"
+                if pointer is not None
+                else None
             )
             if entry.name == active_name or entry.is_symlink():
                 continue
@@ -1058,10 +1084,7 @@ def _load_optional_runtime_status(
     directory_name: str,
     generation_id: str,
 ) -> tuple[RuntimeStatus | None, Path | None]:
-    runtime = _runtime_directory(cache_dir, create=False)
-    if runtime is None:
-        return None, None
-    path = runtime / f"{directory_name}.json"
+    path = _runtime_status_path(cache_dir, directory_name)
     observed = _lstat_optional(path)
     if observed is None:
         return None, None
@@ -1070,33 +1093,23 @@ def _load_optional_runtime_status(
     return load_runtime_status(path, generation_id), path
 
 
-def _runtime_status_path_for_write(cache_dir: Path, directory_name: str) -> Path:
-    runtime = _runtime_directory(cache_dir, create=True)
-    if runtime is None:
+def _runtime_status_path(cache_dir: Path, directory_name: str) -> Path:
+    if (
+        not _DIRECTORY_NAME.fullmatch(directory_name)
+        or directory_name in {".", ".."}
+    ):
         raise _cache_unavailable()
-    path = runtime / f"{directory_name}.json"
+    return cache_dir / f".runtime-status-{directory_name}.json"
+
+
+def _write_runtime_status_atomic(
+    cache_dir: Path, directory_name: str, value: object
+) -> None:
+    path = _runtime_status_path(cache_dir, directory_name)
     observed = _lstat_optional(path)
     if observed is not None and not stat.S_ISREG(observed.st_mode):
         raise _cache_unavailable()
-    return path
-
-
-def _runtime_directory(cache_dir: Path, *, create: bool) -> Path | None:
-    runtime = cache_dir / "runtime"
-    observed = _lstat_optional(runtime)
-    if observed is None and create:
-        try:
-            runtime.mkdir()
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise _cache_unavailable() from error
-        observed = _lstat_optional(runtime)
-    if observed is None:
-        return None
-    if not stat.S_ISDIR(observed.st_mode):
-        raise _cache_unavailable()
-    return runtime
+    _write_json_atomic(path, value)
 
 
 def _lstat_optional(path: Path) -> os.stat_result | None:
@@ -1112,6 +1125,16 @@ def _same_generation(left: CacheState, right: CacheState) -> bool:
     return (
         left.generation_id == right.generation_id
         and left.directory_name == right.directory_name
+    )
+
+
+def _same_runtime_revision(left: CacheState, right: CacheState) -> bool:
+    return (
+        _same_generation(left, right)
+        and left.checked_at == right.checked_at
+        and left.stale == right.stale
+        and left.warning_code == right.warning_code
+        and left.runtime_revision == right.runtime_revision
     )
 
 
