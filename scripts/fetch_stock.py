@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 
 from papa_shin_stock.cache import StockCache
 from papa_shin_stock.config import StockConfig
@@ -14,7 +16,18 @@ def refresh_default() -> dict[str, object]:
     return StockCache(config.cache_dir, client).refresh(config).to_public_dict()
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        description="Обновление локального проверенного кэша"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        build_parser().parse_args([] if argv is None else argv)
+    except SystemExit as error:
+        return int(error.code)
+
     try:
         result = refresh_default()
         exit_code = 0
@@ -32,4 +45,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

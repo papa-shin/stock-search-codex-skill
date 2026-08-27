@@ -3,10 +3,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from email.message import Message
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -242,6 +243,27 @@ class SafeHttpSecurityTest(unittest.TestCase):
 
 
 class FetchStockCliTest(unittest.TestCase):
+    def test_help_exits_zero_without_config_or_refresh_side_effects(self) -> None:
+        output = StringIO()
+        errors = StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            absent_config = str(Path(directory) / "absent.env")
+            with patch.dict(
+                os.environ,
+                {"PAPA_SHIN_STOCK_CONFIG": absent_config},
+                clear=False,
+            ):
+                with patch.object(fetch_stock, "refresh_default") as refresh:
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = fetch_stock.main(["--help"])
+
+        self.assertEqual(exit_code, 0)
+        refresh.assert_not_called()
+        self.assertIn("usage:", output.getvalue())
+        self.assertIn("--help", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+
     def test_success_prints_single_public_json_document_and_returns_zero(self) -> None:
         public_result = {
             "status": "stale_cache",

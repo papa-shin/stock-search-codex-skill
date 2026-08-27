@@ -8,42 +8,49 @@ Codex Skill для read-only поиска товаров и предложени
 - подготовленный администратором приватный конфигурационный файл;
 - Codex с поддержкой skills.
 
-Проверьте версию до установки:
-
-```text
-python3 --version
-```
-
-В Windows обычно используется `py -3.11 --version` или `python --version`.
-
 ## Установка в macOS и Linux
 
-Скопируйте весь каталог пакета в новый каталог:
+Выберите установленный Python 3.11+ и сохраните launcher в отдельной переменной. Во всех последующих командах используйте только её:
 
-```text
-~/.codex/skills/papa-shin-stock-search/
+```bash
+PAPA_SHIN_PYTHON='python3.11'
+"$PAPA_SHIN_PYTHON" --version
+"$PAPA_SHIN_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Требуется Python 3.11+")'
 ```
 
-Проверьте итоговый путь:
+Клонируйте публичный репозиторий непосредственно в каталог skills. Команда безопасно завершится ошибкой, если целевой каталог уже существует:
 
-```text
-~/.codex/skills/papa-shin-stock-search/SKILL.md
+```bash
+PAPA_SHIN_CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+PAPA_SHIN_SKILLS_DIR="$PAPA_SHIN_CODEX_ROOT/skills"
+PAPA_SHIN_SKILL_DIR="$PAPA_SHIN_SKILLS_DIR/papa-shin-stock-search"
+mkdir -p -- "$PAPA_SHIN_SKILLS_DIR"
+git clone -- 'https://github.com/papa-shin/stock-search-codex-skill.git' "$PAPA_SHIN_SKILL_DIR"
+cd -- "$PAPA_SHIN_SKILL_DIR"
 ```
 
 Разместите полученный от администратора приватный файл отдельно от пакета согласно [references/configuration.md](references/configuration.md). Не переносите его в репозиторий.
 
 ## Установка в Windows
 
-Скопируйте весь каталог пакета в новый каталог:
+В PowerShell выберите launcher. Для Python Launcher используйте `py -3.11`; если Python 3.11+ доступен командой `python`, задайте `$PapaShinPython = "python"` и `$PapaShinPythonArgs = @()`:
 
-```text
-%USERPROFILE%\.codex\skills\papa-shin-stock-search\
+```powershell
+$PapaShinPython = "py"
+$PapaShinPythonArgs = @("-3.11")
+& $PapaShinPython @PapaShinPythonArgs --version
+& $PapaShinPython @PapaShinPythonArgs -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Требуется Python 3.11+")'
 ```
 
-Итоговый файл должен находиться здесь:
+Клонируйте репозиторий непосредственно в каталог skills:
 
-```text
-%USERPROFILE%\.codex\skills\papa-shin-stock-search\SKILL.md
+```powershell
+$PapaShinCodexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+$PapaShinSkillsDir = Join-Path $PapaShinCodexRoot "skills"
+$PapaShinSkillDir = Join-Path $PapaShinSkillsDir "papa-shin-stock-search"
+New-Item -ItemType Directory -Force -Path $PapaShinSkillsDir | Out-Null
+git clone -- "https://github.com/papa-shin/stock-search-codex-skill.git" $PapaShinSkillDir
+Set-Location -LiteralPath $PapaShinSkillDir
 ```
 
 Приватный конфигурационный файл храните в профиле пользователя вне пакета; точное размещение согласуйте с администратором.
@@ -52,15 +59,31 @@ python3 --version
 
 ## Проверка
 
-Из корня установленного пакета выполните synthetic test suite:
+В macOS/Linux из корня пакета используйте ранее проверенный launcher:
 
-```text
-python3 -m unittest discover -s tests -v
-python3 scripts/fetch_stock.py --help
-python3 scripts/search_stock.py --help
+```bash
+"$PAPA_SHIN_PYTHON" -m unittest discover -s tests -v
+"$PAPA_SHIN_PYTHON" scripts/fetch_stock.py --help
+"$PAPA_SHIN_PYTHON" scripts/search_stock.py --help
 ```
 
-Для Windows замените `python3` на проверенную команду Python 3.11+ (`py -3.11` или `python`). Справка не должна требовать приватную конфигурацию или выводить её значения.
+В PowerShell повторно используйте выбранный launcher и его аргументы:
+
+```powershell
+& $PapaShinPython @PapaShinPythonArgs -m unittest discover -s tests -v
+& $PapaShinPython @PapaShinPythonArgs scripts/fetch_stock.py --help
+& $PapaShinPython @PapaShinPythonArgs scripts/search_stock.py --help
+```
+
+Обе команды справки должны завершиться без приватной конфигурации и не выводить её значения.
+
+## Примеры запросов менеджера
+
+- «Найди летние шины 205/55R16, минимум четыре штуки, до 8 000 за единицу».
+- «Покажи предложения по шинам 205/55R16 с доставкой не дольше трёх дней».
+- «Подбери шины на мой автомобиль» — сначала skill запрашивает точный типоразмер и сезон. Он не просит VIN, не обращается к внешнему сервису совместимости и не придумывает размер.
+
+Другие сценарии и ожидаемые уточнения приведены в [references/manager-queries.md](references/manager-queries.md).
 
 ## Границы безопасности
 
