@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,7 +20,13 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from papa_shin_stock import cache as cache_module
-from papa_shin_stock.cache import CacheLock, CacheState, StockCache, _fsync_directory
+from papa_shin_stock.cache import (
+    CacheLock,
+    CacheState,
+    CurrentPointer,
+    StockCache,
+    _fsync_directory,
+)
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import DownloadReceipt, HttpResponse
@@ -171,6 +178,17 @@ class StockCacheTest(unittest.TestCase):
             offer_product_id_field="product_id",
             cache_dir=self.cache_root,
         )
+
+    def _expire_current_refresh_lock(self) -> None:
+        lock_path = self.cache_root / ".refresh.lock"
+        owner_path = lock_path / "owner.json"
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        expired = time.time() - cache_module._LOCK_TTL_SECONDS - 1
+        owner_path.write_text(
+            json.dumps({"token": owner["token"], "created_at": expired}),
+            encoding="utf-8",
+        )
+        os.utime(lock_path / f"heartbeat-{owner['token']}", (expired, expired))
 
     def test_success_activates_verified_generation_with_plain_json_pointer(self) -> None:
         cache = StockCache(self.cache_root, FakeHttpClient())
@@ -731,6 +749,265 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.status, "stale_cache")
         self.assertEqual(result.warning_code, "cache_locked")
         self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+
+    def test_delayed_activation_before_commit_cannot_overwrite_successful_writer(
+        self,
+    ) -> None:
+        self.fixture.seed_generation()
+        delayed_before_commit = threading.Event()
+        allow_delayed = threading.Event()
+        delayed_results: list[object] = []
+        delayed_errors: list[BaseException] = []
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+        paused = False
+
+        def pause_delayed_activation(root: Path) -> object:
+            nonlocal paused
+            if (
+                threading.current_thread().name == "delayed-activation"
+                and not paused
+            ):
+                paused = True
+                delayed_before_commit.set()
+                if not allow_delayed.wait(timeout=5):
+                    raise AssertionError("delayed activation timeout")
+            return real_commit_acquire(root)
+
+        def run_delayed() -> None:
+            try:
+                delayed_results.append(
+                    StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+                )
+            except BaseException as error:
+                delayed_errors.append(error)
+
+        current_client = FakeHttpClient(
+            response=HttpResponse(
+                status=200,
+                headers={"ETag": '"generation-c"'},
+                body=manifest_bytes("generation-c"),
+            )
+        )
+        with patch.object(
+            cache_module.RuntimeCommitLock,
+            "acquire",
+            side_effect=pause_delayed_activation,
+        ):
+            delayed = threading.Thread(
+                target=run_delayed, name="delayed-activation"
+            )
+            delayed.start()
+            reached_commit = delayed_before_commit.wait(timeout=1)
+            if not reached_commit:
+                allow_delayed.set()
+                delayed.join(timeout=5)
+            self.assertTrue(reached_commit)
+
+            self._expire_current_refresh_lock()
+            current_result = StockCache(
+                self.cache_root, current_client
+            ).refresh(self.config)
+            allow_delayed.set()
+            delayed.join(timeout=5)
+
+        self.assertFalse(delayed.is_alive())
+        self.assertEqual(delayed_errors, [])
+        self.assertEqual(len(delayed_results), 1)
+        self.assertEqual(current_result.status, "updated")
+        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+        active = CacheState.load(self.cache_root)
+        self.assertIsNotNone(active)
+        self.assertTrue(active.files.manifest.parent.is_dir())
+
+    def test_activation_holding_commit_orders_later_writer_after_it(self) -> None:
+        self.fixture.seed_generation()
+        first_at_pointer = threading.Event()
+        allow_first_pointer = threading.Event()
+        second_waiting = threading.Event()
+        second_done = threading.Event()
+        first_errors: list[BaseException] = []
+        second_errors: list[BaseException] = []
+        second_results: list[object] = []
+        real_write_json = cache_module._write_json_atomic
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+
+        def pause_first_pointer(path: Path, value: object) -> None:
+            if (
+                path == self.cache_root / "current.json"
+                and threading.current_thread().name == "first-activation"
+            ):
+                first_at_pointer.set()
+                if not allow_first_pointer.wait(timeout=5):
+                    raise AssertionError("first pointer timeout")
+            real_write_json(path, value)
+
+        def observe_second_wait(root: Path) -> object:
+            if threading.current_thread().name == "second-activation":
+                second_waiting.set()
+            return real_commit_acquire(root)
+
+        def run_first() -> None:
+            try:
+                StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+            except BaseException as error:
+                first_errors.append(error)
+
+        current_client = FakeHttpClient(
+            response=HttpResponse(
+                status=200,
+                headers={"ETag": '"generation-c"'},
+                body=manifest_bytes("generation-c"),
+            )
+        )
+
+        def run_second() -> None:
+            try:
+                second_results.append(
+                    StockCache(self.cache_root, current_client).refresh(self.config)
+                )
+            except BaseException as error:
+                second_errors.append(error)
+            finally:
+                second_done.set()
+
+        with patch.object(
+            cache_module, "_write_json_atomic", side_effect=pause_first_pointer
+        ):
+            with patch.object(
+                cache_module.RuntimeCommitLock,
+                "acquire",
+                side_effect=observe_second_wait,
+            ):
+                first = threading.Thread(target=run_first, name="first-activation")
+                first.start()
+                self.assertTrue(first_at_pointer.wait(timeout=5))
+                self._expire_current_refresh_lock()
+                second = threading.Thread(
+                    target=run_second, name="second-activation"
+                )
+                second.start()
+                self.assertTrue(second_waiting.wait(timeout=5))
+                second_completed_while_first_paused = second_done.wait(timeout=1)
+                allow_first_pointer.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+
+        self.assertFalse(second_completed_while_first_paused)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(first_errors, [])
+        self.assertEqual(second_errors, [])
+        self.assertEqual(len(second_results), 1)
+        self.assertEqual(second_results[0].status, "updated")
+        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+
+    def test_activation_rollback_cas_cannot_restore_over_successful_writer(
+        self,
+    ) -> None:
+        self.fixture.seed_generation()
+        previous_pointer = (self.cache_root / "current.json").read_bytes()
+        rollback_paused = threading.Event()
+        allow_rollback = threading.Event()
+        second_waiting = threading.Event()
+        second_done = threading.Event()
+        delayed_errors: list[BaseException] = []
+        second_errors: list[BaseException] = []
+        second_results: list[object] = []
+        real_load = CacheState.load
+        real_write_bytes = cache_module._write_bytes_atomic
+        real_commit_acquire = cache_module.RuntimeCommitLock.acquire
+
+        def fail_delayed_validation(
+            cache_dir: Path, progress: object | None = None
+        ) -> CacheState | None:
+            pointer = CurrentPointer.load(cache_dir / "current.json")
+            if (
+                threading.current_thread().name == "rollback-activation"
+                and pointer.generation_id == "generation-b"
+            ):
+                raise StockError(
+                    "cache_unavailable", "Синтетическая ошибка validation", 7
+                )
+            return real_load(cache_dir, progress if callable(progress) else None)
+
+        def pause_rollback(path: Path, payload: bytes) -> None:
+            if (
+                path == self.cache_root / "current.json"
+                and payload == previous_pointer
+                and threading.current_thread().name == "rollback-activation"
+            ):
+                rollback_paused.set()
+                if not allow_rollback.wait(timeout=5):
+                    raise AssertionError("rollback timeout")
+            real_write_bytes(path, payload)
+
+        def observe_second_wait(root: Path) -> object:
+            if threading.current_thread().name == "rollback-successor":
+                second_waiting.set()
+            return real_commit_acquire(root)
+
+        def run_delayed() -> None:
+            try:
+                StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+            except BaseException as error:
+                delayed_errors.append(error)
+
+        current_client = FakeHttpClient(
+            response=HttpResponse(
+                status=200,
+                headers={"ETag": '"generation-c"'},
+                body=manifest_bytes("generation-c"),
+            )
+        )
+
+        def run_second() -> None:
+            try:
+                second_results.append(
+                    StockCache(self.cache_root, current_client).refresh(self.config)
+                )
+            except BaseException as error:
+                second_errors.append(error)
+            finally:
+                second_done.set()
+
+        with patch.object(CacheState, "load", side_effect=fail_delayed_validation):
+            with patch.object(
+                cache_module, "_write_bytes_atomic", side_effect=pause_rollback
+            ):
+                with patch.object(
+                    cache_module.RuntimeCommitLock,
+                    "acquire",
+                    side_effect=observe_second_wait,
+                ):
+                    delayed = threading.Thread(
+                        target=run_delayed, name="rollback-activation"
+                    )
+                    delayed.start()
+                    self.assertTrue(rollback_paused.wait(timeout=5))
+                    self._expire_current_refresh_lock()
+                    second = threading.Thread(
+                        target=run_second, name="rollback-successor"
+                    )
+                    second.start()
+                    self.assertTrue(second_waiting.wait(timeout=5))
+                    second_completed_while_rollback_paused = second_done.wait(
+                        timeout=1
+                    )
+                    allow_rollback.set()
+                    delayed.join(timeout=5)
+                    second.join(timeout=5)
+
+        self.assertFalse(second_completed_while_rollback_paused)
+        self.assertFalse(delayed.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(delayed_errors, [])
+        self.assertEqual(second_errors, [])
+        self.assertEqual(len(second_results), 1)
+        self.assertEqual(second_results[0].status, "updated")
+        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+        active = CacheState.load(self.cache_root)
+        self.assertIsNotNone(active)
+        self.assertTrue(active.files.manifest.parent.is_dir())
 
     def test_interrupted_pointer_replace_rolls_back_to_previous_generation(self) -> None:
         self.fixture.seed_generation()

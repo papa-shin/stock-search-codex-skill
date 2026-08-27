@@ -992,28 +992,54 @@ class StockCache:
         os.replace(staged.manifest.parent, final_directory)
         try:
             _fsync_directory(final_directory.parent)
-            lock.assert_owned()
-            _write_runtime_status_atomic(
-                self.root,
-                final_name,
-                {
-                    "generation_id": manifest.generation_id,
-                    "checked_at": checked_at,
-                    "stale": False,
-                    "warning_code": None,
-                    "revision": uuid.uuid4().hex,
-                },
-            )
-            lock.assert_owned()
-            _write_json_atomic(current_path, pointer.to_dict())
-            lock.assert_owned()
+            runtime_value = {
+                "generation_id": manifest.generation_id,
+                "checked_at": checked_at,
+                "stale": False,
+                "warning_code": None,
+                "revision": uuid.uuid4().hex,
+            }
+            lock.heartbeat()
+            with RuntimeCommitLock.acquire(self.root):
+                lock.assert_owned()
+                if _read_optional_bytes(current_path) != previous_pointer:
+                    raise StockError(
+                        "cache_locked", "Активное поколение кэша изменилось", 6
+                    )
+                _write_runtime_status_atomic(
+                    self.root, final_name, runtime_value
+                )
+                lock.assert_owned()
+                _write_json_atomic(current_path, pointer.to_dict())
+                lock.assert_owned()
+                committed_pointer = CurrentPointer.load(current_path)
+                committed_runtime = load_runtime_status(
+                    _runtime_status_path(self.root, final_name),
+                    manifest.generation_id,
+                )
+                if (
+                    committed_pointer != pointer
+                    or committed_runtime.revision != runtime_value["revision"]
+                    or committed_runtime.checked_at != checked_at
+                    or committed_runtime.stale
+                    or committed_runtime.warning_code is not None
+                ):
+                    raise StockError(
+                        "cache_locked", "Активное поколение кэша изменилось", 6
+                    )
+                lock.assert_owned()
             state = CacheState.load(self.root, lock.heartbeat)
-            if state is None:
+            if (
+                state is None
+                or state.generation_id != pointer.generation_id
+                or state.directory_name != pointer.directory_name
+                or state.runtime_revision != runtime_value["revision"]
+            ):
                 raise _cache_unavailable()
             lock.assert_owned()
         except BaseException:
             self._rollback_pointer_if_owned(
-                current_path, pointer.activation_token, previous_pointer
+                current_path, pointer, previous_pointer
             )
             self._remove_generation_if_inactive(final_directory)
             raise
@@ -1022,14 +1048,28 @@ class StockCache:
     def _rollback_pointer_if_owned(
         self,
         current_path: Path,
-        activation_token: str | None,
+        expected_pointer: CurrentPointer,
+        previous_pointer: bytes | None,
+    ) -> None:
+        try:
+            with RuntimeCommitLock.acquire(self.root):
+                self._rollback_pointer_if_owned_locked(
+                    current_path, expected_pointer, previous_pointer
+                )
+        except StockError:
+            return
+
+    def _rollback_pointer_if_owned_locked(
+        self,
+        current_path: Path,
+        expected_pointer: CurrentPointer,
         previous_pointer: bytes | None,
     ) -> None:
         try:
             current = CurrentPointer.load(current_path)
         except StockError:
             return
-        if current.activation_token != activation_token:
+        if current != expected_pointer:
             return
         if previous_pointer is None:
             current_path.unlink(missing_ok=True)
