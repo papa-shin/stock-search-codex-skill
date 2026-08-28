@@ -13,6 +13,7 @@ _ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DEFAULT_CONFIG_PATH = Path.home() / ".codex" / "secrets" / "papa-shin-stock.env"
 _DEFAULT_CACHE_DIR = Path.home() / ".codex" / "cache" / "papa-shin-stock"
 _SKILL_ROOT = Path(__file__).resolve().parents[2]
+_ROBOTYRE_PRODUCT_ID_FIELD = "robotyre_product_id"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,20 +41,31 @@ class StockConfig:
             manifest_url=manifest_url,
             username=require_value(values, "PAPA_SHIN_STOCK_USERNAME"),
             password=require_value(values, "PAPA_SHIN_STOCK_PASSWORD"),
-            product_id_field=require_value(values, "PAPA_SHIN_STOCK_PRODUCT_ID_FIELD"),
-            offer_product_id_field=require_value(
-                values, "PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD"
+            product_id_field=_validated_product_id_field(
+                values.get(
+                    "PAPA_SHIN_STOCK_PRODUCT_ID_FIELD",
+                    _ROBOTYRE_PRODUCT_ID_FIELD,
+                )
+            ),
+            offer_product_id_field=_validated_product_id_field(
+                values.get(
+                    "PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD",
+                    _ROBOTYRE_PRODUCT_ID_FIELD,
+                )
             ),
             cache_dir=cache_dir,
         )
 
     def resolve_product_id(self, row: dict[str, object]) -> str:
-        value = row.get(self.product_id_field)
-        if type(value) not in (str, int) or str(value) == "":
+        value = row.get(_ROBOTYRE_PRODUCT_ID_FIELD)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[1-9][0-9]*", value) is None
+        ):
             raise StockError(
                 "manifest_invalid", "Некорректные машинные данные", 3
             )
-        return str(value)
+        return value
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -117,6 +129,12 @@ def _validated_manifest_url(value: str) -> str:
         or parsed.password is not None
         or port == 0
     ):
+        raise _invalid_config()
+    return value
+
+
+def _validated_product_id_field(value: str) -> str:
+    if value != _ROBOTYRE_PRODUCT_ID_FIELD:
         raise _invalid_config()
     return value
 

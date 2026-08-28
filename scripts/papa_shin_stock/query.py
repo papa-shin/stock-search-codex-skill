@@ -45,9 +45,15 @@ class SearchQuery:
     @classmethod
     def from_args(cls, namespace: argparse.Namespace) -> "SearchQuery":
         size = _optional_text(getattr(namespace, "size", None))
+        if size is not None:
+            raise StockError(
+                "query_unsupported",
+                "Источник не публикует структурированный типоразмер",
+                4,
+            )
         return cls(
             product_type=_optional_text(getattr(namespace, "product_type", None)),
-            size=normalize_tire_size(size) if size is not None else None,
+            size=None,
             season=_optional_text(getattr(namespace, "season", None)),
             spikes=_optional_text(getattr(namespace, "spikes", None)),
             run_flat=_optional_text(getattr(namespace, "run_flat", None)),

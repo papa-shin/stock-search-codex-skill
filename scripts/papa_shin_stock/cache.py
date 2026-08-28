@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -45,6 +45,16 @@ _LOCK_TTL_SECONDS = 30 * 60
 _LOCK_FUTURE_SKEW_SECONDS = 5 * 60
 _DIRECTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_REPORT_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+_PRODUCT_TYPE_ID = re.compile(r"[1-9][0-9]*\Z")
+_WARNING_CODE = re.compile(r"unknown_characteristic\.[a-z_]+\Z")
+_PUBLICATION_ETAG = re.compile(r'"[0-9a-f]+-[0-9a-f]+"\Z')
+_ROBOTYRE_CONTRACT = "robotyre-stock/v1"
+_ROBOTYRE_SCHEMA_VERSION = "1"
+_ROBOTYRE_STALE_AFTER_SECONDS = 5_400
+_MANIFEST_FUTURE_SKEW_SECONDS = 5 * 60
+_MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024 * 1024
 _RUNTIME_REVISION = re.compile(r"[0-9a-f]{32}\Z")
 _RUNTIME_STATUS_FILE = re.compile(
     r"\.runtime-status-(?P<directory>[A-Za-z0-9][A-Za-z0-9._-]*)\.json\Z"
@@ -179,9 +189,9 @@ class GenerationSnapshot:
         files: GenerationFiles,
         manifest_payload: bytes,
         *,
-        checked_at: str,
+        verified_at: str,
         stale: bool,
-        warning_code: str | None,
+        warning_codes: tuple[str, ...],
         payload_handles: dict[str, object],
         retained: list[object],
     ) -> None:
@@ -189,9 +199,9 @@ class GenerationSnapshot:
         self.integrity = files.integrity
         self.files = files
         self.manifest_payload = manifest_payload
-        self.checked_at = checked_at
+        self.verified_at = verified_at
         self.stale = stale
-        self.warning_code = warning_code
+        self.warning_codes = warning_codes
         self._payload_handles = payload_handles
         self._retained = retained
         self._opened: set[str] = set()
@@ -477,9 +487,9 @@ def _validate_windows_runtime_payload(
     value = _parse_windows_json(payload)
     if not isinstance(value, dict) or set(value) != {
         "generation_id",
-        "checked_at",
+        "verified_at",
         "stale",
-        "warning_code",
+        "warning_codes",
         "revision",
         "ownership",
     }:
@@ -589,14 +599,15 @@ class CurrentPointer:
 class CacheState:
     generation_id: str
     generated_at: str
-    checked_at: str
+    source_checked_at: str
+    verified_at: str
     manifest_etag: str | None
     manifest_last_modified: str | None
     directory_name: str
     files: GenerationFiles
     runtime_revision: str | None = None
     stale: bool = False
-    warning_code: str | None = None
+    warning_codes: tuple[str, ...] = ()
 
     @classmethod
     def load(
@@ -693,14 +704,14 @@ class CacheState:
                     raise _cache_unavailable()
                 generation_id = value.get("generation_id")
                 generated_at = value.get("generated_at")
-                checked_at = value.get("checked_at")
+                verified_at = value.get("verified_at")
                 manifest_etag = value.get("manifest_etag")
                 manifest_last_modified = value.get("manifest_last_modified")
                 if generation_id != pointer.generation_id:
                     raise _cache_unavailable()
                 if not is_iso_8601_timestamp(generated_at):
                     raise _cache_unavailable()
-                if not isinstance(checked_at, str) or not checked_at:
+                if not is_iso_8601_timestamp(verified_at):
                     raise _cache_unavailable()
                 if manifest_etag is not None and not isinstance(
                     manifest_etag, str
@@ -736,7 +747,8 @@ class CacheState:
                 return cls(
                     generation_id=generation_id,
                     generated_at=generated_at,
-                    checked_at=runtime.checked_at,
+                    source_checked_at=manifest.source_checked_at,
+                    verified_at=runtime.verified_at,
                     manifest_etag=manifest_etag,
                     manifest_last_modified=manifest_last_modified,
                     directory_name=pointer.directory_name,
@@ -748,7 +760,7 @@ class CacheState:
                     ),
                     runtime_revision=runtime.revision,
                     stale=runtime.stale,
-                    warning_code=runtime.warning_code,
+                    warning_codes=runtime.warning_codes,
                 )
         except StockError:
             raise
@@ -874,14 +886,14 @@ class CacheState:
 
         generation_id = value.get("generation_id")
         generated_at = value.get("generated_at")
-        checked_at = value.get("checked_at")
+        verified_at = value.get("verified_at")
         manifest_etag = value.get("manifest_etag")
         manifest_last_modified = value.get("manifest_last_modified")
         if generation_id != pointer.generation_id:
             raise _cache_unavailable()
         if not is_iso_8601_timestamp(generated_at):
             raise _cache_unavailable()
-        if not isinstance(checked_at, str) or not checked_at:
+        if not is_iso_8601_timestamp(verified_at):
             raise _cache_unavailable()
         if manifest_etag is not None and not isinstance(manifest_etag, str):
             raise _cache_unavailable()
@@ -899,14 +911,15 @@ class CacheState:
         result = cls(
             generation_id=generation_id,
             generated_at=generated_at,
-            checked_at=runtime_status.checked_at,
+            source_checked_at=manifest.source_checked_at,
+            verified_at=runtime_status.verified_at,
             manifest_etag=manifest_etag,
             manifest_last_modified=manifest_last_modified,
             directory_name=pointer.directory_name,
             files=files,
             runtime_revision=runtime_status.revision,
             stale=runtime_status.stale,
-            warning_code=runtime_status.warning_code,
+            warning_codes=runtime_status.warning_codes,
         )
         root_attestation.assert_current()
         return result
@@ -915,10 +928,67 @@ class CacheState:
 @dataclass(frozen=True, slots=True)
 class RuntimeStatus:
     generation_id: str
-    checked_at: str
+    verified_at: str
     stale: bool
-    warning_code: str | None
+    warning_codes: tuple[str, ...]
     revision: str | None
+
+
+def _warning_codes(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or len(value) > 8:
+        raise _cache_unavailable()
+    result: list[str] = []
+    for code in value:
+        if not is_bounded_unicode_scalar(code, maximum=_MAX_STATUS_TEXT):
+            raise _cache_unavailable()
+        assert isinstance(code, str)
+        if code in result:
+            raise _cache_unavailable()
+        result.append(code)
+    return tuple(result)
+
+
+def _merge_warning_codes(*values: object) -> tuple[str, ...]:
+    merged: list[str] = []
+    for value in values:
+        items = (value,) if isinstance(value, str) else (() if value is None else value)
+        if not isinstance(items, (list, tuple)):
+            raise _cache_unavailable()
+        for code in items:
+            if not is_bounded_unicode_scalar(code, maximum=_MAX_STATUS_TEXT):
+                raise _cache_unavailable()
+            assert isinstance(code, str)
+            if code not in merged:
+                merged.append(code)
+    if "source_stale" in merged:
+        merged.remove("source_stale")
+        merged.insert(0, "source_stale")
+    return tuple(merged)
+
+
+def _warning_message(code: str) -> str:
+    if code == "source_stale":
+        return "Источник давно не обновлялся"
+    if code == "cache_cleanup_incomplete":
+        return "Не удалось удалить часть неактивного кэша"
+    return "Не удалось обновить данные; используется предыдущее поколение"
+
+
+def _state_source_is_stale(
+    state: "CacheState", now: datetime | None = None
+) -> bool:
+    try:
+        checked = datetime.fromisoformat(
+            state.source_checked_at.replace("Z", "+00:00")
+        )
+        current = now or datetime.now(timezone.utc)
+        return current > checked + timedelta(
+            seconds=_ROBOTYRE_STALE_AFTER_SECONDS
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise _cache_unavailable() from error
 
 
 def validate_runtime_status(
@@ -926,33 +996,30 @@ def validate_runtime_status(
 ) -> RuntimeStatus:
     if not isinstance(value, dict):
         raise _cache_unavailable()
+    if "warning_code" in value:
+        raise _cache_unavailable()
     generation_id = value.get("generation_id")
-    checked_at = value.get("checked_at")
+    verified_at = value.get("verified_at")
     stale = value.get("stale", False)
-    warning_code = value.get("warning_code")
+    warning_codes = _warning_codes(value.get("warning_codes", []))
     revision = value.get("revision")
     if generation_id != expected_generation_id:
         raise _cache_unavailable()
     if (
-        not is_iso_8601_timestamp(checked_at)
+        not is_iso_8601_timestamp(verified_at)
     ):
         raise _cache_unavailable()
     if not isinstance(stale, bool):
         raise _cache_unavailable()
-    if stale:
-        if (
-            not is_bounded_unicode_scalar(
-                warning_code, maximum=_MAX_STATUS_TEXT
-            )
-        ):
-            raise _cache_unavailable()
-    elif warning_code is not None:
+    if stale and not warning_codes:
+        raise _cache_unavailable()
+    if not stale and warning_codes:
         raise _cache_unavailable()
     if revision is not None and (
         not isinstance(revision, str) or not _RUNTIME_REVISION.fullmatch(revision)
     ):
         raise _cache_unavailable()
-    return RuntimeStatus(generation_id, checked_at, stale, warning_code, revision)
+    return RuntimeStatus(generation_id, verified_at, stale, warning_codes, revision)
 
 
 def load_runtime_status(path: Path, expected_generation_id: str) -> RuntimeStatus:
@@ -1006,16 +1073,22 @@ def load_runtime_status_from_directory(
 @dataclass(frozen=True, slots=True)
 class ManifestFile:
     url: str
+    media_type: str
     bytes: int
     sha256: str
+    etag: str
+    last_modified: str
 
 
 @dataclass(frozen=True, slots=True)
 class Manifest:
     generation_id: str
     generated_at: str
+    source_checked_at: str
+    stale_after_seconds: int
     products: ManifestFile
     offers: ManifestFile
+    archive: ManifestFile
     body: bytes
 
     @classmethod
@@ -1036,22 +1109,100 @@ class Manifest:
         if not isinstance(value, dict):
             raise _manifest_invalid()
 
-        generation_id = value.get("generation_id")
+        contract = value.get("contract")
+        schema_version = value.get("schema_version")
+        if contract != _ROBOTYRE_CONTRACT or schema_version != _ROBOTYRE_SCHEMA_VERSION:
+            if isinstance(contract, str) and isinstance(schema_version, str):
+                raise StockError(
+                    "contract_unsupported",
+                    "Версия машинного контракта не поддерживается",
+                    3,
+                )
+            raise _manifest_invalid()
+        allowed = {
+            "contract",
+            "schema_version",
+            "content_generation_id",
+            "report_date",
+            "timezone",
+            "product_type_sku_counts",
+            "offer_count",
+            "warnings",
+            "generated_at",
+            "checked_at",
+            "stale_after_seconds",
+            "files",
+            "linked_xlsx",
+        }
+        required = allowed - {"linked_xlsx"}
+        if set(value) - allowed or not required.issubset(value):
+            raise _manifest_invalid()
+        generation_id = value.get("content_generation_id")
         generated_at = value.get("generated_at")
+        source_checked_at = value.get("checked_at")
         files = value.get("files")
-        if not is_bounded_unicode_scalar(generation_id):
+        if not isinstance(generation_id, str) or not _LOWER_SHA256.fullmatch(generation_id):
             raise _manifest_invalid()
-        if not is_iso_8601_timestamp(generated_at):
+        if not is_iso_8601_timestamp(generated_at) or not is_iso_8601_timestamp(source_checked_at):
             raise _manifest_invalid()
+        assert isinstance(generated_at, str)
+        assert isinstance(source_checked_at, str)
+        generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        checked = datetime.fromisoformat(source_checked_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if generated > checked or checked > now + timedelta(seconds=_MANIFEST_FUTURE_SKEW_SECONDS):
+            raise _manifest_invalid()
+        report_date = value.get("report_date")
+        try:
+            if not isinstance(report_date, str) or not _REPORT_DATE.fullmatch(report_date):
+                raise ValueError
+            datetime.strptime(report_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise _manifest_invalid() from error
+        if value.get("timezone") != "Asia/Yekaterinburg":
+            raise _manifest_invalid()
+        if value.get("stale_after_seconds") != _ROBOTYRE_STALE_AFTER_SECONDS:
+            raise _manifest_invalid()
+        _validate_product_type_counts(value.get("product_type_sku_counts"))
+        offer_count = value.get("offer_count")
+        if type(offer_count) is not int or offer_count < 0:
+            raise _manifest_invalid()
+        _validate_manifest_warnings(value.get("warnings"))
+        if "linked_xlsx" in value:
+            _validate_linked_xlsx(value["linked_xlsx"])
         if not isinstance(files, dict):
+            raise _manifest_invalid()
+        if set(files) != {"products.jsonl", "offers.jsonl", "archive.zip"}:
             raise _manifest_invalid()
         return cls(
             generation_id=generation_id,
             generated_at=generated_at,
-            products=_manifest_file(files.get("products")),
-            offers=_manifest_file(files.get("offers")),
+            source_checked_at=source_checked_at,
+            stale_after_seconds=_ROBOTYRE_STALE_AFTER_SECONDS,
+            products=_manifest_file(
+                files.get("products.jsonl"),
+                "/robotyre-stock/v1/products.jsonl",
+                "application/x-ndjson",
+                maximum_bytes=_MAX_DOWNLOAD_BYTES,
+            ),
+            offers=_manifest_file(
+                files.get("offers.jsonl"),
+                "/robotyre-stock/v1/offers.jsonl",
+                "application/x-ndjson",
+                maximum_bytes=_MAX_DOWNLOAD_BYTES,
+            ),
+            archive=_manifest_file(
+                files.get("archive.zip"),
+                "/robotyre-stock/v1/archive.zip",
+                "application/zip",
+            ),
             body=body,
         )
+
+    def source_is_stale(self, now: datetime | None = None) -> bool:
+        checked = datetime.fromisoformat(self.source_checked_at.replace("Z", "+00:00"))
+        current = now or datetime.now(timezone.utc)
+        return current > checked + timedelta(seconds=self.stale_after_seconds)
 
 
 def _generation_integrity(manifest: Manifest) -> GenerationIntegrity:
@@ -1065,6 +1216,32 @@ def _generation_integrity(manifest: Manifest) -> GenerationIntegrity:
     )
 
 
+def _is_legacy_manifest_payload(payload: bytes) -> bool:
+    """Recognize only the previous unversioned cache manifest for preservation."""
+    try:
+        value = json.loads(
+            payload.decode("utf-8"), object_pairs_hook=_unique_object
+        )
+    except (
+        StockError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ):
+        return False
+    if not isinstance(value, dict) or "contract" in value:
+        return False
+    files = value.get("files")
+    return (
+        isinstance(value.get("generation_id"), str)
+        and isinstance(files, dict)
+        and {"products", "offers"}.issubset(files)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RefreshResult:
     status: str
@@ -1072,7 +1249,7 @@ class RefreshResult:
     generated_at: str
     checked_at: str
     stale: bool
-    warning_code: str | None = None
+    warning_codes: tuple[str, ...] = ()
 
     @classmethod
     def from_state(
@@ -1081,15 +1258,15 @@ class RefreshResult:
         state: CacheState,
         *,
         stale: bool = False,
-        warning_code: str | None = None,
+        warning_codes: str | tuple[str, ...] | None = None,
     ) -> "RefreshResult":
         return cls(
             status=status,
             generation_id=state.generation_id,
             generated_at=state.generated_at,
-            checked_at=state.checked_at,
+            checked_at=state.source_checked_at,
             stale=stale or state.stale,
-            warning_code=warning_code or state.warning_code,
+            warning_codes=_merge_warning_codes(state.warning_codes, warning_codes),
         )
 
     def to_public_dict(self) -> dict[str, object]:
@@ -1103,17 +1280,10 @@ class RefreshResult:
             },
             "warnings": [],
         }
-        if self.warning_code is not None:
-            message = (
-                "Не удалось удалить часть неактивного кэша"
-                if self.warning_code == "cache_cleanup_incomplete"
-                else "Не удалось обновить данные; используется предыдущее поколение"
-            )
+        if self.warning_codes:
             result["warnings"] = [
-                {
-                    "code": self.warning_code,
-                    "message": message,
-                }
+                {"code": code, "message": _warning_message(code)}
+                for code in self.warning_codes
             ]
         return result
 
@@ -2694,7 +2864,7 @@ class StockCache:
                             "stale_cache",
                             current,
                             stale=True,
-                            warning_code=cleanup_warning,
+                            warning_codes=cleanup_warning,
                         )
                     raise _cache_unavailable()
                 lock.heartbeat()
@@ -2707,7 +2877,7 @@ class StockCache:
                     raise
                 cleanup_warning = self._cleanup_inactive_generations(lock)
                 return RefreshResult.from_state(
-                    "updated", state, warning_code=cleanup_warning
+                    "updated", state, warning_codes=cleanup_warning
                 )
         except StockError as error:
             fallback = previous if previous is not None else self._load_if_readable()
@@ -2753,14 +2923,19 @@ class StockCache:
             raise
         release_warning = lock.release()
         if release_warning is not None:
-            result = replace(result, warning_code=release_warning)
+            result = replace(
+                result,
+                warning_codes=_merge_warning_codes(
+                    result.warning_codes, release_warning
+                ),
+            )
         return result
 
     def _finalize_windows_failure(
         self,
         lock: _WindowsCacheLock | None,
         previous: CacheState | None,
-        warning_code: str,
+        warning_codes: str,
     ) -> RefreshResult | None:
         persisted = previous
         persistence_error: StockError | None = None
@@ -2769,11 +2944,11 @@ class StockCache:
             if (
                 lock is not None
                 and persisted is not None
-                and warning_code != "cache_locked"
+                and warning_codes != "cache_locked"
             ):
                 try:
                     persisted = self._record_runtime_status_windows(
-                        persisted, True, warning_code, lock
+                        persisted, True, warning_codes, lock
                     )
                 except StockError as error:
                     persistence_error = error
@@ -2784,7 +2959,7 @@ class StockCache:
                 release_warning = lock.release()
         if (
             persisted is None
-            or warning_code == "cache_locked"
+            or warning_codes == "cache_locked"
             or (
                 persistence_error is not None
                 and persistence_error.code == "cache_locked"
@@ -2802,7 +2977,7 @@ class StockCache:
             raise persistence_error
         if persisted is None:
             return None
-        return self._stale_fallback_windows(persisted, warning_code)
+        return self._stale_fallback_windows(persisted, warning_codes)
 
     def _refresh_windows_locked(
         self,
@@ -2835,7 +3010,7 @@ class StockCache:
                 "stale_cache",
                 current,
                 stale=True,
-                warning_code=cleanup_warning,
+                warning_codes=cleanup_warning,
             )
         staged = self._download_generation_windows(manifest, config, lock)
         try:
@@ -2846,14 +3021,14 @@ class StockCache:
             raise
         cleanup_warning = self._cleanup_inactive_generations_windows(lock)
         return RefreshResult.from_state(
-            "updated", state, warning_code=cleanup_warning
+            "updated", state, warning_codes=cleanup_warning
         )
 
     def _record_runtime_status_windows(
         self,
         state: CacheState,
         stale: bool,
-        warning_code: str | None,
+        warning_codes: str | tuple[str, ...] | None,
         lock: "_WindowsCacheLock",
     ) -> CacheState:
         lock.assert_owned()
@@ -2896,23 +3071,29 @@ class StockCache:
             )
             if (
                 current_status.revision != state.runtime_revision
-                or current_status.checked_at != state.checked_at
+                or current_status.verified_at != state.verified_at
                 or current_status.stale != state.stale
-                or current_status.warning_code != state.warning_code
+                or current_status.warning_codes != state.warning_codes
             ):
                 raise StockError(
                     "cache_locked", "Активное поколение кэша изменилось", 6
                 )
+        source_stale = _state_source_is_stale(state)
+        effective_stale = stale or source_stale
+        codes = _merge_warning_codes(
+            ("source_stale",) if source_stale else (),
+            warning_codes,
+        )
         value = _windows_runtime_value(
             {
                 "generation_id": state.generation_id,
-                "checked_at": (
+                "verified_at": (
                     datetime.now(timezone.utc).isoformat()
                     if not stale
-                    else state.checked_at
+                    else state.verified_at
                 ),
-                "stale": stale,
-                "warning_code": warning_code,
+                "stale": effective_stale,
+                "warning_codes": list(codes),
                 "revision": uuid.uuid4().hex,
             },
             root_ownership_token=lock.root_attestation.ownership_token,
@@ -2940,18 +3121,18 @@ class StockCache:
             raise _cache_unavailable()
         return replace(
             state,
-            checked_at=expected_status.checked_at,
+            verified_at=expected_status.verified_at,
             files=replace(state.files, runtime_status=path),
             runtime_revision=expected_status.revision,
             stale=expected_status.stale,
-            warning_code=expected_status.warning_code,
+            warning_codes=expected_status.warning_codes,
         )
 
     def _stale_fallback_windows(
-        self, state: CacheState, warning_code: str
+        self, state: CacheState, warning_codes: str
     ) -> RefreshResult:
         return RefreshResult.from_state(
-            "stale_cache", state, stale=True, warning_code=warning_code
+            "stale_cache", state, stale=True, warning_codes=warning_codes
         )
 
     def _download_generation_windows(
@@ -3071,24 +3252,26 @@ class StockCache:
         response: HttpResponse,
         lock: "_WindowsCacheLock",
     ) -> CacheState:
-        checked_at = datetime.now(timezone.utc).isoformat()
+        verified_at = datetime.now(timezone.utc).isoformat()
+        source_stale = manifest.source_is_stale()
+        source_warnings = ["source_stale"] if source_stale else []
         final_name = f"generation-{uuid.uuid4().hex}"
         final_directory = self.root / "generations" / final_name
         state_value = {
             "generation_id": manifest.generation_id,
             "generated_at": manifest.generated_at,
-            "checked_at": checked_at,
+            "verified_at": verified_at,
             "manifest_etag": _header(response.headers, "etag"),
             "manifest_last_modified": _header(response.headers, "last-modified"),
-            "stale": False,
-            "warning_code": None,
+            "stale": source_stale,
+            "warning_codes": source_warnings,
         }
         runtime_value = _windows_runtime_value(
             {
                 "generation_id": manifest.generation_id,
-                "checked_at": checked_at,
-                "stale": False,
-                "warning_code": None,
+                "verified_at": verified_at,
+                "stale": source_stale,
+                "warning_codes": source_warnings,
                 "revision": uuid.uuid4().hex,
             },
             root_ownership_token=lock.root_attestation.ownership_token,
@@ -3267,6 +3450,7 @@ class StockCache:
             pointer = self._load_current_pointer_windows_session(session)
             root_names = session.list_directory(())
             cleanup_incomplete = False
+            preserved_generation_names: set[str] = set()
             if "generations" in root_names:
                 generation_names = session.list_directory(("generations",))
                 for attempt in range(_GENERATION_QUARANTINE_SETTLE_ATTEMPTS):
@@ -3317,13 +3501,20 @@ class StockCache:
                         if name.startswith("generation-"):
                             if set(inventory) != allowed_inventory:
                                 raise _cache_unavailable()
-                            manifest = Manifest.parse(
-                                session.read_file(
-                                    ("generations", name),
-                                    "manifest.json",
-                                    _WINDOWS_MANIFEST_MAX_BYTES,
-                                )
+                            manifest_payload = session.read_file(
+                                ("generations", name),
+                                "manifest.json",
+                                _WINDOWS_MANIFEST_MAX_BYTES,
                             )
+                            try:
+                                manifest = Manifest.parse(
+                                    manifest_payload
+                                )
+                            except StockError:
+                                if _is_legacy_manifest_payload(manifest_payload):
+                                    preserved_generation_names.add(name)
+                                    continue
+                                raise
                             state_value = _parse_windows_json(
                                 session.read_file(
                                     ("generations", name),
@@ -3367,6 +3558,8 @@ class StockCache:
                     and pointer is not None
                     and pointer.directory_name == directory_name
                 ):
+                    continue
+                if directory_name in preserved_generation_names:
                     continue
                 try:
                     observed = session.file_identity((), name)
@@ -3459,7 +3652,7 @@ class StockCache:
                 _runtime_status_path(self.root, pointer.directory_name).name,
                 _WINDOWS_RUNTIME_MAX_BYTES,
             )
-            checked_at, stale, warning_code = _snapshot_metadata(
+            verified_at, stale, warning_codes = _snapshot_metadata(
                 pointer,
                 manifest,
                 state_payload,
@@ -3477,9 +3670,9 @@ class StockCache:
             return GenerationSnapshot(
                 files,
                 manifest_payload,
-                checked_at=checked_at,
+                verified_at=verified_at,
                 stale=stale,
-                warning_code=warning_code,
+                warning_codes=warning_codes,
                 payload_handles={
                     "products": descriptors["products.jsonl"],
                     "offers": descriptors["offers.jsonl"],
@@ -3551,7 +3744,7 @@ class StockCache:
             runtime_payload = session.read_optional_file(
                 (), runtime_path.name, _WINDOWS_RUNTIME_MAX_BYTES
             )
-            checked_at, stale, warning_code = _snapshot_metadata(
+            verified_at, stale, warning_codes = _snapshot_metadata(
                 pointer,
                 manifest,
                 state_payload,
@@ -3575,9 +3768,9 @@ class StockCache:
             return GenerationSnapshot(
                 files,
                 manifest_payload,
-                checked_at=checked_at,
+                verified_at=verified_at,
                 stale=stale,
-                warning_code=warning_code,
+                warning_codes=warning_codes,
                 payload_handles={
                     "products": handles["products.jsonl"],
                     "offers": handles["offers.jsonl"],
@@ -3596,7 +3789,7 @@ class StockCache:
         self,
         state: CacheState,
         stale: bool,
-        warning_code: str | None,
+        warning_codes: str | tuple[str, ...] | None,
         lock: CacheLock,
         *,
         verify_current: bool = False,
@@ -3608,15 +3801,21 @@ class StockCache:
                 raise StockError(
                     "cache_locked", "Активное поколение кэша изменилось", 6
                 )
+        source_stale = _state_source_is_stale(state)
+        effective_stale = stale or source_stale
+        codes = _merge_warning_codes(
+            ("source_stale",) if source_stale else (),
+            warning_codes,
+        )
         value = {
             "generation_id": state.generation_id,
-            "checked_at": (
+            "verified_at": (
                 datetime.now(timezone.utc).isoformat()
                 if not stale
-                else state.checked_at
+                else state.verified_at
             ),
-            "stale": stale,
-            "warning_code": warning_code,
+            "stale": effective_stale,
+            "warning_codes": list(codes),
             "revision": uuid.uuid4().hex,
         }
         validate_runtime_status(value, state.generation_id)
@@ -3637,9 +3836,9 @@ class StockCache:
                 )
                 if (
                     written.revision != value["revision"]
-                    or written.checked_at != value["checked_at"]
-                    or written.stale != stale
-                    or written.warning_code != warning_code
+                    or written.verified_at != value["verified_at"]
+                    or written.stale != effective_stale
+                    or written.warning_codes != codes
                 ):
                     raise StockError(
                         "cache_locked", "Активное поколение кэша изменилось", 6
@@ -3652,24 +3851,24 @@ class StockCache:
         runtime_path = _runtime_status_path(self.root, state.directory_name)
         return replace(
             state,
-            checked_at=written.checked_at,
+            verified_at=written.verified_at,
             files=replace(state.files, runtime_status=runtime_path),
             runtime_revision=written.revision,
             stale=written.stale,
-            warning_code=written.warning_code,
+            warning_codes=written.warning_codes,
         )
 
     def _stale_fallback(
-        self, state: CacheState, warning_code: str
+        self, state: CacheState, warning_codes: str
     ) -> RefreshResult:
         persisted = state
-        if warning_code != "cache_locked":
+        if warning_codes != "cache_locked":
             try:
                 with CacheLock.acquire(self.root) as lock:
                     persisted = self._record_runtime_status(
                         state,
                         True,
-                        warning_code,
+                        warning_codes,
                         lock,
                         verify_current=True,
                     )
@@ -3680,7 +3879,7 @@ class StockCache:
             "stale_cache",
             persisted,
             stale=True,
-            warning_code=warning_code,
+            warning_codes=warning_codes,
         )
 
     def _load_if_readable(
@@ -3819,15 +4018,17 @@ class StockCache:
         response: HttpResponse,
         lock: CacheLock,
     ) -> CacheState:
-        checked_at = datetime.now(timezone.utc).isoformat()
+        verified_at = datetime.now(timezone.utc).isoformat()
+        source_stale = manifest.source_is_stale()
+        source_warnings = ["source_stale"] if source_stale else []
         state_value: dict[str, Any] = {
             "generation_id": manifest.generation_id,
             "generated_at": manifest.generated_at,
-            "checked_at": checked_at,
+            "verified_at": verified_at,
             "manifest_etag": _header(response.headers, "etag"),
             "manifest_last_modified": _header(response.headers, "last-modified"),
-            "stale": False,
-            "warning_code": None,
+            "stale": source_stale,
+            "warning_codes": source_warnings,
         }
         final_name = f"generation-{uuid.uuid4().hex}"
         final_directory = self.root / "generations" / final_name
@@ -3843,9 +4044,9 @@ class StockCache:
         )
         runtime_value = {
             "generation_id": manifest.generation_id,
-            "checked_at": checked_at,
-            "stale": False,
-            "warning_code": None,
+            "verified_at": verified_at,
+            "stale": source_stale,
+            "warning_codes": source_warnings,
             "revision": uuid.uuid4().hex,
         }
         expected_runtime = validate_runtime_status(
@@ -3915,9 +4116,10 @@ class StockCache:
                 if (
                     committed_pointer != pointer
                     or committed_runtime.revision != runtime_value["revision"]
-                    or committed_runtime.checked_at != checked_at
-                    or committed_runtime.stale
-                    or committed_runtime.warning_code is not None
+                    or committed_runtime.verified_at != verified_at
+                    or committed_runtime.stale != expected_runtime.stale
+                    or committed_runtime.warning_codes
+                    != expected_runtime.warning_codes
                 ):
                     raise StockError(
                         "cache_locked", "Активное поколение кэша изменилось", 6
@@ -4145,6 +4347,7 @@ class StockCache:
                     generations_descriptor, generations
                 )
             cleanup_incomplete = False
+            preserved_generation_names: set[str] = set()
             for name in generation_names:
                 lock.assert_owned()
                 pointer = self._load_current_pointer_for_cleanup(
@@ -4177,6 +4380,42 @@ class StockCache:
                     ):
                         cleanup_incomplete = True
                         break
+                    if name.startswith("generation-"):
+                        generation_descriptor = -1
+                        manifest_descriptor = -1
+                        try:
+                            generation_descriptor = _open_private_child_directory(
+                                generations_descriptor,
+                                generations,
+                                generations / name,
+                            )
+                            manifest_descriptor = _open_private_child_regular_file(
+                                generation_descriptor, "manifest.json"
+                            )
+                            manifest_payload = _read_descriptor_bounded(
+                                manifest_descriptor,
+                                _WINDOWS_MANIFEST_MAX_BYTES,
+                            )
+                            try:
+                                Manifest.parse(manifest_payload)
+                            except StockError:
+                                if _is_legacy_manifest_payload(manifest_payload):
+                                    preserved_generation_names.add(name)
+                                    continue
+                        except (OSError, StockError):
+                            preserved_generation_names.add(name)
+                            continue
+                        finally:
+                            _close_optional_descriptor(
+                                manifest_descriptor
+                                if manifest_descriptor >= 0
+                                else None
+                            )
+                            _close_optional_descriptor(
+                                generation_descriptor
+                                if generation_descriptor >= 0
+                                else None
+                            )
                     lock.root_attestation.assert_current()
                     if not _remove_private_child_directory(
                         generations_descriptor,
@@ -4214,6 +4453,8 @@ class StockCache:
                     and pointer is not None
                     and directory_name == pointer.directory_name
                 ):
+                    continue
+                if directory_name in preserved_generation_names:
                     continue
                 try:
                     observed = _lstat_private_child(
@@ -4273,26 +4514,106 @@ class StockCache:
             raise
 
 
-def _manifest_file(value: object) -> ManifestFile:
+def _manifest_file(
+    value: object,
+    expected_url: str,
+    expected_media_type: str,
+    *,
+    maximum_bytes: int | None = None,
+) -> ManifestFile:
     if not isinstance(value, dict):
         raise _manifest_invalid()
+    if set(value) != {
+        "url",
+        "media_type",
+        "bytes",
+        "sha256",
+        "etag",
+        "last_modified",
+    }:
+        raise _manifest_invalid()
     url = value.get("url")
+    media_type = value.get("media_type")
     expected_bytes = value.get("bytes")
     expected_sha256 = value.get("sha256")
-    if not isinstance(url, str) or not url:
+    etag = value.get("etag")
+    last_modified = value.get("last_modified")
+    if url != expected_url or media_type != expected_media_type:
         raise _manifest_invalid()
     if (
         not isinstance(expected_bytes, int)
         or isinstance(expected_bytes, bool)
-        or expected_bytes < 0
+        or expected_bytes < 1
+        or (maximum_bytes is not None and expected_bytes > maximum_bytes)
     ):
         raise _manifest_invalid()
-    if not isinstance(expected_sha256, str) or not _SHA256.fullmatch(
+    if not isinstance(expected_sha256, str) or not _LOWER_SHA256.fullmatch(
         expected_sha256
     ):
         raise _manifest_invalid()
+    if not isinstance(etag, str) or not _PUBLICATION_ETAG.fullmatch(etag):
+        raise _manifest_invalid()
+    if not is_bounded_unicode_scalar(last_modified):
+        raise _manifest_invalid()
+    assert isinstance(url, str)
+    assert isinstance(media_type, str)
+    assert isinstance(last_modified, str)
     _validate_manifest_url(url)
-    return ManifestFile(url, expected_bytes, expected_sha256.lower())
+    return ManifestFile(
+        url,
+        media_type,
+        expected_bytes,
+        expected_sha256,
+        etag,
+        last_modified,
+    )
+
+
+def _validate_product_type_counts(value: object) -> None:
+    if not isinstance(value, dict):
+        raise _manifest_invalid()
+    for key, count in value.items():
+        if (
+            not isinstance(key, str)
+            or not _PRODUCT_TYPE_ID.fullmatch(key)
+            or type(count) is not int
+            or count < 1
+        ):
+            raise _manifest_invalid()
+
+
+def _validate_manifest_warnings(value: object) -> None:
+    if not isinstance(value, list):
+        raise _manifest_invalid()
+    for warning in value:
+        if not isinstance(warning, dict) or set(warning) != {"code", "count"}:
+            raise _manifest_invalid()
+        code = warning.get("code")
+        count = warning.get("count")
+        if (
+            not isinstance(code, str)
+            or not _WARNING_CODE.fullmatch(code)
+            or type(count) is not int
+            or count < 1
+        ):
+            raise _manifest_invalid()
+
+
+def _validate_linked_xlsx(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"name", "sha256"}:
+        raise _manifest_invalid()
+    name = value.get("name")
+    digest = value.get("sha256")
+    if (
+        not isinstance(name, str)
+        or re.fullmatch(r"papashin-(?!0000)[0-9]{4}-[0-9]{2}-[0-9]{2}\.xlsx", name)
+        is None
+        or not isinstance(digest, str)
+        or not _LOWER_SHA256.fullmatch(digest)
+    ):
+        raise _manifest_invalid()
 
 
 def _validate_manifest_url(url: str) -> None:
@@ -4573,9 +4894,9 @@ def _assert_runtime_commit_expected(
     )
     if (
         current.revision != expected.runtime_revision
-        or current.checked_at != expected.checked_at
+        or current.verified_at != expected.verified_at
         or current.stale != expected.stale
-        or current.warning_code != expected.warning_code
+        or current.warning_codes != expected.warning_codes
     ):
         raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
 
@@ -6051,8 +6372,7 @@ def _snapshot_metadata(
     if (
         state_value.get("generation_id") != pointer.generation_id
         or state_value.get("generated_at") != manifest.generated_at
-        or not isinstance(state_value.get("checked_at"), str)
-        or not state_value["checked_at"]
+        or not is_iso_8601_timestamp(state_value.get("verified_at"))
         or (manifest_etag is not None and not isinstance(manifest_etag, str))
         or (
             manifest_last_modified is not None
@@ -6076,7 +6396,7 @@ def _snapshot_metadata(
                 expected_generation_ownership_token
             ),
         )
-    return runtime.checked_at, runtime.stale, runtime.warning_code
+    return runtime.verified_at, runtime.stale, runtime.warning_codes
 
 
 def _open_private_child_regular_file(
@@ -6280,9 +6600,9 @@ def _same_generation(left: CacheState, right: CacheState) -> bool:
 def _same_runtime_revision(left: CacheState, right: CacheState) -> bool:
     return (
         _same_generation(left, right)
-        and left.checked_at == right.checked_at
+        and left.verified_at == right.verified_at
         and left.stale == right.stale
-        and left.warning_code == right.warning_code
+        and left.warning_codes == right.warning_codes
         and left.runtime_revision == right.runtime_revision
     )
 

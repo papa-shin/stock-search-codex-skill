@@ -30,8 +30,6 @@ class StockConfigTest(unittest.TestCase):
             "PAPA_SHIN_STOCK_MANIFEST_URL=https://example.test/manifest.json\n"
             "PAPA_SHIN_STOCK_USERNAME=test-user\n"
             "PAPA_SHIN_STOCK_PASSWORD=test-password\n"
-            "PAPA_SHIN_STOCK_PRODUCT_ID_FIELD=product_id\n"
-            "PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD=offer_id\n"
             + extra
         )
 
@@ -189,21 +187,42 @@ class StockConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "config_invalid"):
             StockConfig.load(config_path)
 
-    def test_resolve_product_id_accepts_string_or_integer(self) -> None:
+    def test_id_fields_default_to_canonical_robotyre_field(self) -> None:
         config = StockConfig.load(self.write_env(self.complete_env()))
 
-        self.assertEqual(config.resolve_product_id({"product_id": "A-12"}), "A-12")
-        self.assertEqual(config.resolve_product_id({"product_id": 42}), "42")
+        self.assertEqual(config.product_id_field, "robotyre_product_id")
+        self.assertEqual(config.offer_product_id_field, "robotyre_product_id")
+        self.assertEqual(config.resolve_product_id({"robotyre_product_id": "42"}), "42")
+
+    def test_explicit_id_fields_only_accept_canonical_value(self) -> None:
+        valid = self.complete_env(
+            "PAPA_SHIN_STOCK_PRODUCT_ID_FIELD=robotyre_product_id\n"
+            "PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD=robotyre_product_id\n"
+        )
+        config = StockConfig.load(self.write_env(valid))
+        self.assertEqual(config.product_id_field, "robotyre_product_id")
+
+        for key in (
+            "PAPA_SHIN_STOCK_PRODUCT_ID_FIELD",
+            "PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD",
+        ):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(StockError, "config_invalid"):
+                    StockConfig.load(
+                        self.write_env(self.complete_env(f"{key}=legacy_id\n"))
+                    )
 
     def test_resolve_product_id_rejects_missing_or_empty_value(self) -> None:
         config = StockConfig.load(self.write_env(self.complete_env()))
 
         for row in (
             {},
-            {"product_id": ""},
-            {"product_id": None},
-            {"product_id": True},
-            {"product_id": 1.5},
+            {"robotyre_product_id": ""},
+            {"robotyre_product_id": "0"},
+            {"robotyre_product_id": None},
+            {"robotyre_product_id": True},
+            {"robotyre_product_id": 1},
+            {"robotyre_product_id": "A-12"},
         ):
             with self.subTest(row=row):
                 with self.assertRaisesRegex(StockError, "manifest_invalid") as raised:

@@ -14,6 +14,11 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.robotyre_v1_fixture import (
+    BASE_GENERATION_ID,
+    manifest_bytes as robotyre_manifest_bytes,
+    payloads as robotyre_payloads,
+)
 from tests.test_cache import CacheFixture, FakeHttpClient, manifest_bytes
 
 from papa_shin_stock import cache as cache_module
@@ -31,38 +36,20 @@ from papa_shin_stock._windows_fs import (
 )
 
 
-FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
-SEARCH_PRODUCTS = (FIXTURES_DIR / "products.jsonl").read_bytes()
-SEARCH_OFFERS = (FIXTURES_DIR / "offers.jsonl").read_bytes()
+SEARCH_PRODUCTS, SEARCH_OFFERS = robotyre_payloads()
+GENERATION_C = "c" * 64
+GENERATION_D = "f" * 64
 
 
 def search_manifest_bytes() -> bytes:
-    return json.dumps(
-        {
-            "generation_id": "synthetic-generation",
-            "generated_at": "2026-08-27T10:00:00+00:00",
-            "files": {
-                "products": {
-                    "url": "products.jsonl",
-                    "bytes": len(SEARCH_PRODUCTS),
-                    "sha256": hashlib.sha256(SEARCH_PRODUCTS).hexdigest(),
-                },
-                "offers": {
-                    "url": "offers.jsonl",
-                    "bytes": len(SEARCH_OFFERS),
-                    "sha256": hashlib.sha256(SEARCH_OFFERS).hexdigest(),
-                },
-            },
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return robotyre_manifest_bytes(SEARCH_PRODUCTS, SEARCH_OFFERS)
 
 
 class SearchFixtureHttpClient:
     def __init__(self, response: HttpResponse | None = None) -> None:
         self.response = response or HttpResponse(
             status=200,
-            headers={"ETag": '"synthetic-generation"'},
+            headers={"ETag": f'"{BASE_GENERATION_ID}"'},
             body=search_manifest_bytes(),
         )
 
@@ -652,8 +639,8 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             manifest_url="https://stock.example.test/manifest.json",
             username="reader",
             password="secret",
-            product_id_field="product_id",
-            offer_product_id_field="product_id",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=self.root,
         )
         self.windows = LocalWindowsFilesystem()
@@ -674,8 +661,8 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         return FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-c"'},
-                body=manifest_bytes("generation-c"),
+                headers={"ETag": f'"{GENERATION_C}"'},
+                body=manifest_bytes(GENERATION_C),
             ),
             **kwargs,
         )
@@ -685,8 +672,8 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             manifest_url="https://stock.example.test/manifest.json",
             username="synthetic-user",
             password="synthetic-password",
-            product_id_field="private_product_key",
-            offer_product_id_field="private_offer_product_key",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=self.root,
         )
 
@@ -787,10 +774,43 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(config)
             second_stale = StockCache(self.root, FailingClient()).refresh(config)
 
-        self.assertEqual(first_stale.checked_at, initial.checked_at)
-        self.assertNotEqual(fresh.checked_at, initial.checked_at)
+        self.assertEqual(first_stale.checked_at, initial.source_checked_at)
+        self.assertEqual(fresh.checked_at, initial.source_checked_at)
         self.assertEqual(second_stale.checked_at, fresh.checked_at)
         self.assertTrue(second_stale.stale)
+
+    def test_304_freshness_does_not_reread_manifest_path_after_attested_load(self) -> None:
+        config = self._search_config()
+
+        class ReplacingClient:
+            def get_manifest(
+                nested_self,
+                etag: str | None = None,
+                last_modified: str | None = None,
+            ) -> HttpResponse:
+                pointer = json.loads(
+                    (self.root / "current.json").read_text(encoding="utf-8")
+                )
+                manifest_path = (
+                    self.root
+                    / "generations"
+                    / pointer["directory_name"]
+                    / "manifest.json"
+                )
+                manifest_path.write_bytes(
+                    b"x" * (cache_module._WINDOWS_MANIFEST_MAX_BYTES + 1)
+                )
+                return HttpResponse(status=304, headers={}, body=b"")
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            result = StockCache(self.root, ReplacingClient()).refresh(config)
+
+        self.assertEqual(result.status, "not_modified")
 
     def test_malformed_windows_runtime_status_is_rejected_by_cache_and_search(
         self,
@@ -810,7 +830,10 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             invalid_values = (
                 b"[]",
                 b"{malformed",
-                valid.replace(b"synthetic-generation", b"foreign-generation"),
+                valid.replace(
+                    BASE_GENERATION_ID.encode("ascii"),
+                    ("e" * 64).encode("ascii"),
+                ),
             )
             for value in invalid_values:
                 with self.subTest(value=value[:32]):
@@ -974,8 +997,8 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         second_client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-c"'},
-                body=manifest_bytes("generation-c"),
+                headers={"ETag": f'"{GENERATION_C}"'},
+                body=manifest_bytes(GENERATION_C),
             )
         )
 
@@ -987,7 +1010,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
 
         self.assertEqual((first.status, second.status), ("updated", "updated"))
         pointer = json.loads((self.root / "current.json").read_text(encoding="utf-8"))
-        self.assertEqual(pointer["generation_id"], "generation-c")
+        self.assertEqual(pointer["generation_id"], GENERATION_C)
         self.assertEqual(
             [path.name for path in (self.root / "generations").iterdir()],
             [pointer["directory_name"]],
@@ -1037,9 +1060,48 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             result = StockCache(self.root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertIsNone(result.warning_code)
+        self.assertEqual(result.warning_codes, ())
         self.assertFalse((self.root / ".refresh.lock").exists())
         self.assertEqual(self._release_artifacts(), [])
+
+    def test_success_preserves_inactive_legacy_generation_for_manual_cleanup(self) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            pointer = json.loads((self.root / "current.json").read_text(encoding="utf-8"))
+            active = self.root / "generations" / pointer["directory_name"]
+            owner = json.loads(
+                (active / cache_module._WINDOWS_GENERATION_OWNER_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            owner["generation_id"] = "legacy-generation"
+            legacy = self.root / "generations" / "generation-legacy"
+            legacy.mkdir()
+            (legacy / cache_module._WINDOWS_GENERATION_OWNER_NAME).write_text(
+                json.dumps(owner), encoding="utf-8"
+            )
+            (legacy / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "generation_id": "legacy-generation",
+                        "generated_at": "2026-08-27T10:00:00+00:00",
+                        "files": {"products": {}, "offers": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for name in ("products.jsonl", "offers.jsonl", "state.json"):
+                (legacy / name).write_bytes(b"{}\n")
+
+            result = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(result.warning_codes, ())
+        self.assertTrue(legacy.is_dir())
 
     def test_persistent_release_cleanup_failure_is_reported_and_preserved(self) -> None:
         self.windows.flat_delete_failures_remaining = 20
@@ -1050,7 +1112,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             result = StockCache(self.root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertFalse((self.root / ".refresh.lock").exists())
         retained = [
             path
@@ -1084,8 +1146,8 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
                 self.root, self._generation_c_client()
             ).refresh(self.config)
 
-        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
-        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(first.warning_codes, ("cache_cleanup_incomplete",))
+        self.assertEqual(second.warning_codes, ("cache_cleanup_incomplete",))
         self.assertTrue(retained_path.is_dir())
         self.assertEqual(retained_path.stat().st_ino, retained_identity)
         self.assertEqual((retained_path / "owner.json").read_bytes(), retained_payload)
@@ -1100,7 +1162,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             result = StockCache(self.root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(
             (self.root / ".refresh.lock" / "foreign.txt").read_bytes(),
             b"foreign-safe",
@@ -1155,7 +1217,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             [pointer["directory_name"]],
         )
 
-    def test_failed_refresh_prioritizes_persistent_lock_release_warning(self) -> None:
+    def test_failed_refresh_preserves_failure_and_lock_release_warnings(self) -> None:
         with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
             cache_module, "_windows_filesystem", return_value=self.windows
         ):
@@ -1169,7 +1231,10 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(
+            result.warning_codes,
+            ("network_error", "cache_cleanup_incomplete"),
+        )
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
         self.assertTrue(
@@ -1292,7 +1357,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
                 ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "download_integrity_failed")
+        self.assertEqual(result.warning_codes, ("download_integrity_failed",))
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
 
@@ -1336,15 +1401,15 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
                 ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(result.warning_codes, ("cache_locked",))
         self.assertEqual(result.generation_id, first.generation_id)
 
     def test_post_rename_generation_cleanup_failure_blocks_redownload(self) -> None:
         third_client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-d"'},
-                body=manifest_bytes("generation-d"),
+                headers={"ETag": f'"{GENERATION_D}"'},
+                body=manifest_bytes(GENERATION_D),
             )
         )
 
@@ -1368,9 +1433,9 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             third = StockCache(self.root, third_client).refresh(self.config)
 
         self.assertEqual(second.status, "updated")
-        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(third.status, "stale_cache")
-        self.assertEqual(third.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(third.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(self._pointer_payload(), pointer_after_second)
         self.assertEqual(third_client.download_calls, [])
         self.assertEqual(len(quarantines_after_second), 1)
@@ -1399,7 +1464,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.generation_id, "generation-a")
+        self.assertEqual(result.generation_id, "a" * 64)
         self.assertEqual(self._pointer_payload(), previous_pointer)
 
     def test_activation_failure_preserves_previous_pointer_and_generation(self) -> None:
@@ -1613,7 +1678,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         self.assertEqual(first.generation_id, previous_pointer["generation_id"])
         self.assertEqual(
             json.loads(self._pointer_payload())["generation_id"],
-            "generation-c",
+            GENERATION_C,
         )
 
     def test_expired_windows_lock_is_reclaimed(self) -> None:
@@ -1657,7 +1722,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
         self.assertEqual(marker.read_bytes(), b"foreign-safe")
@@ -1680,7 +1745,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
         self.assertEqual(marker.read_bytes(), b"foreign-safe")
@@ -1697,9 +1762,9 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             foreign_payload = json.dumps(
                 {
                     "generation_id": "generation-foreign",
-                    "checked_at": "2026-08-28T00:00:00+00:00",
+                    "verified_at": "2026-08-28T00:00:00+00:00",
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                     "revision": "1" * 32,
                     "ownership": {
                         "kind": "papa-shin-stock-runtime-status",
@@ -1718,7 +1783,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
         self.assertEqual(foreign.read_bytes(), foreign_payload)
@@ -1739,7 +1804,7 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes, ("cache_cleanup_incomplete",))
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(outside.read_bytes(), b"foreign-safe")
         self.assertTrue((foreign / "manifest.json").exists())
@@ -1804,8 +1869,8 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
             manifest_url="https://stock.example.test/manifest.json",
             username="reader",
             password="secret",
-            product_id_field="product_id",
-            offer_product_id_field="product_id",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=self.root,
         )
 
@@ -1816,15 +1881,15 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
             FakeHttpClient(
                 response=HttpResponse(
                     status=200,
-                    headers={"ETag": '"generation-c"'},
-                    body=manifest_bytes("generation-c"),
+                    headers={"ETag": f'"{GENERATION_C}"'},
+                    body=manifest_bytes(GENERATION_C),
                 )
             ),
         ).refresh(self.config)
 
         self.assertEqual((first.status, second.status), ("updated", "updated"))
         pointer = json.loads((self.root / "current.json").read_text(encoding="utf-8"))
-        self.assertEqual(pointer["generation_id"], "generation-c")
+        self.assertEqual(pointer["generation_id"], GENERATION_C)
         self.assertEqual(
             [path.name for path in (self.root / "generations").iterdir()],
             [pointer["directory_name"]],
@@ -1838,39 +1903,18 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
         class GenerationClient:
             def __init__(self, generation_id: str) -> None:
                 self.generation_id = generation_id
-                self.products = SEARCH_PRODUCTS.replace(
-                    b"synthetic-generation", generation_id.encode("ascii")
-                )
-                self.offers = SEARCH_OFFERS.replace(
-                    b"synthetic-generation", generation_id.encode("ascii")
-                )
+                self.products, self.offers = robotyre_payloads(generation_id)
 
             def get_manifest(
                 self,
                 etag: str | None = None,
                 last_modified: str | None = None,
             ) -> HttpResponse:
-                body = json.dumps(
-                    {
-                        "generation_id": self.generation_id,
-                        "generated_at": "2026-08-27T10:00:00+00:00",
-                        "files": {
-                            "products": {
-                                "url": "products.jsonl",
-                                "bytes": len(self.products),
-                                "sha256": hashlib.sha256(
-                                    self.products
-                                ).hexdigest(),
-                            },
-                            "offers": {
-                                "url": "offers.jsonl",
-                                "bytes": len(self.offers),
-                                "sha256": hashlib.sha256(self.offers).hexdigest(),
-                            },
-                        },
-                    },
-                    separators=(",", ":"),
-                ).encode("utf-8")
+                body = robotyre_manifest_bytes(
+                    self.products,
+                    self.offers,
+                    self.generation_id,
+                )
                 return HttpResponse(status=200, headers={}, body=body)
 
             def download(
@@ -1897,25 +1941,27 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
             manifest_url="https://stock.example.test/manifest.json",
             username="reader",
             password="secret",
-            product_id_field="private_product_key",
-            offer_product_id_field="private_offer_product_key",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=self.root,
         )
         query = SearchQuery.from_args(argparse.Namespace())
-        cache = StockCache(self.root, GenerationClient("synthetic-generation-a"))
+        generation_a = "a" * 64
+        generation_b = "b" * 64
+        cache = StockCache(self.root, GenerationClient(generation_a))
         cache.refresh(config)
 
         with cache.generation_snapshot() as snapshot_a:
             StockCache(
-                self.root, GenerationClient("synthetic-generation-b")
+                self.root, GenerationClient(generation_b)
             ).refresh(config)
             result_a = StockSearcher(snapshot_a, config).search(query)
 
         with cache.generation_snapshot() as snapshot_b:
             result_b = StockSearcher(snapshot_b, config).search(query)
 
-        self.assertEqual(result_a.generation["id"], "synthetic-generation-a")
-        self.assertEqual(result_b.generation["id"], "synthetic-generation-b")
+        self.assertEqual(result_a.generation["id"], generation_a)
+        self.assertEqual(result_b.generation["id"], generation_b)
         self.assertEqual(result_a.summary, result_b.summary)
 
     def test_two_real_parallel_refreshes_leave_one_generation_and_no_lock_artifacts(

@@ -38,6 +38,10 @@ from papa_shin_stock.schema import (
     StockSearcher,
 )
 import search_stock
+from tests.robotyre_v1_fixture import (
+    manifest_bytes as v1_manifest_bytes,
+    payloads as v1_payloads,
+)
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -48,21 +52,24 @@ class StockSearchTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.generation_dir = Path(self.temp_dir.name) / "synthetic-generation"
+        self.generation_dir = Path(self.temp_dir.name) / "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
         self.generation_dir.mkdir()
-        for name in ("manifest.json", "products.jsonl", "offers.jsonl"):
-            target = self.generation_dir / name
-            target.write_bytes((FIXTURES_DIR / name).read_bytes())
+        products, offers = v1_payloads()
+        (self.generation_dir / "manifest.json").write_bytes(
+            v1_manifest_bytes(products, offers)
+        )
+        (self.generation_dir / "products.jsonl").write_bytes(products)
+        (self.generation_dir / "offers.jsonl").write_bytes(offers)
 
         self.files = GenerationFiles.from_directory(
-            "synthetic-generation", self.generation_dir
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", self.generation_dir
         )
         self.config = StockConfig(
             manifest_url="https://stock.example.test/manifest.json",
             username="synthetic-user",
             password="synthetic-password",
-            product_id_field="private_product_key",
-            offer_product_id_field="private_offer_product_key",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=Path(self.temp_dir.name) / "cache",
         )
         self.searcher = StockSearcher(self.files, self.config)
@@ -109,83 +116,55 @@ class StockSearchTest(unittest.TestCase):
             self.search(max_price="1e-600000")
 
     def test_search_distinguishes_sku_and_quantity(self) -> None:
-        result = self.search(size="205/55R16", season="Лето")
+        result = self.search(season="Лето")
 
         self.assertEqual(result.summary.sku_count, 2)
         self.assertEqual(result.summary.total_quantity, 24)
 
-    def test_results_sort_by_minimum_price_then_total_quantity(self) -> None:
-        result = self.search(size="205/55R16", season="Лето")
+    def test_all_season_filter_uses_structured_all_season_characteristic(self) -> None:
+        result = self.search(season="Всесезонная", min_total_quantity=0)
 
         self.assertEqual(
             [product.product_id for product in result.products],
-            ["synthetic-summer-b", "synthetic-summer-a"],
+            ["4"],
+        )
+        self.assertEqual(result.products[0].characteristics["season"], "Лето")
+        self.assertEqual(result.products[0].characteristics["all_season"], "Да")
+
+    def test_results_sort_by_minimum_price_then_total_quantity(self) -> None:
+        result = self.search(season="Лето")
+
+        self.assertEqual(
+            [product.product_id for product in result.products],
+            ["2", "1"],
         )
 
     def test_offer_filters_remove_products_without_matching_offer(self) -> None:
         result = self.search(supplier="Synthetic Supplier B")
 
-        self.assertEqual([product.product_id for product in result.products], ["synthetic-summer-a"])
+        self.assertEqual([product.product_id for product in result.products], ["1"])
         self.assertEqual(result.summary.sku_count, 1)
         self.assertEqual(result.summary.total_quantity, 12)
 
     def test_no_results_is_successful_and_preserves_normalized_filters(self) -> None:
-        result = self.search(size="195/65R15")
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.products, ())
-        self.assertEqual(result.summary.sku_count, 0)
-        self.assertEqual(result.filters["size"], "195/65R15")
+        with self.assertRaisesRegex(StockError, "query_unsupported"):
+            self.search(size="195/65R15")
 
     def test_unknown_and_missing_characteristics_are_reported_separately(self) -> None:
-        result = self.search(size="205/55R16", min_total_quantity=0)
-
-        self.assertEqual(
-            result.unknown_characteristics,
-            (
-                {
-                    "product_id": "synthetic-unknown",
-                    "characteristic": "spikes",
-                    "status": "unknown",
-                },
-                {
-                    "product_id": "synthetic-unknown",
-                    "characteristic": "run_flat",
-                    "status": "missing",
-                },
-                {
-                    "product_id": "synthetic-unknown",
-                    "characteristic": "load_index",
-                    "status": "unknown",
-                },
-                {
-                    "product_id": "synthetic-unknown",
-                    "characteristic": "speed_index",
-                    "status": "missing",
-                },
-            ),
-        )
-
-    def test_unknown_and_missing_size_and_season_are_reported(self) -> None:
-        products = self.files.products
-        products.write_text(
-            products.read_text(encoding="utf-8").replace(
-                '"size":"205/55R16","season":"Лето","spikes":{"status":"unknown"}',
-                '"size":{"status":"unknown"},"season":{"status":"missing"},"spikes":{"status":"unknown"}',
-            ),
-            encoding="utf-8",
-        )
-
         result = self.search(min_total_quantity=0)
 
         self.assertIn(
-            {"product_id": "synthetic-unknown", "characteristic": "size", "status": "unknown"},
+            {"product_id": "4", "characteristic": "spikes", "status": "unknown"},
             result.unknown_characteristics,
         )
         self.assertIn(
-            {"product_id": "synthetic-unknown", "characteristic": "season", "status": "missing"},
+            {"product_id": "4", "characteristic": "run_flat", "status": "missing"},
             result.unknown_characteristics,
         )
+
+    def test_unknown_and_missing_size_and_season_are_reported(self) -> None:
+        with self.assertRaisesRegex(StockError, "query_unsupported"):
+            self.search(size="205/55R16", min_total_quantity=0)
 
     def test_product_generation_mismatch_fails_closed(self) -> None:
         products = self.files.products
@@ -198,7 +177,7 @@ class StockSearchTest(unittest.TestCase):
         offers = self.files.offers
         offers.write_text(
             offers.read_text(encoding="utf-8").replace(
-                '"synthetic-generation"', '"other-synthetic-generation"', 1
+                '"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"', '"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"', 1
             ),
             encoding="utf-8",
         )
@@ -218,7 +197,7 @@ class StockSearchTest(unittest.TestCase):
                     json.dumps(manifest, separators=(",", ":")).encode("utf-8")
                 )
 
-                with self.assertRaisesRegex(StockError, "generation_mismatch"):
+                with self.assertRaisesRegex(StockError, "manifest_invalid"):
                     self.search()
 
     def test_public_jsonl_strings_reject_lone_surrogates(self) -> None:
@@ -258,7 +237,9 @@ class StockSearchTest(unittest.TestCase):
     def test_non_finite_json_value_is_rejected_before_public_serialization(self) -> None:
         products = self.files.products
         products.write_text(
-            products.read_text(encoding="utf-8").replace('"load_index":"91"', '"load_index":NaN', 1),
+            products.read_text(encoding="utf-8").replace(
+                '"source_value":"Летняя"', '"source_value":NaN', 1
+            ),
             encoding="utf-8",
         )
 
@@ -266,42 +247,20 @@ class StockSearchTest(unittest.TestCase):
             self.search()
 
     def test_numeric_json_prices_preserve_exact_filter_sort_and_output(self) -> None:
-        self.files.offers.write_text(
-            '{"private_offer_product_key":"synthetic-summer-a",'
-            '"content_generation_id":"synthetic-generation",'
-            '"supplier":"Precise","price":0.10000000000000001,'
-            '"delivery_days":1,"quantity":1}\n'
-            '{"private_offer_product_key":"synthetic-summer-b",'
-            '"content_generation_id":"synthetic-generation",'
-            '"supplier":"Lower","price":0.1,'
-            '"delivery_days":1,"quantity":1}\n',
+        offers = self.files.offers
+        offers.write_text(
+            offers.read_text(encoding="utf-8").replace(
+                '"price_sale":"7000"', '"price_sale":0.10000000000000001', 1
+            ),
             encoding="utf-8",
         )
-
-        result = self.search()
-        public = result.to_public_dict()
-        filtered = self.search(max_price="0.100000000000000005")
-
-        self.assertEqual(
-            [product.product_id for product in result.products[:2]],
-            ["synthetic-summer-b", "synthetic-summer-a"],
-        )
-        prices = {
-            product["product_id"]: product["offers"][0]["price"]
-            for product in public["products"]
-            if product["offers"]
-        }
-        self.assertEqual(prices["synthetic-summer-a"], "0.10000000000000001")
-        self.assertEqual(prices["synthetic-summer-b"], "0.1")
-        self.assertEqual(
-            [product.product_id for product in filtered.products],
-            ["synthetic-summer-b"],
-        )
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            self.search()
 
     def test_numeric_json_price_underflow_is_rejected(self) -> None:
         self.files.offers.write_text(
-            '{"private_offer_product_key":"synthetic-summer-a",'
-            '"content_generation_id":"synthetic-generation",'
+            '{"robotyre_product_id":"synthetic-summer-a",'
+            '"content_generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
             '"supplier":"Underflow","price":1e-9999,'
             '"delivery_days":1,"quantity":1}\n',
             encoding="utf-8",
@@ -564,32 +523,39 @@ class StockSearchTest(unittest.TestCase):
                     )
 
     def test_more_than_ten_thousand_products_returns_exact_top_result(self) -> None:
-        product = (
-            '{"private_product_key":"synthetic-%s","content_generation_id":"synthetic-generation",'
-            '"name":"Synthetic","article":"SYN","product_type":"Шины",'
-            '"size":"205/55R16","season":"Лето","spikes":"Нет","run_flat":"Нет",'
-            '"total_quantity":4,"characteristics":{}}\n'
+        base_product = json.loads(
+            (FIXTURES_DIR / "products.jsonl").read_text(encoding="utf-8").splitlines()[0]
         )
+        product_rows = []
+        offer_rows = []
+        base_offer = json.loads(
+            (FIXTURES_DIR / "offers.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        )
+        for index in range(10_001):
+            product_id = str(index + 1)
+            product = dict(base_product)
+            product["robotyre_product_id"] = product_id
+            product["name"] = f"Synthetic {product_id}"
+            product_rows.append(json.dumps(product, separators=(",", ":")))
+            offer = dict(base_offer)
+            offer["robotyre_product_id"] = product_id
+            offer["price_sale"] = str(20_000 - index)
+            offer_rows.append(json.dumps(offer, separators=(",", ":")))
         self.files.products.write_text(
-            "".join(product % index for index in range(10_001)), encoding="utf-8"
+            "\n".join(product_rows) + "\n", encoding="utf-8"
         )
         self.files.offers.write_text(
-            "".join(
-                '{"private_offer_product_key":"synthetic-%s","content_generation_id":"synthetic-generation",'
-                '"supplier":"Synthetic","price":"%s","delivery_days":1,"quantity":1}\n'
-                % (index, 20_000 - index)
-                for index in range(10_001)
-            ),
+            "\n".join(offer_rows) + "\n",
             encoding="utf-8",
         )
 
-        result = self.search(size="205/55R16", season="Лето", limit=1)
+        result = self.search(season="Лето", limit=1)
 
-        self.assertEqual(result.products[0].product_id, "synthetic-10000")
+        self.assertEqual(result.products[0].product_id, "10001")
 
     def test_duplicate_json_keys_fail_closed(self) -> None:
         self.files.products.write_text(
-            '{"private_product_key":"synthetic-a","content_generation_id":"synthetic-generation",'
+            '{"robotyre_product_id":"synthetic-a","content_generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
             '"content_generation_id":"other-generation"}\n',
             encoding="utf-8",
         )
@@ -600,7 +566,9 @@ class StockSearchTest(unittest.TestCase):
     def test_nested_overflow_json_number_fails_closed(self) -> None:
         products = self.files.products
         products.write_text(
-            products.read_text(encoding="utf-8").replace('"load_index":"91"', '"load_index":{"bad":1e400}', 1),
+            products.read_text(encoding="utf-8").replace(
+                '"source_value":"Летняя"', '"source_value":{"bad":1e400}', 1
+            ),
             encoding="utf-8",
         )
 
@@ -609,32 +577,32 @@ class StockSearchTest(unittest.TestCase):
 
     def test_unapproved_large_nested_characteristic_is_not_public(self) -> None:
         products = self.files.products
-        products.write_text(
-            products.read_text(encoding="utf-8").replace(
-                '"characteristics":{"load_index":"91","speed_index":"V"}',
-                '"characteristics":{"load_index":"91","private_nested":{"payload":"' + "x" * 1_100_000 + '"}}',
-                1,
-            ),
-            encoding="utf-8",
-        )
-
-        public = self.search(size="205/55R16", season="Лето").to_public_dict()
-        serialized = json.dumps(public, ensure_ascii=False, separators=(",", ":"))
-
-        self.assertNotIn("private_nested", serialized)
-        self.assertLessEqual(len(serialized.encode("utf-8")), 512 * 1024)
+        row = json.loads(products.read_text(encoding="utf-8").splitlines()[0])
+        row["characteristics"]["private_nested"] = {"payload": "x" * 1024}
+        products.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            self.search(season="Лето")
 
     def test_offer_tie_prefers_higher_quantity(self) -> None:
         offers = self.files.offers
+        base = json.loads(offers.read_text(encoding="utf-8").splitlines()[0])
+        base["robotyre_product_id"] = "2"
+        base["price_sale"] = "6000"
+        low = dict(base)
+        low["supplier_name"] = "Low"
+        low["quantity"] = 1
+        high = dict(base)
+        high["supplier_name"] = "High"
+        high["quantity"] = 99
         offers.write_text(
             offers.read_text(encoding="utf-8")
-            + '{"private_offer_product_key":"synthetic-summer-b","content_generation_id":"synthetic-generation","supplier":"Low","price":"6000","delivery_days":4,"quantity":1}\n'
-            + '{"private_offer_product_key":"synthetic-summer-b","content_generation_id":"synthetic-generation","supplier":"High","price":"6000","delivery_days":4,"quantity":99}\n',
+            + json.dumps(low, separators=(",", ":")) + "\n"
+            + json.dumps(high, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
 
-        public = self.search(size="205/55R16", season="Лето").to_public_dict()
-        product = next(item for item in public["products"] if item["product_id"] == "synthetic-summer-b")
+        public = self.search(season="Лето").to_public_dict()
+        product = next(item for item in public["products"] if item["product_id"] == "2")
 
         self.assertEqual(product["offers"][0]["supplier"], "High")
 
@@ -642,10 +610,10 @@ class StockSearchTest(unittest.TestCase):
         (self.generation_dir / "state.json").write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": True,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             encoding="utf-8",
@@ -665,26 +633,26 @@ class StockSearchTest(unittest.TestCase):
             "{malformed",
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": True,
-                    "warning_code": None,
+                    "warning_codes": [],
                 }
             ),
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": True,
-                    "warning_code": "",
+                    "warning_codes": "",
                 }
             ),
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": False,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
         )
@@ -698,8 +666,8 @@ class StockSearchTest(unittest.TestCase):
     def test_recursive_state_is_normalized_to_safe_cache_error(self) -> None:
         nested = "[" * 2_000 + "0" + "]" * 2_000
         (self.generation_dir / "state.json").write_text(
-            '{"generation_id":"synthetic-generation",'
-            '"checked_at":"2026-08-27T10:01:00+00:00",'
+            '{"generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+            '"verified_at":"2026-08-27T10:01:00+00:00",'
             '"stale":false,"nested":' + nested + "}",
             encoding="utf-8",
         )
@@ -713,10 +681,10 @@ class StockSearchTest(unittest.TestCase):
         (self.generation_dir / "state.json").write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 }
             ),
             encoding="utf-8",
@@ -732,28 +700,28 @@ class StockSearchTest(unittest.TestCase):
         self.assertNotIn("internal path", str(raised.exception))
 
     def test_output_is_bounded_and_uses_only_neutral_product_id(self) -> None:
-        result = self.search(size="205/55R16", season="Лето", limit=2, offers_limit=3)
+        result = self.search(season="Лето", limit=2, offers_limit=3)
         public = result.to_public_dict()
         serialized = json.dumps(public, ensure_ascii=False)
 
         self.assertEqual(len(public["products"]), 2)
         summer_a = next(
             product for product in public["products"]
-            if product["product_id"] == "synthetic-summer-a"
+            if product["product_id"] == "1"
         )
         self.assertEqual(len(summer_a["offers"]), 3)
         self.assertEqual(set(summer_a), {
             "product_id", "name", "article", "product_type", "characteristics",
             "total_quantity", "minimum_price", "offers",
         })
-        self.assertNotIn("private_product_key", serialized)
-        self.assertNotIn("private_offer_product_key", serialized)
+        self.assertNotIn("robotyre_product_id", serialized)
+        self.assertNotIn("robotyre_product_id", serialized)
         self.assertNotIn("source_note", serialized)
 
     def test_actual_boundary_removes_previous_tail_before_truncation_warning(self) -> None:
         maximum = 512 * 1024
         generation = {
-            "id": "synthetic-generation",
+            "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "generated_at": "2026-08-27T10:00:00+00:00",
             "checked_at": "2026-08-27T10:01:00+00:00",
             "stale": True,
@@ -933,39 +901,22 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         cache_module._attest_cache_root(self.cache_root, create=True).close()
         self.generation = self.cache_root / "generations" / "generation-existing"
         self.generation.mkdir(parents=True)
-        products = (FIXTURES_DIR / "products.jsonl").read_bytes()
-        offers = (FIXTURES_DIR / "offers.jsonl").read_bytes()
-        manifest = {
-            "generation_id": "synthetic-generation",
-            "generated_at": "2026-08-27T10:00:00+00:00",
-            "files": {
-                "products": {
-                    "url": "products.jsonl",
-                    "bytes": len(products),
-                    "sha256": hashlib.sha256(products).hexdigest(),
-                },
-                "offers": {
-                    "url": "offers.jsonl",
-                    "bytes": len(offers),
-                    "sha256": hashlib.sha256(offers).hexdigest(),
-                },
-            },
-        }
-        (self.generation / "manifest.json").write_text(
-            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
-        )
+        products, offers = v1_payloads()
+        manifest_payload = v1_manifest_bytes(products, offers)
+        manifest = json.loads(manifest_payload)
+        (self.generation / "manifest.json").write_bytes(manifest_payload)
         (self.generation / "products.jsonl").write_bytes(products)
         (self.generation / "offers.jsonl").write_bytes(offers)
         (self.generation / "state.json").write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "generated_at": "2026-08-27T10:00:00+00:00",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
-                    "manifest_etag": '"synthetic-generation"',
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "generated_at": manifest["generated_at"],
+                    "verified_at": "2026-08-27T10:01:00+00:00",
+                    "manifest_etag": '"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"',
                     "manifest_last_modified": "Thu, 27 Aug 2026 10:00:00 GMT",
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 },
                 separators=(",", ":"),
             ),
@@ -974,7 +925,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         (self.cache_root / "current.json").write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     "directory_name": "generation-existing",
                 }
             ),
@@ -984,8 +935,8 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             manifest_url="https://stock.example.test/manifest.json",
             username="synthetic-user",
             password="synthetic-password",
-            product_id_field="private_product_key",
-            offer_product_id_field="private_offer_product_key",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=self.cache_root,
         )
 
@@ -997,43 +948,22 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
     def _write_generation(self, directory_name: str, generation_id: str) -> Path:
         directory = self.cache_root / "generations" / directory_name
         directory.mkdir()
-        products = (FIXTURES_DIR / "products.jsonl").read_bytes().replace(
-            b"synthetic-generation", generation_id.encode("ascii")
-        )
-        offers = (FIXTURES_DIR / "offers.jsonl").read_bytes().replace(
-            b"synthetic-generation", generation_id.encode("ascii")
-        )
-        manifest = {
-            "generation_id": generation_id,
-            "generated_at": "2026-08-27T11:00:00+00:00",
-            "files": {
-                "products": {
-                    "url": "products.jsonl",
-                    "bytes": len(products),
-                    "sha256": hashlib.sha256(products).hexdigest(),
-                },
-                "offers": {
-                    "url": "offers.jsonl",
-                    "bytes": len(offers),
-                    "sha256": hashlib.sha256(offers).hexdigest(),
-                },
-            },
-        }
-        (directory / "manifest.json").write_text(
-            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
-        )
+        products, offers = v1_payloads(generation_id)
+        manifest_payload = v1_manifest_bytes(products, offers, generation_id)
+        manifest = json.loads(manifest_payload)
+        (directory / "manifest.json").write_bytes(manifest_payload)
         (directory / "products.jsonl").write_bytes(products)
         (directory / "offers.jsonl").write_bytes(offers)
         (directory / "state.json").write_text(
             json.dumps(
                 {
                     "generation_id": generation_id,
-                    "generated_at": "2026-08-27T11:00:00+00:00",
-                    "checked_at": "2026-08-27T11:01:00+00:00",
+                    "generated_at": manifest["generated_at"],
+                    "verified_at": "2026-08-27T11:01:00+00:00",
                     "manifest_etag": None,
                     "manifest_last_modified": None,
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 },
                 separators=(",", ":"),
             ),
@@ -1049,12 +979,12 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
         with cache.generation_snapshot() as snapshot_a:
             generation_b = self._write_generation(
-                "generation-successor", "synthetic-generation-b"
+                "generation-successor", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
             )
             (self.cache_root / "current.json").write_text(
                 json.dumps(
                     {
-                        "generation_id": "synthetic-generation-b",
+                        "generation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                         "directory_name": generation_b.name,
                     },
                     separators=(",", ":"),
@@ -1068,8 +998,8 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         with cache.generation_snapshot() as snapshot_b:
             result_b = StockSearcher(snapshot_b, self.config).search(query)
 
-        self.assertEqual(result_a.generation["id"], "synthetic-generation")
-        self.assertEqual(result_b.generation["id"], "synthetic-generation-b")
+        self.assertEqual(result_a.generation["id"], "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        self.assertEqual(result_b.generation["id"], "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
         self.assertEqual(result_a.summary, result_b.summary)
 
     def test_generation_snapshot_closes_every_partial_open_on_failure(self) -> None:
@@ -1100,7 +1030,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         (self.cache_root / "current.json").write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     "directory_name": "g" * (cache_module._WINDOWS_POINTER_MAX_BYTES + 1),
                 }
             ),
@@ -1265,7 +1195,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         second_stale = self.public_search()
 
         self.assertEqual(first_stale["generation"]["checked_at"], initial_checked_at)
-        self.assertNotEqual(fresh["generation"]["checked_at"], initial_checked_at)
+        self.assertEqual(fresh["generation"]["checked_at"], initial_checked_at)
         self.assertFalse(fresh["generation"]["stale"])
         self.assertEqual(
             second_stale["generation"]["checked_at"],
@@ -1276,13 +1206,6 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
     def test_delayed_failure_cannot_overwrite_later_same_generation_304(self) -> None:
         entered_fallback = threading.Event()
         allow_fallback = threading.Event()
-        real_datetime = cache_module.datetime
-
-        class FixedDateTime:
-            @classmethod
-            def now(cls, tz: object) -> object:
-                return real_datetime.fromisoformat("2026-08-27T10:01:00+00:00")
-
         class FailingClient:
             def get_manifest(self, etag: str | None, modified: str | None) -> HttpResponse:
                 raise StockError("network_error", "Не удалось обновить данные", 3)
@@ -1314,17 +1237,16 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
                 first_errors.append(error)
 
         first = threading.Thread(target=run_first_refresh)
-        with patch.object(cache_module, "datetime", FixedDateTime):
-            first.start()
-            self.assertTrue(entered_fallback.wait(timeout=5))
+        first.start()
+        self.assertTrue(entered_fallback.wait(timeout=5))
 
-            second = StockCache(self.cache_root, NotModifiedClient()).refresh(self.config)
-            allow_fallback.set()
-            first.join(timeout=5)
-            if second.warning_code == "cache_locked":
-                second = StockCache(self.cache_root, NotModifiedClient()).refresh(
-                    self.config
-                )
+        second = StockCache(self.cache_root, NotModifiedClient()).refresh(self.config)
+        allow_fallback.set()
+        first.join(timeout=5)
+        if "cache_locked" in second.warning_codes:
+            second = StockCache(self.cache_root, NotModifiedClient()).refresh(
+                self.config
+            )
 
         self.assertFalse(first.is_alive())
         self.assertEqual(first_errors, [])
@@ -1340,10 +1262,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         outside.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T11:00:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T11:00:00+00:00",
                     "stale": True,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             encoding="utf-8",
@@ -1375,10 +1297,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         runtime.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": state.checked_at,
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": state.verified_at,
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 }
             ),
             encoding="utf-8",
@@ -1460,7 +1382,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
                 )
 
         self.assertTrue(updated.stale)
-        self.assertEqual(updated.warning_code, "network_error")
+        self.assertIn("network_error", updated.warning_codes)
 
     def test_reclaimed_writer_before_commit_lock_cannot_overwrite_later_commit(
         self,
@@ -1664,10 +1586,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         runtime.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:01:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:01:00+00:00",
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 }
             ),
             encoding="utf-8",
@@ -1676,10 +1598,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         outside.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T11:00:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T11:00:00+00:00",
                     "stale": True,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             encoding="utf-8",
@@ -1704,7 +1626,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
                             StockError, "cache_unavailable"
                         ):
                             cache_module.load_runtime_status(
-                                runtime, "synthetic-generation"
+                                runtime, "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                             )
 
     def test_dangling_runtime_status_symlink_is_rejected(self) -> None:
@@ -1768,10 +1690,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         runtime.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:02:00+00:00",
                     "stale": True,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             encoding="utf-8",
@@ -1816,10 +1738,10 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         runtime.write_text(
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:02:00+00:00",
                     "stale": True,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             encoding="utf-8",
@@ -1846,33 +1768,33 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             "{malformed",
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:02:00+00:00",
                     "stale": True,
-                    "warning_code": "",
+                    "warning_codes": "",
                 }
             ),
             json.dumps(
                 {
-                    "generation_id": "synthetic-generation",
-                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "verified_at": "2026-08-27T10:02:00+00:00",
                     "stale": False,
-                    "warning_code": "network_error",
+                    "warning_codes": ["network_error"],
                 }
             ),
             json.dumps(
                 {
                     "generation_id": "other-generation",
-                    "checked_at": "2026-08-27T10:02:00+00:00",
+                    "verified_at": "2026-08-27T10:02:00+00:00",
                     "stale": False,
-                    "warning_code": None,
+                    "warning_codes": [],
                 }
             ),
-            '{"generation_id":"synthetic-generation",'
-            '"checked_at":"2026-08-27T10:02:00+00:00",'
+            '{"generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+            '"verified_at":"2026-08-27T10:02:00+00:00",'
             '"stale":false,"nested":' + "[" * 2_000 + "0" + "]" * 2_000 + "}",
-            '{"generation_id":"synthetic-generation",'
-            '"checked_at":"2026-08-27T10:02:00+00:00",'
+            '{"generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+            '"verified_at":"2026-08-27T10:02:00+00:00",'
             '"stale":false,"nested":1e400}',
         )
 
@@ -1919,19 +1841,19 @@ class SqliteFailureNormalizationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.generation_dir = Path(self.temp_dir.name) / "synthetic-generation"
+        self.generation_dir = Path(self.temp_dir.name) / "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
         self.generation_dir.mkdir()
         for name in ("manifest.json", "products.jsonl", "offers.jsonl"):
             (self.generation_dir / name).write_bytes((FIXTURES_DIR / name).read_bytes())
         self.files = GenerationFiles.from_directory(
-            "synthetic-generation", self.generation_dir
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", self.generation_dir
         )
         self.config = StockConfig(
             manifest_url="https://stock.example.test/manifest.json",
             username="synthetic-user",
             password="synthetic-password",
-            product_id_field="private_product_key",
-            offer_product_id_field="private_offer_product_key",
+            product_id_field="robotyre_product_id",
+            offer_product_id_field="robotyre_product_id",
             cache_dir=Path(self.temp_dir.name) / "cache",
         )
 
@@ -2230,20 +2152,20 @@ class SearchStockCliTest(unittest.TestCase):
         arguments: list[str] | None = None,
     ) -> tuple[int, str, str, str]:
         with tempfile.TemporaryDirectory() as temporary:
-            generation = Path(temporary) / "synthetic-generation"
+            generation = Path(temporary) / "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             generation.mkdir()
             (generation / "manifest.json").write_bytes(manifest)
             (generation / "products.jsonl").write_bytes(products)
             (generation / "offers.jsonl").write_bytes(offers)
             files = GenerationFiles.from_directory(
-                "synthetic-generation", generation
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", generation
             )
             config = StockConfig(
                 manifest_url="https://stock.example.test/manifest.json",
                 username="synthetic-user",
                 password="synthetic-password",
-                product_id_field="private_product_key",
-                offer_product_id_field="private_offer_product_key",
+                product_id_field="robotyre_product_id",
+                offer_product_id_field="robotyre_product_id",
                 cache_dir=Path(temporary) / "cache",
             )
             output = StringIO()
@@ -2260,7 +2182,7 @@ class SearchStockCliTest(unittest.TestCase):
 
             return exit_code, output.getvalue(), errors.getvalue(), temporary
 
-    def test_valid_size_query_reports_malformed_source_size_as_manifest_error(
+    def test_size_query_is_rejected_before_source_validation(
         self,
     ) -> None:
         product = json.loads(
@@ -2277,7 +2199,7 @@ class SearchStockCliTest(unittest.TestCase):
             arguments=["--size", "205/55R16"],
         )
 
-        self.assertEqual(exit_code, 3)
+        self.assertEqual(exit_code, 4)
         self.assertEqual(errors, "")
         self.assertNotIn(private_path, output)
         self.assertEqual(
@@ -2285,20 +2207,19 @@ class SearchStockCliTest(unittest.TestCase):
             {
                 "status": "error",
                 "error": {
-                    "code": "manifest_invalid",
-                    "message": "Некорректные машинные данные",
+                    "code": "query_unsupported",
+                    "message": "Источник не публикует структурированный типоразмер",
                 },
             },
         )
 
     def test_missing_offer_product_id_is_manifest_error(self) -> None:
-        offer = {
-            "content_generation_id": "synthetic-generation",
-            "supplier": "Synthetic Supplier",
-            "price": "7000",
-            "delivery_days": 1,
-            "quantity": 4,
-        }
+        offer = json.loads(
+            (FIXTURES_DIR / "offers.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        offer.pop("robotyre_product_id")
 
         exit_code, output, errors, private_path = self._run_generation_cli(
             manifest=(FIXTURES_DIR / "manifest.json").read_bytes(),
@@ -2315,7 +2236,7 @@ class SearchStockCliTest(unittest.TestCase):
         output = StringIO()
         public_result = {
             "status": "ok",
-            "generation": {"id": "synthetic-generation"},
+            "generation": {"id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
             "filters": {},
             "summary": {"sku_count": 0, "total_quantity": 0},
             "products": [],
@@ -2344,14 +2265,14 @@ class SearchStockCliTest(unittest.TestCase):
 
     def test_surrogate_jsonl_string_is_one_safe_json_error_without_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            generation = Path(temporary) / "synthetic-generation"
+            generation = Path(temporary) / "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             generation.mkdir()
             (generation / "manifest.json").write_bytes(
                 (FIXTURES_DIR / "manifest.json").read_bytes()
             )
             product = {
-                "private_product_key": "synthetic-product",
-                "content_generation_id": "synthetic-generation",
+                "robotyre_product_id": "synthetic-product",
+                "content_generation_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 "name": "\ud800",
                 "article": "SYN",
                 "product_type": "Шины",
@@ -2363,14 +2284,14 @@ class SearchStockCliTest(unittest.TestCase):
             )
             (generation / "offers.jsonl").write_bytes(b"")
             files = GenerationFiles.from_directory(
-                "synthetic-generation", generation
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", generation
             )
             config = StockConfig(
                 manifest_url="https://stock.example.test/manifest.json",
                 username="synthetic-user",
                 password="synthetic-password",
-                product_id_field="private_product_key",
-                offer_product_id_field="private_offer_product_key",
+                product_id_field="robotyre_product_id",
+                offer_product_id_field="robotyre_product_id",
                 cache_dir=Path(temporary) / "cache",
             )
             output = StringIO()
@@ -2403,8 +2324,8 @@ class SearchStockCliTest(unittest.TestCase):
         self,
     ) -> None:
         offer = (
-            '{"private_offer_product_key":"synthetic-summer-a",'
-            '"content_generation_id":"synthetic-generation",'
+            '{"robotyre_product_id":"synthetic-summer-a",'
+            '"content_generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
             '"supplier":"Synthetic","price":'
             f"{EXTREME_JSON_FLOAT},"
             '"delivery_days":1,"quantity":1}\n'
@@ -2436,7 +2357,7 @@ class SearchStockCliTest(unittest.TestCase):
         self,
     ) -> None:
         manifest = (
-            '{"generation_id":"synthetic-generation",'
+            '{"generation_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
             '"generated_at":"2026-08-27T10:00:00+00:00",'
             f'"extra":{EXTREME_JSON_FLOAT}}}'
         ).encode("ascii")
@@ -2447,7 +2368,7 @@ class SearchStockCliTest(unittest.TestCase):
             offers=(FIXTURES_DIR / "offers.jsonl").read_bytes(),
         )
 
-        self.assertEqual(exit_code, 7)
+        self.assertEqual(exit_code, 3)
         self.assertEqual(output.count("\n"), 1)
         self.assertEqual(errors, "")
         self.assertNotIn("Traceback", output)
@@ -2457,8 +2378,8 @@ class SearchStockCliTest(unittest.TestCase):
             {
                 "status": "error",
                 "error": {
-                    "code": "cache_unavailable",
-                    "message": "Проверенный кэш недоступен",
+                    "code": "manifest_invalid",
+                    "message": "Некорректный manifest",
                 },
             },
         )
@@ -2505,19 +2426,19 @@ class SearchStockCliTest(unittest.TestCase):
 
     def test_decimal_exponent_boundaries_write_json_without_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            generation = Path(temporary) / "synthetic-generation"
+            generation = Path(temporary) / "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             generation.mkdir()
             for name in ("manifest.json", "products.jsonl", "offers.jsonl"):
                 (generation / name).write_bytes((FIXTURES_DIR / name).read_bytes())
             files = GenerationFiles.from_directory(
-                "synthetic-generation", generation
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", generation
             )
             config = StockConfig(
                 manifest_url="https://stock.example.test/manifest.json",
                 username="synthetic-user",
                 password="synthetic-password",
-                product_id_field="private_product_key",
-                offer_product_id_field="private_offer_product_key",
+                product_id_field="robotyre_product_id",
+                offer_product_id_field="robotyre_product_id",
                 cache_dir=Path(temporary) / "cache",
             )
             boundaries = (
