@@ -56,9 +56,6 @@ _CACHE_ROOT_MARKER_KIND = "papa-shin-stock-cache-root"
 _CACHE_ROOT_MARKER_VERSION = 1
 _CACHE_ROOT_MARKER_MAX_BYTES = 512
 _CACHE_ROOT_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
-_CACHE_ROOT_INIT_TEMP = re.compile(
-    r"\.papa-shin-stock-cache-root\.init-[0-9a-f]{32}\.tmp\Z"
-)
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
     errno.EINVAL,
@@ -2744,7 +2741,6 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
     descriptor: int | None = None
     initialization_locked = False
     initialized_now = False
-    initialized_token: str | None = None
     try:
         if os.name != "posix":
             raise _cache_unavailable()
@@ -2775,17 +2771,22 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
             entries = _list_cache_root_names(root, descriptor)
             if entries:
                 raise _cache_unavailable()
-            initialized_token = _publish_cache_root_marker(root, descriptor)
+            os.fchmod(descriptor, _PRIVATE_DIRECTORY_MODE)
+            hardened = os.fstat(descriptor)
+            if (
+                not _same_file_identity(pinned, hardened)
+                or stat.S_IMODE(hardened.st_mode) != _PRIVATE_DIRECTORY_MODE
+                or not _cache_root_inventory_is_initialization_safe(descriptor)
+            ):
+                raise _cache_unavailable()
+            pinned = hardened
+            _publish_cache_root_marker(root, descriptor)
             initialized_now = True
 
         token = _read_cache_root_marker(root, descriptor)
         if initialized_now and not _cache_root_inventory_is_initialization_safe(
             descriptor
         ):
-            if initialized_token is not None:
-                _unlink_cache_root_marker_if_token(
-                    root, descriptor, initialized_token
-                )
             raise _cache_unavailable()
         os.fchmod(descriptor, _PRIVATE_DIRECTORY_MODE)
         hardened = os.fstat(descriptor)
@@ -2801,10 +2802,6 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
             )
             provisional_attestation.assert_current()
             if not _cache_root_inventory_is_initialization_safe(descriptor):
-                if initialized_token is not None:
-                    _unlink_cache_root_marker_if_token(
-                        root, descriptor, initialized_token
-                    )
                 raise _cache_unavailable()
             provisional_attestation.assert_current()
         if initialization_locked:
@@ -2845,9 +2842,7 @@ def _cache_root_marker_exists(descriptor: int) -> bool:
         return False
 
 
-def _cache_root_inventory_is_initialization_safe(
-    descriptor: int, allowed_temporary_name: str | None = None
-) -> bool:
+def _cache_root_inventory_is_initialization_safe(descriptor: int) -> bool:
     try:
         entries = os.listdir(descriptor)
     except OSError:
@@ -2855,18 +2850,7 @@ def _cache_root_inventory_is_initialization_safe(
     for name in entries:
         if name == _CACHE_ROOT_MARKER_NAME:
             continue
-        if name != allowed_temporary_name:
-            return False
-        try:
-            observed = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        except OSError:
-            return False
-        if (
-            not stat.S_ISREG(observed.st_mode)
-            or observed.st_nlink != 1
-            or stat.S_IMODE(observed.st_mode) != _PRIVATE_FILE_MODE
-        ):
-            return False
+        return False
     return True
 
 
@@ -2885,142 +2869,63 @@ def _publish_cache_root_marker(root: Path, descriptor: int | None) -> str:
     if descriptor is None:
         raise _cache_unavailable()
     token = secrets.token_hex(16)
-    temporary_name = f".papa-shin-stock-cache-root.init-{token}.tmp"
     payload = _cache_root_marker_payload(token)
     file_descriptor = -1
-    temporary_identity: os.stat_result | None = None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         file_descriptor = os.open(
-            temporary_name,
+            _CACHE_ROOT_MARKER_NAME,
             flags,
             _PRIVATE_FILE_MODE,
             dir_fd=descriptor,
         )
         os.fchmod(file_descriptor, _PRIVATE_FILE_MODE)
-        temporary_identity = os.fstat(file_descriptor)
+        marker_identity = os.fstat(file_descriptor)
         if (
-            not stat.S_ISREG(temporary_identity.st_mode)
-            or temporary_identity.st_nlink != 1
-            or stat.S_IMODE(temporary_identity.st_mode) != _PRIVATE_FILE_MODE
+            not stat.S_ISREG(marker_identity.st_mode)
+            or marker_identity.st_nlink != 1
+            or stat.S_IMODE(marker_identity.st_mode) != _PRIVATE_FILE_MODE
         ):
             raise _cache_unavailable()
-        with os.fdopen(file_descriptor, "wb") as stream:
-            file_descriptor = -1
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            if not _cache_root_inventory_is_initialization_safe(
-                descriptor, temporary_name
-            ):
-                raise _cache_unavailable()
-            os.link(
-                temporary_name,
-                _CACHE_ROOT_MARKER_NAME,
-                src_dir_fd=descriptor,
-                dst_dir_fd=descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError as error:
-            raise _cache_unavailable() from error
-        linked_identity = os.stat(
-            temporary_name, dir_fd=descriptor, follow_symlinks=False
-        )
+        _write_all(file_descriptor, payload)
+        os.fsync(file_descriptor)
+        written_identity = os.fstat(file_descriptor)
         if (
-            temporary_identity is None
-            or not _same_file_identity(temporary_identity, linked_identity)
-            or not stat.S_ISREG(linked_identity.st_mode)
-            or linked_identity.st_nlink != 2
+            not _same_file_identity(marker_identity, written_identity)
+            or not stat.S_ISREG(written_identity.st_mode)
+            or written_identity.st_nlink != 1
+            or written_identity.st_size != len(payload)
         ):
             raise _cache_unavailable()
-        _unlink_cache_root_initializer_temp_if_identity(
-            descriptor, temporary_name, linked_identity
-        )
-        temporary_name = ""
         _fsync_directory_descriptor(descriptor)
-        _read_cache_root_marker(root, descriptor)
-        if not _cache_root_inventory_is_initialization_safe(descriptor):
-            _unlink_cache_root_marker_if_token(root, descriptor, token)
+        if _read_cache_root_marker(root, descriptor) != token:
             raise _cache_unavailable()
+        if not _cache_root_inventory_is_initialization_safe(descriptor):
+            raise _cache_unavailable()
+        os.close(file_descriptor)
+        file_descriptor = -1
         return token
+    except BaseException:
+        if file_descriptor >= 0:
+            try:
+                os.ftruncate(file_descriptor, 0)
+                os.fsync(file_descriptor)
+            except OSError:
+                pass
+        raise
     finally:
         if file_descriptor >= 0:
             os.close(file_descriptor)
-        try:
-            if temporary_name and temporary_identity is not None:
-                _unlink_cache_root_initializer_temp_if_identity(
-                    descriptor, temporary_name, temporary_identity
-                )
-        except FileNotFoundError:
-            pass
 
 
-def _unlink_cache_root_initializer_temp_if_identity(
-    descriptor: int, name: str, expected: os.stat_result
-) -> None:
-    if (
-        Path(name).name != name
-        or name in {"", ".", ".."}
-        or not stat.S_ISREG(expected.st_mode)
-        or expected.st_nlink not in {1, 2}
-    ):
-        raise _cache_unavailable()
-    quarantine = (
-        f".papa-shin-stock-cache-root.init-cleanup-{uuid.uuid4().hex}.tmp"
-    )
-    os.rename(
-        name,
-        quarantine,
-        src_dir_fd=descriptor,
-        dst_dir_fd=descriptor,
-    )
-    moved = os.stat(quarantine, dir_fd=descriptor, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(moved.st_mode)
-        or moved.st_nlink != expected.st_nlink
-        or not _same_file_identity(expected, moved)
-    ):
-        # A replacement is foreign. Retaining one unique quarantine fails closed;
-        # retrying the now-absent source cannot create an unbounded orphan chain.
-        raise _cache_unavailable()
-    os.unlink(quarantine, dir_fd=descriptor)
-    _fsync_directory_descriptor(descriptor)
-
-
-def _unlink_cache_root_marker_if_token(
-    root: Path, descriptor: int, expected_token: str
-) -> None:
-    quarantine = (
-        f".papa-shin-stock-cache-root.rollback-{expected_token}-{uuid.uuid4().hex}"
-    )
-    try:
-        if _read_cache_root_marker(root, descriptor) != expected_token:
-            return
-        observed = os.stat(
-            _CACHE_ROOT_MARKER_NAME,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            return
-        os.rename(
-            _CACHE_ROOT_MARKER_NAME,
-            quarantine,
-            src_dir_fd=descriptor,
-            dst_dir_fd=descriptor,
-        )
-        moved = os.stat(quarantine, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(moved.st_mode)
-            or moved.st_nlink != 1
-            or not _same_file_identity(observed, moved)
-        ):
-            return
-        _fsync_directory_descriptor(descriptor)
-    except (OSError, StockError):
-        return
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "marker write made no progress")
+        offset += written
 
 
 def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:

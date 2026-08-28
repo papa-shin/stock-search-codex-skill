@@ -302,35 +302,8 @@ class StockCacheTest(unittest.TestCase):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 cache_module._attest_cache_root(root, create=True)
         self.assertEqual((root / "unrelated.txt").read_text(), "keep")
-        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
-
-    def test_matching_foreign_initializer_temp_does_not_make_root_adoptable(
-        self,
-    ) -> None:
-        root = Path(self.temp_dir.name) / "foreign-init-race"
-        root.mkdir(mode=0o755)
-        foreign = root / (
-            ".papa-shin-stock-cache-root.init-" + "b" * 32 + ".tmp"
-        )
-        real_publish = cache_module._publish_cache_root_marker
-
-        def inject_then_publish(path: Path, descriptor: int | None) -> str:
-            foreign.write_text("foreign", encoding="utf-8")
-            os.chmod(foreign, 0o600)
-            return real_publish(path, descriptor)
-
-        with patch.object(
-            cache_module,
-            "_publish_cache_root_marker",
-            side_effect=inject_then_publish,
-        ):
-            with self.assertRaisesRegex(StockError, "cache_unavailable"):
-                cache_module._attest_cache_root(root, create=True)
-
-        self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign")
-        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
-        with self.assertRaisesRegex(StockError, "cache_unavailable"):
-            cache_module._attest_cache_root(root, create=True)
+        self.assertEqual(before_mode, 0o755)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
 
     def test_marker_inserted_during_initialization_is_preserved_fail_closed(
         self,
@@ -340,13 +313,17 @@ class StockCacheTest(unittest.TestCase):
         marker = root / ".papa-shin-stock-cache-root.json"
         foreign_payload = cache_module._cache_root_marker_payload("c" * 32)
 
-        def insert_conflicting_marker(*args: object, **kwargs: object) -> None:
+        real_publish = cache_module._publish_cache_root_marker
+
+        def insert_conflicting_marker(path: Path, descriptor: int | None) -> str:
             marker.write_bytes(foreign_payload)
             os.chmod(marker, 0o600)
-            raise FileExistsError("synthetic marker race")
+            return real_publish(path, descriptor)
 
         with patch.object(
-            cache_module.os, "link", side_effect=insert_conflicting_marker
+            cache_module,
+            "_publish_cache_root_marker",
+            side_effect=insert_conflicting_marker,
         ):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 cache_module._attest_cache_root(root, create=True)
@@ -356,117 +333,111 @@ class StockCacheTest(unittest.TestCase):
             list(root.glob(".papa-shin-stock-cache-root.conflict-*")), []
         )
 
-    def test_initializer_temp_replacement_is_preserved_fail_closed(self) -> None:
-        root = Path(self.temp_dir.name) / "initializer-temp-replacement"
+    def test_interrupted_marker_write_is_retained_and_blocks_reinitialization(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name) / "interrupted-marker-write"
         root.mkdir(mode=0o755)
-        foreign_payload = b"foreign initializer replacement"
-        replacement_name: str | None = None
+        marker = root / ".papa-shin-stock-cache-root.json"
+        real_write = os.write
+        interrupted = False
 
-        def replace_initializer_temp_then_fail(
-            source: str,
-            destination: str,
-            **kwargs: object,
-        ) -> None:
-            nonlocal replacement_name
-            self.assertEqual(destination, ".papa-shin-stock-cache-root.json")
-            descriptor = kwargs["src_dir_fd"]
-            self.assertIsInstance(descriptor, int)
-            os.unlink(source, dir_fd=descriptor)
-            replacement_descriptor = os.open(
-                source,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=descriptor,
-            )
-            try:
-                os.write(replacement_descriptor, foreign_payload)
-            finally:
-                os.close(replacement_descriptor)
-            replacement_name = source
-            raise OSError(errno.EIO, "synthetic publication failure")
+        def interrupt_after_partial_write(descriptor: int, payload: bytes) -> int:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                real_write(descriptor, payload[:7])
+                raise OSError(errno.EIO, "synthetic marker write interruption")
+            return real_write(descriptor, payload)
 
         with patch.object(
             cache_module.os,
-            "link",
-            side_effect=replace_initializer_temp_then_fail,
+            "write",
+            side_effect=interrupt_after_partial_write,
         ):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 cache_module._attest_cache_root(root, create=True)
 
-        self.assertIsNotNone(replacement_name)
-        self.assertFalse((root / replacement_name).exists())
-        quarantines = list(
-            root.glob(".papa-shin-stock-cache-root.init-cleanup-*.tmp")
+        self.assertTrue(interrupted)
+        partial_payload = marker.read_bytes()
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._read_cache_root_marker(root, None)
+        before_mode = stat.S_IMODE(root.stat().st_mode)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+        self.assertEqual(marker.read_bytes(), partial_payload)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+        self.assertEqual(list(root.iterdir()), [marker])
+
+    def test_interrupted_marker_directory_fsync_leaves_invalid_marker(self) -> None:
+        root = Path(self.temp_dir.name) / "interrupted-marker-directory-fsync"
+        root.mkdir(mode=0o755)
+        marker = root / ".papa-shin-stock-cache-root.json"
+
+        with patch.object(
+            cache_module,
+            "_fsync_directory_descriptor",
+            side_effect=OSError(errno.EIO, "synthetic directory fsync interruption"),
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        retained = marker.read_bytes()
+        self.assertEqual(retained, b"")
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+        self.assertEqual(marker.read_bytes(), retained)
+
+    def test_marker_publisher_retries_partial_writes(self) -> None:
+        root = Path(self.temp_dir.name) / "partial-marker-writes"
+        root.mkdir(mode=0o755)
+        real_write = os.write
+        writes = 0
+
+        def write_small_chunks(descriptor: int, payload: bytes) -> int:
+            nonlocal writes
+            writes += 1
+            return real_write(descriptor, payload[:5])
+
+        with patch.object(cache_module.os, "write", side_effect=write_small_chunks):
+            attestation = cache_module._attest_cache_root(root, create=True)
+            attestation.close()
+
+        self.assertGreater(writes, 1)
+        self.assertRegex(
+            cache_module._read_cache_root_marker(root, None), r"^[0-9a-f]{32}$"
         )
-        self.assertEqual(len(quarantines), 1)
-        self.assertEqual(quarantines[0].read_bytes(), foreign_payload)
-        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
 
-    def test_initializer_temp_swap_at_destructive_step_is_quarantined(self) -> None:
-        root = Path(self.temp_dir.name) / "initializer-temp-unlink-race"
-        root.mkdir(mode=0o700)
-        candidate_name = ".papa-shin-stock-cache-root.init-" + "d" * 32 + ".tmp"
-        candidate = root / candidate_name
-        candidate.write_bytes(b"owned initializer")
-        os.chmod(candidate, 0o600)
-        expected = candidate.stat()
-        parked = root / f"{candidate_name}.owned"
-        foreign_payload = b"foreign replacement"
-        real_rename = os.rename
-        swapped = False
+    def test_marker_replacement_during_validation_is_not_deleted(self) -> None:
+        root = Path(self.temp_dir.name) / "marker-validation-replacement"
+        root.mkdir(mode=0o755)
+        marker = root / ".papa-shin-stock-cache-root.json"
+        parked = root / ".owned-cache-root-marker"
+        foreign_payload = cache_module._cache_root_marker_payload("e" * 32)
+        real_read = cache_module._read_cache_root_marker
+        replaced = False
 
-        def swap_before_destructive_rename(
-            source: str,
-            destination: str,
-            **kwargs: object,
-        ) -> None:
-            nonlocal swapped
-            if source == candidate_name and not swapped:
-                swapped = True
-                descriptor = kwargs["src_dir_fd"]
-                self.assertIsInstance(descriptor, int)
-                real_rename(
-                    source,
-                    parked.name,
-                    src_dir_fd=descriptor,
-                    dst_dir_fd=descriptor,
-                )
-                replacement_descriptor = os.open(
-                    source,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=descriptor,
-                )
-                try:
-                    os.write(replacement_descriptor, foreign_payload)
-                finally:
-                    os.close(replacement_descriptor)
-            real_rename(source, destination, **kwargs)
+        def replace_then_read(path: Path, descriptor: int | None) -> str:
+            nonlocal replaced
+            if not replaced and marker.exists():
+                replaced = True
+                os.rename(marker, parked)
+                marker.write_bytes(foreign_payload)
+                os.chmod(marker, 0o600)
+            return real_read(path, descriptor)
 
-        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            with patch.object(
-                cache_module.os,
-                "rename",
-                side_effect=swap_before_destructive_rename,
-            ):
-                with self.assertRaisesRegex(StockError, "cache_unavailable"):
-                    cache_module._unlink_cache_root_initializer_temp_if_identity(
-                        descriptor,
-                        candidate_name,
-                        expected,
-                    )
-        finally:
-            os.close(descriptor)
+        with patch.object(
+            cache_module,
+            "_read_cache_root_marker",
+            side_effect=replace_then_read,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
 
-        self.assertTrue(swapped)
-        self.assertEqual(parked.read_bytes(), b"owned initializer")
-        self.assertFalse(candidate.exists())
-        quarantines = list(
-            root.glob(".papa-shin-stock-cache-root.init-cleanup-*.tmp")
-        )
-        self.assertEqual(len(quarantines), 1)
-        self.assertEqual(quarantines[0].read_bytes(), foreign_payload)
+        self.assertTrue(replaced)
+        self.assertEqual(marker.read_bytes(), foreign_payload)
+        self.assertTrue(parked.is_file())
+        self.assertEqual(parked.read_bytes(), b"")
 
     def test_insertion_after_root_hardening_blocks_initialization(self) -> None:
         root = Path(self.temp_dir.name) / "late-post-hardening-insertion"
