@@ -99,6 +99,7 @@ class _Api(Protocol):
     def size(self, handle: int) -> int: ...
     def last_write_time(self, handle: int) -> float: ...
     def final_path(self, handle: int) -> str: ...
+    def long_path(self, path: str) -> str: ...
     def list_directory_handle(self, handle: int) -> list[str]: ...
     def rename_relative(
         self,
@@ -258,6 +259,12 @@ class Kernel32Api:
             wintypes.DWORD,
         ]
         self.kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        self.kernel32.GetLongPathNameW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+        ]
+        self.kernel32.GetLongPathNameW.restype = wintypes.DWORD
         self.kernel32.SetFileInformationByHandle.argtypes = [
             wintypes.HANDLE,
             ctypes.c_int,
@@ -443,6 +450,16 @@ class Kernel32Api:
             self._raise("GetFinalPathNameByHandleW failed")
         return buffer.value
 
+    def long_path(self, path: str) -> str:
+        size = self.kernel32.GetLongPathNameW(path, None, 0)
+        if not size:
+            self._raise("GetLongPathNameW failed")
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        written = self.kernel32.GetLongPathNameW(path, buffer, len(buffer))
+        if not written or written >= len(buffer):
+            self._raise("GetLongPathNameW failed")
+        return buffer.value
+
     def list_directory_handle(self, handle: int) -> list[str]:
         names: list[str] = []
         information_class = _FILE_ID_BOTH_DIRECTORY_RESTART_INFO
@@ -605,9 +622,9 @@ class VerifiedHandle:
             raise WindowsFilesystemError("Win32 handle identity changed")
         if not self.directory and self.api.link_count(self.handle) != 1:
             raise WindowsFilesystemError("hard-linked file rejected")
-        if WindowsFilesystem._canonical(
-            self.api.final_path(self.handle)
-        ) != WindowsFilesystem._canonical(self.path):
+        if not WindowsFilesystem._final_path_matches(
+            self.api, self.handle, self.path
+        ):
             raise WindowsFilesystemError("Win32 final path changed")
 
     def __enter__(self) -> "VerifiedHandle":
@@ -1245,6 +1262,12 @@ class WindowsFilesystem:
             value = value[4:]
         return ntpath.normcase(ntpath.normpath(value))
 
+    @classmethod
+    def _final_path_matches(cls, api: _Api, handle: int, requested: str) -> bool:
+        return cls._canonical(api.final_path(handle)) == cls._canonical(
+            api.long_path(requested)
+        )
+
     @staticmethod
     def _child(parent: str, name: str) -> str:
         if not name or name in {".", ".."} or PureWindowsPath(name).name != name:
@@ -1289,7 +1312,7 @@ class WindowsFilesystem:
                 raise WindowsFilesystemError("hard-linked file rejected")
             if expected is not None and identity != expected:
                 raise WindowsFilesystemError("Win32 file identity changed")
-            if self._canonical(self.api.final_path(handle)) != self._canonical(requested):
+            if not self._final_path_matches(self.api, handle, requested):
                 raise WindowsFilesystemError("Win32 final path changed")
             return VerifiedHandle(self.api, handle, requested, identity, directory)
         except BaseException:
@@ -1342,9 +1365,7 @@ class WindowsFilesystem:
                 raise WindowsFilesystemError("hard-linked file rejected")
             if expected is not None and identity != expected:
                 raise WindowsFilesystemError("Win32 file identity changed")
-            if self._canonical(self.api.final_path(handle)) != self._canonical(
-                requested
-            ):
+            if not self._final_path_matches(self.api, handle, requested):
                 raise WindowsFilesystemError("Win32 final path changed")
             return VerifiedHandle(
                 self.api, handle, requested, identity, directory
@@ -1637,8 +1658,9 @@ class WindowsFilesystem:
                     published = (
                         WindowsIdentity(*self.api.identity(temporary.handle))
                         == temporary.identity
-                        and self._canonical(self.api.final_path(temporary.handle))
-                        == self._canonical(destination)
+                        and self._final_path_matches(
+                            self.api, temporary.handle, destination
+                        )
                     )
                 except OSError:
                     published = False
@@ -1647,8 +1669,9 @@ class WindowsFilesystem:
             if (
                 WindowsIdentity(*self.api.identity(temporary.handle))
                 != temporary.identity
-                or self._canonical(self.api.final_path(temporary.handle))
-                != self._canonical(temporary.path)
+                or not self._final_path_matches(
+                    self.api, temporary.handle, temporary.path
+                )
             ):
                 raise WindowsFilesystemError("atomic replacement was not confirmed")
             published = True

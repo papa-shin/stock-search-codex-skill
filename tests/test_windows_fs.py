@@ -42,6 +42,7 @@ class FakeWindowsApi:
         self.flush_failure_handles: set[int] = set()
         self.defer_disposition_until_close = False
         self.pending_disposition_handles: set[int] = set()
+        self.long_path_aliases: dict[str, str] = {}
         self.next_handle = 10
 
     @staticmethod
@@ -163,6 +164,9 @@ class FakeWindowsApi:
 
     def final_path(self, handle: int) -> str:
         return str(self.nodes[self.handles[handle]]["path"])
+
+    def long_path(self, path: str) -> str:
+        return self.long_path_aliases.get(self.canonical(path), path)
 
     def list_directory(self, path: str) -> list[str]:
         parent = PureWindowsPath(path)
@@ -312,6 +316,21 @@ class WindowsFilesystemTest(unittest.TestCase):
 
         with self.assertRaises(WindowsFilesystemError):
             self.fs.open_verified(victim, directory=False)
+
+    def test_short_path_alias_for_same_final_identity_is_accepted(self) -> None:
+        short = r"C:\Users\RUNNER~1\AppData\Local\Temp\cache"
+        long = r"C:\Users\runneradmin\AppData\Local\Temp\cache"
+        self.api.add_directory(short, (7, 75))
+        self.api.nodes[self.api.canonical(short)]["path"] = long
+        self.api.long_path_aliases[self.api.canonical(short)] = long
+
+        try:
+            with self.fs.open_verified(short, directory=True) as handle:
+                handle.assert_current()
+        except WindowsFilesystemError as error:
+            self.fail(f"short/long spelling of one identity was rejected: {error}")
+
+        self.assertEqual(handle.identity, WindowsIdentity(7, 75))
 
     def test_initialize_and_attest_marker(self) -> None:
         marker = ".papa-shin-stock-cache-root.json"

@@ -52,6 +52,8 @@ class LocalWindowsRoot:
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
+        if os.name == "nt":
+            return
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(descriptor)
@@ -605,6 +607,17 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ),
             **kwargs,
         )
+
+    def test_local_backend_skips_unsupported_windows_directory_fsync(self) -> None:
+        with patch.object(os, "name", "nt"), patch.object(
+            os,
+            "open",
+            side_effect=PermissionError("synthetic Windows directory open"),
+        ):
+            try:
+                LocalWindowsRoot._fsync_directory(self.root)
+            except PermissionError as error:
+                self.fail(f"Windows test backend attempted directory open: {error}")
 
     def test_two_sequential_refreshes_are_updated_and_cleanup_old_generation(self) -> None:
         first_client = FakeHttpClient()
