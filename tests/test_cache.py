@@ -305,6 +305,41 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(before_mode, 0o755)
         self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
 
+    @unittest.skipUnless(os.name == "posix", "dirfd identity проверяется на POSIX")
+    def test_replaced_published_marker_with_same_token_fails_closed(self) -> None:
+        root = Path(self.temp_dir.name) / "replaced-published-marker"
+        root.mkdir(mode=0o755)
+        marker = root / ".papa-shin-stock-cache-root.json"
+        displaced = Path(self.temp_dir.name) / "owned-marker"
+        real_publish = cache_module._publish_cache_root_marker
+        foreign_identity: os.stat_result | None = None
+
+        def replace_after_publish(path: Path, descriptor: int | None) -> object:
+            nonlocal foreign_identity
+            evidence = real_publish(path, descriptor)
+            os.replace(marker, displaced)
+            marker.write_bytes(displaced.read_bytes())
+            os.chmod(marker, 0o600)
+            foreign_identity = marker.stat()
+            self.assertFalse(
+                cache_module._same_file_identity(displaced.stat(), foreign_identity)
+            )
+            return evidence
+
+        with patch.object(
+            cache_module,
+            "_publish_cache_root_marker",
+            side_effect=replace_after_publish,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        self.assertIsNotNone(foreign_identity)
+        self.assertTrue(
+            cache_module._same_file_identity(marker.stat(), foreign_identity)
+        )
+        self.assertEqual(marker.read_bytes(), displaced.read_bytes())
+
     def test_marker_inserted_during_initialization_is_preserved_fail_closed(
         self,
     ) -> None:
@@ -414,22 +449,25 @@ class StockCacheTest(unittest.TestCase):
         marker = root / ".papa-shin-stock-cache-root.json"
         parked = root / ".owned-cache-root-marker"
         foreign_payload = cache_module._cache_root_marker_payload("e" * 32)
-        real_read = cache_module._read_cache_root_marker
+        real_assert = cache_module._assert_published_cache_root_marker
         replaced = False
 
-        def replace_then_read(path: Path, descriptor: int | None) -> str:
+        def replace_then_assert(
+            descriptor: int,
+            evidence: cache_module._PublishedCacheRootMarker,
+        ) -> str:
             nonlocal replaced
             if not replaced and marker.exists():
                 replaced = True
                 os.rename(marker, parked)
                 marker.write_bytes(foreign_payload)
                 os.chmod(marker, 0o600)
-            return real_read(path, descriptor)
+            return real_assert(descriptor, evidence)
 
         with patch.object(
             cache_module,
-            "_read_cache_root_marker",
-            side_effect=replace_then_read,
+            "_assert_published_cache_root_marker",
+            side_effect=replace_then_assert,
         ):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 cache_module._attest_cache_root(root, create=True)

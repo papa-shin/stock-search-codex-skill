@@ -161,6 +161,15 @@ class CacheRootAttestation:
 
 
 @dataclass(frozen=True, slots=True)
+class _PublishedCacheRootMarker:
+    ownership_token: str
+    device: int
+    inode: int
+    file_type: int
+    link_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentPointer:
     generation_id: str
     directory_name: str
@@ -2780,10 +2789,14 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
             ):
                 raise _cache_unavailable()
             pinned = hardened
-            _publish_cache_root_marker(root, descriptor)
+            published_marker = _publish_cache_root_marker(root, descriptor)
+            token = _assert_published_cache_root_marker(
+                descriptor, published_marker
+            )
             initialized_now = True
-
-        token = _read_cache_root_marker(root, descriptor)
+        else:
+            published_marker = None
+            token = _read_cache_root_marker(root, descriptor)
         if initialized_now and not _cache_root_inventory_is_initialization_safe(
             descriptor
         ):
@@ -2797,12 +2810,20 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
             raise _cache_unavailable()
         pinned = hardened
         if initialized_now:
+            if published_marker is None:
+                raise _cache_unavailable()
+            token = _assert_published_cache_root_marker(
+                descriptor, published_marker
+            )
             provisional_attestation = CacheRootAttestation(
                 root, descriptor, pinned, token
             )
             provisional_attestation.assert_current()
             if not _cache_root_inventory_is_initialization_safe(descriptor):
                 raise _cache_unavailable()
+            token = _assert_published_cache_root_marker(
+                descriptor, published_marker
+            )
             provisional_attestation.assert_current()
         if initialization_locked:
             _fcntl.flock(descriptor, _fcntl.LOCK_UN)
@@ -2865,7 +2886,9 @@ def _cache_root_marker_payload(token: str) -> bytes:
     ).encode("utf-8")
 
 
-def _publish_cache_root_marker(root: Path, descriptor: int | None) -> str:
+def _publish_cache_root_marker(
+    root: Path, descriptor: int | None
+) -> _PublishedCacheRootMarker:
     if descriptor is None:
         raise _cache_unavailable()
     token = secrets.token_hex(16)
@@ -2898,14 +2921,20 @@ def _publish_cache_root_marker(root: Path, descriptor: int | None) -> str:
             or written_identity.st_size != len(payload)
         ):
             raise _cache_unavailable()
+        evidence = _PublishedCacheRootMarker(
+            ownership_token=token,
+            device=written_identity.st_dev,
+            inode=written_identity.st_ino,
+            file_type=stat.S_IFMT(written_identity.st_mode),
+            link_count=written_identity.st_nlink,
+        )
         _fsync_directory_descriptor(descriptor)
-        if _read_cache_root_marker(root, descriptor) != token:
-            raise _cache_unavailable()
+        _assert_published_cache_root_marker(descriptor, evidence)
         if not _cache_root_inventory_is_initialization_safe(descriptor):
             raise _cache_unavailable()
         os.close(file_descriptor)
         file_descriptor = -1
-        return token
+        return evidence
     except BaseException:
         if file_descriptor >= 0:
             try:
@@ -2919,6 +2948,61 @@ def _publish_cache_root_marker(root: Path, descriptor: int | None) -> str:
             os.close(file_descriptor)
 
 
+def _assert_published_cache_root_marker(
+    root_descriptor: int, evidence: _PublishedCacheRootMarker
+) -> str:
+    file_descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(
+            _CACHE_ROOT_MARKER_NAME,
+            flags,
+            dir_fd=root_descriptor,
+        )
+        opened = os.fstat(file_descriptor)
+        if (
+            opened.st_dev != evidence.device
+            or opened.st_ino != evidence.inode
+            or stat.S_IFMT(opened.st_mode) != evidence.file_type
+            or evidence.file_type != stat.S_IFREG
+            or opened.st_nlink != evidence.link_count
+            or evidence.link_count != 1
+            or stat.S_IMODE(opened.st_mode) != _PRIVATE_FILE_MODE
+        ):
+            raise _cache_unavailable()
+        effective_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
+        if opened.st_uid != effective_uid:
+            raise _cache_unavailable()
+        payload = os.read(file_descriptor, _CACHE_ROOT_MARKER_MAX_BYTES + 1)
+        token = _parse_cache_root_marker_payload(payload)
+        confirmed = os.fstat(file_descriptor)
+        if (
+            confirmed.st_dev != evidence.device
+            or confirmed.st_ino != evidence.inode
+            or stat.S_IFMT(confirmed.st_mode) != evidence.file_type
+            or confirmed.st_nlink != evidence.link_count
+            or token != evidence.ownership_token
+        ):
+            raise _cache_unavailable()
+        return token
+    except StockError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ) as error:
+        raise _cache_unavailable() from error
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
@@ -2926,6 +3010,30 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "marker write made no progress")
         offset += written
+
+
+def _parse_cache_root_marker_payload(payload: bytes) -> str:
+    if len(payload) > _CACHE_ROOT_MARKER_MAX_BYTES:
+        raise _cache_unavailable()
+    if payload != payload.strip():
+        raise _cache_unavailable()
+    value = _parse_json(payload.decode("utf-8"))
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "schema_version",
+        "ownership_token",
+    }:
+        raise _cache_unavailable()
+    token = value.get("ownership_token")
+    if (
+        value.get("kind") != _CACHE_ROOT_MARKER_KIND
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != _CACHE_ROOT_MARKER_VERSION
+        or not isinstance(token, str)
+        or not _CACHE_ROOT_TOKEN.fullmatch(token)
+    ):
+        raise _cache_unavailable()
+    return token
 
 
 def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:
@@ -2968,26 +3076,7 @@ def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:
             ):
                 raise _cache_unavailable()
         payload = os.read(file_descriptor, _CACHE_ROOT_MARKER_MAX_BYTES + 1)
-        if len(payload) > _CACHE_ROOT_MARKER_MAX_BYTES:
-            raise _cache_unavailable()
-        if payload != payload.strip():
-            raise _cache_unavailable()
-        value = _parse_json(payload.decode("utf-8"))
-        if not isinstance(value, dict) or set(value) != {
-            "kind",
-            "schema_version",
-            "ownership_token",
-        }:
-            raise _cache_unavailable()
-        token = value.get("ownership_token")
-        if (
-            value.get("kind") != _CACHE_ROOT_MARKER_KIND
-            or type(value.get("schema_version")) is not int
-            or value.get("schema_version") != _CACHE_ROOT_MARKER_VERSION
-            or not isinstance(token, str)
-            or not _CACHE_ROOT_TOKEN.fullmatch(token)
-        ):
-            raise _cache_unavailable()
+        token = _parse_cache_root_marker_payload(payload)
         confirmed = os.fstat(file_descriptor)
         if not _same_file_identity(opened, confirmed) or confirmed.st_nlink != 1:
             raise _cache_unavailable()
