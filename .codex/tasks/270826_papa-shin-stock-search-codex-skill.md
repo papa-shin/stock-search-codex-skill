@@ -770,3 +770,10 @@ Expected: только файлы skill, документация, tests и task
 - Документация уточняет отдельные main/temp budgets, суммарный SQLite disk envelope, риск накопления orphan-каталогов и безопасную operator guidance без destructive-команд.
 - TDD RED подтверждён до реализации: планы содержали повторные `SCAN o` и два temp B-tree, VM steps росли линейно, `temp.max_page_count` оставался системным default, registry был неограничен, subprocess сохранял две записи без диагностики.
 - GREEN: focused `tests.test_search` — 66 tests; полный suite Python 3.11 и 3.12 — по 208 tests, `OK`; `compileall` на обеих версиях — `OK`. Нативная Windows остаётся непроверенной платформой.
+
+### Task 6 — Fix-wave Cluster C, fix round 2, 28.08.2026
+
+- Уточнён disk budget: `main.max_page_count` и `temp.max_page_count` ограничивают страницы объектов своих схем, но не SQLite sorter-файлы.
+- Граница 16 GiB зафиксирована только для текущих индексированных production query plans, в которых тест `test_offer_queries_use_composite_index_without_repeated_offer_scans` запрещает `SCAN o` и `USE TEMP B-TREE`.
+- Для будущего запроса с sorter закреплён release gate: plan-regression должен его отклонить либо до релиза должен быть добавлен отдельный внешний disk budget.
+- GREEN: docs-only diff; полный suite Python 3.11 и 3.12 — по 208 tests, `OK`; `quick_validate.py` — `Skill is valid!`; `git diff --check` — `OK`.
