@@ -547,7 +547,7 @@ class StockCacheTest(unittest.TestCase):
     ) -> None:
         canonical = self.cache_root / ".refresh.lock"
         real_fsync_directory = cache_module._fsync_directory
-        real_read_owner = CacheLock._read_owner
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
         fsync_failed = False
         owner_read_failed = False
 
@@ -558,12 +558,15 @@ class StockCacheTest(unittest.TestCase):
                 raise OSError("primary post-publish failure")
             real_fsync_directory(path)
 
-        def fail_first_cleanup_owner_read(path: Path) -> tuple[str, float] | None:
+        def fail_first_cleanup_owner_read(
+            directory_descriptor: int,
+            expected: os.stat_result,
+        ) -> tuple[str, float] | None:
             nonlocal owner_read_failed
-            if path == canonical and fsync_failed and not owner_read_failed:
+            if fsync_failed and not owner_read_failed:
                 owner_read_failed = True
                 return None
-            return real_read_owner(path)
+            return real_read_owner(directory_descriptor, expected)
 
         with patch.object(
             cache_module,
@@ -572,7 +575,7 @@ class StockCacheTest(unittest.TestCase):
         ):
             with patch.object(
                 CacheLock,
-                "_read_owner",
+                "_read_owner_from_directory_descriptor",
                 side_effect=fail_first_cleanup_owner_read,
             ):
                 with self.assertRaisesRegex(OSError, "primary post-publish failure"):
@@ -592,9 +595,10 @@ class StockCacheTest(unittest.TestCase):
         canonical = self.cache_root / ".refresh.lock"
         parked_root = Path(self.temp_dir.name) / "parked-cache-root"
         real_fsync_directory = cache_module._fsync_directory
-        real_read_owner = CacheLock._read_owner
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
         external_marker: Path | None = None
         fsync_failed = False
+        owner_reads = 0
         root_swapped = False
 
         def fail_once_after_publish(path: Path) -> None:
@@ -605,19 +609,24 @@ class StockCacheTest(unittest.TestCase):
             real_fsync_directory(path)
 
         def swap_root_after_quarantine_attestation(
-            path: Path,
+            directory_descriptor: int,
+            expected: os.stat_result,
         ) -> tuple[str, float] | None:
-            nonlocal external_marker, root_swapped
-            observed = real_read_owner(path)
+            nonlocal external_marker, owner_reads, root_swapped
+            observed = real_read_owner(directory_descriptor, expected)
+            owner_reads += 1
             if (
                 observed is not None
                 and not root_swapped
-                and path.name.startswith(".refresh.lock.abort-")
+                and owner_reads == 2
             ):
+                quarantine = next(
+                    self.cache_root.glob(".refresh.lock.abort-*")
+                )
                 root_swapped = True
                 os.rename(self.cache_root, parked_root)
                 self.cache_root.mkdir(mode=0o700)
-                external_quarantine = self.cache_root / path.name
+                external_quarantine = self.cache_root / quarantine.name
                 external_quarantine.mkdir(mode=0o700)
                 external_marker = external_quarantine / "must-survive.txt"
                 external_marker.write_text("safe", encoding="utf-8")
@@ -630,7 +639,7 @@ class StockCacheTest(unittest.TestCase):
         ):
             with patch.object(
                 CacheLock,
-                "_read_owner",
+                "_read_owner_from_directory_descriptor",
                 side_effect=swap_root_after_quarantine_attestation,
             ):
                 with self.assertRaisesRegex(OSError, "primary post-publish failure"):
@@ -645,6 +654,234 @@ class StockCacheTest(unittest.TestCase):
             any(parked_root.glob(".refresh.lock.abort-*")),
             "Owned quarantine may be safely retained after root identity loss",
         )
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_owner_read_does_not_harden_replaced_root_owner(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        os.chmod(canonical / "owner.json", 0o666)
+        parked_root = Path(self.temp_dir.name) / "parked-owner-root"
+        real_lstat_child = cache_module._lstat_private_child
+        external_owner: Path | None = None
+        root_swapped = False
+
+        def swap_root_after_canonical_identity(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            *,
+            missing_ok: bool = False,
+        ) -> os.stat_result | None:
+            nonlocal external_owner, root_swapped
+            observed = real_lstat_child(
+                parent_descriptor,
+                parent,
+                name,
+                missing_ok=missing_ok,
+            )
+            if name == canonical.name and observed is not None and not root_swapped:
+                root_swapped = True
+                os.rename(self.cache_root, parked_root)
+                self.cache_root.mkdir(mode=0o700)
+                external_lock = self.cache_root / canonical.name
+                external_lock.mkdir(mode=0o700)
+                external_owner = external_lock / "owner.json"
+                external_owner.write_text(
+                    json.dumps({"token": lock.token, "created_at": time.time()}),
+                    encoding="utf-8",
+                )
+                os.chmod(external_owner, 0o666)
+                heartbeat = external_lock / f"heartbeat-{lock.token}"
+                heartbeat.write_bytes(b"")
+                os.chmod(heartbeat, 0o666)
+            return observed
+
+        with patch.object(
+            cache_module,
+            "_lstat_private_child",
+            side_effect=swap_root_after_canonical_identity,
+        ):
+            removed = CacheLock._discard_published_lock_if_owned_locked(
+                canonical,
+                lock.token,
+                lock.identity,
+            )
+
+        self.assertFalse(removed)
+        self.assertTrue(root_swapped)
+        self.assertIsNotNone(external_owner)
+        self.assertEqual(stat.S_IMODE(external_owner.stat().st_mode), 0o666)
+        self.assertEqual(
+            json.loads(external_owner.read_text(encoding="utf-8"))["token"],
+            lock.token,
+        )
+        retained_owners = list(parked_root.glob(".refresh.lock*/owner.json"))
+        self.assertEqual(len(retained_owners), 1)
+        self.assertEqual(stat.S_IMODE(retained_owners[0].stat().st_mode), 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_restore_does_not_publish_replaced_quarantine(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        real_lstat_child = cache_module._lstat_private_child
+        owned_quarantine: Path | None = None
+        replacement_owner: Path | None = None
+        replacement_quarantine: Path | None = None
+        replacement_marker: Path | None = None
+
+        def replace_quarantine_after_identity_check(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            *,
+            missing_ok: bool = False,
+        ) -> os.stat_result | None:
+            nonlocal owned_quarantine, replacement_marker
+            nonlocal replacement_owner, replacement_quarantine
+            observed = real_lstat_child(
+                parent_descriptor,
+                parent,
+                name,
+                missing_ok=missing_ok,
+            )
+            if (
+                observed is not None
+                and replacement_quarantine is None
+                and name.startswith(".refresh.lock.abort-")
+            ):
+                replacement_quarantine = self.cache_root / name
+                owned_quarantine = self.cache_root / f"{name}.owned"
+                os.rename(replacement_quarantine, owned_quarantine)
+                replacement_quarantine.mkdir(mode=0o700)
+                replacement_owner = replacement_quarantine / "owner.json"
+                replacement_owner.write_text(
+                    json.dumps(
+                        {"token": "foreign-owner", "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(replacement_owner, 0o666)
+                replacement_marker = replacement_quarantine / "must-not-publish.txt"
+                replacement_marker.write_text("safe", encoding="utf-8")
+            return observed
+
+        with patch.object(
+            cache_module,
+            "_lstat_private_child",
+            side_effect=replace_quarantine_after_identity_check,
+        ):
+            removed = CacheLock._discard_published_lock_if_owned_locked(
+                canonical,
+                lock.token,
+                lock.identity,
+            )
+
+        self.assertFalse(removed)
+        self.assertIsNotNone(owned_quarantine)
+        self.assertIsNotNone(replacement_owner)
+        self.assertIsNotNone(replacement_quarantine)
+        self.assertIsNotNone(replacement_marker)
+        self.assertTrue(owned_quarantine.is_dir())
+        self.assertFalse(canonical.exists())
+        self.assertTrue(replacement_quarantine.is_dir())
+        self.assertEqual(stat.S_IMODE(replacement_owner.stat().st_mode), 0o666)
+        self.assertEqual(replacement_marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_restore_requires_original_owner_token(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        real_lstat_child = cache_module._lstat_private_child
+        replacement_token = "replacement-owner"
+        quarantine: Path | None = None
+
+        def replace_owner_after_quarantine_identity_check(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            *,
+            missing_ok: bool = False,
+        ) -> os.stat_result | None:
+            nonlocal quarantine
+            observed = real_lstat_child(
+                parent_descriptor,
+                parent,
+                name,
+                missing_ok=missing_ok,
+            )
+            if (
+                observed is not None
+                and quarantine is None
+                and name.startswith(".refresh.lock.abort-")
+            ):
+                quarantine = self.cache_root / name
+                (quarantine / "owner.json").write_text(
+                    json.dumps(
+                        {"token": replacement_token, "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+            return observed
+
+        with patch.object(
+            cache_module,
+            "_lstat_private_child",
+            side_effect=replace_owner_after_quarantine_identity_check,
+        ):
+            removed = CacheLock._discard_published_lock_if_owned_locked(
+                canonical,
+                lock.token,
+                lock.identity,
+            )
+
+        self.assertFalse(removed)
+        self.assertIsNotNone(quarantine)
+        self.assertFalse(canonical.exists())
+        self.assertTrue(quarantine.is_dir())
+        owner = json.loads((quarantine / "owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["token"], replacement_token)
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_restore_requires_original_quarantine_inventory(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
+        quarantine: Path | None = None
+        injected_marker: Path | None = None
+        owner_reads = 0
+
+        def fail_moved_owner_after_inventory_injection(
+            directory_descriptor: int,
+            expected: os.stat_result,
+        ) -> tuple[str, float] | None:
+            nonlocal injected_marker, owner_reads, quarantine
+            owner_reads += 1
+            if owner_reads == 2:
+                quarantine = next(
+                    self.cache_root.glob(".refresh.lock.abort-*")
+                )
+                injected_marker = quarantine / "late-regular-file.txt"
+                injected_marker.write_text("safe", encoding="utf-8")
+                return None
+            return real_read_owner(directory_descriptor, expected)
+
+        with patch.object(
+            CacheLock,
+            "_read_owner_from_directory_descriptor",
+            side_effect=fail_moved_owner_after_inventory_injection,
+        ):
+            removed = CacheLock._discard_published_lock_if_owned_locked(
+                canonical,
+                lock.token,
+                lock.identity,
+            )
+
+        self.assertFalse(removed)
+        self.assertIsNotNone(quarantine)
+        self.assertIsNotNone(injected_marker)
+        self.assertFalse(canonical.exists())
+        self.assertTrue(quarantine.is_dir())
+        self.assertEqual(injected_marker.read_text(encoding="utf-8"), "safe")
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_load_hardens_existing_private_cache_artifacts(self) -> None:
@@ -920,6 +1157,113 @@ class StockCacheTest(unittest.TestCase):
             (external_root / status.name).read_text(encoding="utf-8"),
             "safe",
         )
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD fsync проверяется на POSIX")
+    def test_pointer_unlink_does_not_fsync_replaced_cache_root(self) -> None:
+        pointer = CurrentPointer(
+            generation_id="generation-a",
+            directory_name="generation-existing",
+            activation_token="synthetic-activation",
+        )
+        runtime_value = {
+            "generation_id": "generation-a",
+            "checked_at": "2026-08-27T10:00:00+00:00",
+            "stale": False,
+            "warning_code": None,
+            "revision": "a" * 32,
+        }
+        expected_runtime = cache_module.validate_runtime_status(
+            runtime_value,
+            pointer.generation_id,
+        )
+        current_path = self.cache_root / "current.json"
+        cache_module._write_json_atomic(current_path, pointer.to_dict())
+        cache_module._write_runtime_status_atomic(
+            self.cache_root,
+            pointer.directory_name,
+            runtime_value,
+        )
+        parked_root = Path(self.temp_dir.name) / "parked-pointer-root"
+        real_unlink_owned = cache_module._unlink_private_regular_file_if_owned
+        external_marker: Path | None = None
+        root_swapped = False
+
+        def swap_root_after_unlink(
+            path: Path,
+            expected: os.stat_result,
+        ) -> bool:
+            nonlocal external_marker, root_swapped
+            removed = real_unlink_owned(path, expected)
+            if removed and not root_swapped:
+                root_swapped = True
+                os.rename(self.cache_root, parked_root)
+                self.cache_root.mkdir(mode=0o755)
+                os.chmod(self.cache_root, 0o755)
+                external_marker = self.cache_root / "must-not-harden.txt"
+                external_marker.write_text("safe", encoding="utf-8")
+            return removed
+
+        with patch.object(
+            cache_module,
+            "_unlink_private_regular_file_if_owned",
+            side_effect=swap_root_after_unlink,
+        ):
+            StockCache(
+                self.cache_root,
+                FakeHttpClient(),
+            )._rollback_pointer_if_owned_locked(
+                current_path,
+                pointer,
+                expected_runtime,
+                previous_pointer=None,
+            )
+
+        self.assertTrue(root_swapped)
+        self.assertIsNotNone(external_marker)
+        self.assertEqual(external_marker.read_text(encoding="utf-8"), "safe")
+        self.assertEqual(stat.S_IMODE(self.cache_root.stat().st_mode), 0o755)
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD fsync проверяется на POSIX")
+    def test_private_unlink_fsyncs_retained_parent_descriptor(self) -> None:
+        artifact = self.cache_root / "owned-cleanup.json"
+        artifact.write_text("owned", encoding="utf-8")
+        expected = artifact.lstat()
+        expected_parent = self.cache_root.lstat()
+        parked_root = Path(self.temp_dir.name) / "parked-fsync-root"
+        real_fsync = os.fsync
+        external_marker: Path | None = None
+        root_swapped = False
+
+        def swap_root_during_parent_fsync(descriptor: int) -> None:
+            nonlocal external_marker, root_swapped
+            observed = os.fstat(descriptor)
+            if stat.S_ISDIR(observed.st_mode) and not root_swapped:
+                self.assertTrue(
+                    cache_module._same_file_identity(expected_parent, observed)
+                )
+                root_swapped = True
+                os.rename(self.cache_root, parked_root)
+                self.cache_root.mkdir(mode=0o755)
+                os.chmod(self.cache_root, 0o755)
+                external_marker = self.cache_root / "must-not-harden.txt"
+                external_marker.write_text("safe", encoding="utf-8")
+            real_fsync(descriptor)
+
+        with patch.object(
+            cache_module.os,
+            "fsync",
+            side_effect=swap_root_during_parent_fsync,
+        ):
+            removed = cache_module._unlink_private_regular_file_if_owned(
+                artifact,
+                expected,
+            )
+
+        self.assertTrue(removed)
+        self.assertTrue(root_swapped)
+        self.assertIsNotNone(external_marker)
+        self.assertEqual(external_marker.read_text(encoding="utf-8"), "safe")
+        self.assertEqual(stat.S_IMODE(self.cache_root.stat().st_mode), 0o755)
 
     @unittest.skipUnless(os.name == "posix", "Directory FD deletion проверяется на POSIX")
     def test_cleanup_rejects_directory_injected_after_quarantine_rename(
