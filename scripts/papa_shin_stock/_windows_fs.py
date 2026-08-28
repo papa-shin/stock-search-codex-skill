@@ -11,6 +11,7 @@ from ctypes import wintypes
 import hashlib
 import ntpath
 import os
+import sys
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -700,31 +701,52 @@ class WindowsCacheRoot:
         parts: tuple[str, ...],
         *,
         writable: bool = False,
+        mutation_parent: bool = False,
     ) -> tuple[VerifiedHandle, list[VerifiedHandle]]:
+        if mutation_parent and not writable:
+            raise WindowsFilesystemError("mutation parent must be writable")
         self.assert_current()
         current = self.root
         opened: list[VerifiedHandle] = []
         try:
-            for name in parts:
+            if mutation_parent and parts:
+                # The retained root shares delete so root-level child renames
+                # can proceed.  For a nested mutation, this duplicate pins the
+                # first component's name while the leaf parent remains movable.
+                current = self.filesystem.open_verified(
+                    self.root.path,
+                    directory=True,
+                    expected=self.root.identity,
+                    writable=True,
+                    pin_namespace=True,
+                )
+                opened.append(current)
+            for index, name in enumerate(parts):
+                is_mutation_leaf = mutation_parent and index == len(parts) - 1
                 child = self.filesystem.open_child(
                     current,
                     name,
                     directory=True,
                     writable=writable,
-                    pin_namespace=True,
+                    pin_namespace=not is_mutation_leaf,
                 )
                 opened.append(child)
                 current = child
             return current, opened
         except BaseException:
-            for handle in reversed(opened):
-                handle.close()
+            self._close_directory_chain(opened)
             raise
 
     @staticmethod
     def _close_directory_chain(opened: list[VerifiedHandle]) -> None:
+        cleanup_errors: list[OSError] = []
         for handle in reversed(opened):
-            handle.close()
+            try:
+                handle.close()
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors and sys.exc_info()[0] is None:
+            raise cleanup_errors[0]
 
     def ensure_directory(self, parts: tuple[str, ...]) -> WindowsIdentity:
         self.assert_current()
@@ -905,7 +927,7 @@ class WindowsCacheRoot:
         payload: bytes,
     ) -> WindowsIdentity:
         parent, opened = self._open_directory_chain(
-            parent_parts, writable=True
+            parent_parts, writable=True, mutation_parent=True
         )
         try:
             identity = self.filesystem.replace_file_cas(
@@ -925,7 +947,7 @@ class WindowsCacheRoot:
         payload: bytes,
     ) -> WindowsIdentity:
         parent, opened = self._open_directory_chain(
-            parent_parts, writable=True
+            parent_parts, writable=True, mutation_parent=True
         )
         try:
             identity = self.filesystem.replace_file_cas(
@@ -1068,7 +1090,7 @@ class WindowsCacheRoot:
         destination_name: str,
     ) -> None:
         parent, opened = self._open_directory_chain(
-            parent_parts, writable=True
+            parent_parts, writable=True, mutation_parent=True
         )
         try:
             self.filesystem.rename_directory(
@@ -1090,7 +1112,7 @@ class WindowsCacheRoot:
         expected_write_times: dict[str, float] | None = None,
     ) -> bool:
         parent, opened = self._open_directory_chain(
-            parent_parts, writable=True
+            parent_parts, writable=True, mutation_parent=True
         )
         try:
             removed = self.filesystem.delete_flat_directory_handle(
@@ -1484,6 +1506,7 @@ class WindowsFilesystem:
     ) -> WindowsCacheRoot:
         root_handle: VerifiedHandle | None = None
         marker_handle: VerifiedHandle | None = None
+        mutation_root: VerifiedHandle | None = None
         try:
             try:
                 root_handle = self.open_verified(
@@ -1515,6 +1538,19 @@ class WindowsFilesystem:
                 pin_namespace=True,
                 immutable=True,
             )
+            # Initialization uses a namespace-pinned root.  Once the retained
+            # marker anchors that root, retain a separately attested writable
+            # root with share-all so child rename/disposition is not blocked by
+            # the parent handle itself.
+            mutation_root = self.open_verified(
+                root,
+                directory=True,
+                expected=evidence.root_identity,
+                writable=True,
+            )
+            root_handle.close()
+            root_handle = mutation_root
+            mutation_root = None
             result = WindowsCacheRoot(
                 self,
                 root_handle,
@@ -1529,8 +1565,12 @@ class WindowsFilesystem:
             return result
         finally:
             try:
-                if marker_handle is not None:
-                    marker_handle.close()
+                try:
+                    if mutation_root is not None:
+                        mutation_root.close()
+                finally:
+                    if marker_handle is not None:
+                        marker_handle.close()
             finally:
                 if root_handle is not None:
                     root_handle.close()
@@ -1648,7 +1688,6 @@ class WindowsFilesystem:
         temporary: VerifiedHandle | None = None
         rollback: VerifiedHandle | None = None
         target: VerifiedHandle | None = None
-        rename_parent: VerifiedHandle | None = None
         target_identity: WindowsIdentity | None = None
         temporary_state = "UNPUBLISHED"
         rollback_state: str | None = None
@@ -1656,11 +1695,6 @@ class WindowsFilesystem:
         target_quarantined = False
         operation_failed = False
         deferred_cleanup_errors: list[OSError] = []
-
-        def destination_parent_handle() -> int:
-            if rename_parent is None:
-                raise WindowsFilesystemError("Win32 rename parent is unavailable")
-            return rename_parent.handle
 
         def close_during_recovery(handle: VerifiedHandle) -> None:
             try:
@@ -1730,6 +1764,20 @@ class WindowsFilesystem:
             rollback_state = "UNPUBLISHED"
             self.api.write(rollback.handle, observed)
             self.api.flush(rollback.handle)
+            rollback_identity = rollback.identity
+            written_rollback = rollback
+            rollback = None
+            rollback_state = "UNKNOWN"
+            written_rollback.close()
+            rollback = self.open_child(
+                parent,
+                rollback_name,
+                directory=False,
+                destructive=True,
+                expected=rollback_identity,
+                movable=True,
+            )
+            rollback_state = "UNPUBLISHED"
             rollback_ready = True
             return observed
 
@@ -1740,7 +1788,7 @@ class WindowsFilesystem:
             try:
                 self.api.rename_relative(
                     rollback.handle,
-                    destination_parent_handle(),
+                    parent.handle,
                     name,
                     replace=False,
                 )
@@ -1793,15 +1841,6 @@ class WindowsFilesystem:
 
         try:
             parent.assert_current()
-            # The retained parent remains namespace-pinned.  A second handle to
-            # the same verified identity supplies the share-all RootDirectory
-            # contract required by native relative rename.
-            rename_parent = self.open_verified(
-                parent.path,
-                directory=True,
-                expected=parent.identity,
-                writable=True,
-            )
             temporary = self.open_child(
                 parent,
                 temporary_name,
@@ -1812,6 +1851,20 @@ class WindowsFilesystem:
             )
             self.api.write(temporary.handle, payload)
             self.api.flush(temporary.handle)
+            temporary_identity = temporary.identity
+            written_temporary = temporary
+            temporary = None
+            temporary_state = "UNKNOWN"
+            written_temporary.close()
+            temporary = self.open_child(
+                parent,
+                temporary_name,
+                directory=False,
+                destructive=True,
+                expected=temporary_identity,
+                movable=True,
+            )
+            temporary_state = "UNPUBLISHED"
             try:
                 target = self.open_child(
                     parent,
@@ -1841,7 +1894,7 @@ class WindowsFilesystem:
                 try:
                     self.api.rename_relative(
                         target.handle,
-                        destination_parent_handle(),
+                        parent.handle,
                         quarantine_name,
                         replace=False,
                     )
@@ -1882,7 +1935,7 @@ class WindowsFilesystem:
             try:
                 self.api.rename_relative(
                     temporary.handle,
-                    destination_parent_handle(),
+                    parent.handle,
                     name,
                     replace=False,
                 )
@@ -1934,7 +1987,7 @@ class WindowsFilesystem:
                     cleanup_needs_flush = True
                 except OSError as error:
                     cleanup_errors.append(error)
-            for handle in (target, rollback, temporary, rename_parent):
+            for handle in (target, rollback, temporary):
                 if handle is None:
                     continue
                 try:
@@ -2002,6 +2055,7 @@ class WindowsFilesystem:
             directory=True,
             destructive=True,
             expected=expected,
+            movable=True,
         ) as source:
             self.api.rename_relative(
                 source.handle,
@@ -2031,6 +2085,7 @@ class WindowsFilesystem:
             directory=True,
             destructive=True,
             expected=expected,
+            movable=True,
         ) as victim:
             names = self.api.list_directory_handle(victim.handle)
             pinned: dict[str, WindowsIdentity] = {}
@@ -2199,15 +2254,30 @@ class WindowsFilesystem:
         expected_payloads: dict[str, bytes] | None = None,
         expected_write_times: dict[str, float] | None = None,
     ) -> bool:
+        parent_path = PureWindowsPath(parent)
+        if not parent_path.is_absolute() or not parent_path.name:
+            raise WindowsFilesystemError("parent must be an absolute leaf")
         with self.open_verified(
-            parent, directory=True, writable=True, pin_namespace=True
-        ) as parent_handle:
-            return self.delete_flat_directory_handle(
-                parent_handle,
-                name,
-                expected,
-                quarantine_name=quarantine_name,
-                expected_inventory=expected_inventory,
-                expected_payloads=expected_payloads,
-                expected_write_times=expected_write_times,
-            )
+            str(parent_path.parent),
+            directory=True,
+            writable=True,
+            pin_namespace=True,
+        ) as ancestor:
+            with self.open_child(
+                ancestor,
+                parent_path.name,
+                directory=True,
+                writable=True,
+            ) as parent_handle:
+                result = self.delete_flat_directory_handle(
+                    parent_handle,
+                    name,
+                    expected,
+                    quarantine_name=quarantine_name,
+                    expected_inventory=expected_inventory,
+                    expected_payloads=expected_payloads,
+                    expected_write_times=expected_write_times,
+                )
+                parent_handle.assert_current()
+                ancestor.assert_current()
+                return result

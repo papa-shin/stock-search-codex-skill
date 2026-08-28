@@ -226,7 +226,6 @@ class NativeKernel32ApiTest(unittest.TestCase):
             with filesystem.open_verified(
                 str(root),
                 directory=True,
-                destructive=True,
                 writable=True,
             ) as parent:
                 filesystem.replace_file_cas(
@@ -241,6 +240,183 @@ class NativeKernel32ApiTest(unittest.TestCase):
                 sorted(path.name for path in root.iterdir()),
                 ["current.json"],
             )
+
+    def test_cache_root_marker_pins_root_while_root_child_cas_succeeds(self) -> None:
+        api = Kernel32Api()
+        filesystem = WindowsFilesystem(api)
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        with tempfile.TemporaryDirectory() as temporary:
+            parent_path = Path(temporary)
+            root = parent_path / "cache"
+            root.mkdir()
+            with filesystem.open_cache_root(
+                str(root),
+                marker,
+                payload=marker_payload,
+                maximum=512,
+                create=True,
+            ) as session:
+                with filesystem.open_verified(
+                    str(parent_path), directory=True, writable=True
+                ) as parent:
+                    with filesystem.open_child(
+                        parent,
+                        root.name,
+                        directory=True,
+                        destructive=True,
+                        movable=True,
+                    ) as movable_root:
+                        for destination, replace in (
+                            ("cache-renamed", False),
+                            ("cache-replaced", True),
+                        ):
+                            with self.assertRaises(OSError):
+                                api.rename_relative(
+                                    movable_root.handle,
+                                    parent.handle,
+                                    destination,
+                                    replace=replace,
+                                )
+
+                session.write_new_file((), "current.json", b"pointer")
+                self.assertEqual((root / "current.json").read_bytes(), b"pointer")
+
+    def test_nested_ancestor_pins_leaf_while_leaf_child_cas_succeeds(self) -> None:
+        api = Kernel32Api()
+        filesystem = WindowsFilesystem(api)
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            root.mkdir()
+            with filesystem.open_cache_root(
+                str(root),
+                marker,
+                payload=marker_payload,
+                maximum=512,
+                create=True,
+            ) as session:
+                session.ensure_directory(("nested",))
+                leaf, opened = session._open_directory_chain(
+                    ("nested",), writable=True, mutation_parent=True
+                )
+                try:
+                    with filesystem.open_child(
+                        session.root,
+                        "nested",
+                        directory=True,
+                        destructive=True,
+                        movable=True,
+                    ) as movable_leaf:
+                        with self.assertRaises(OSError):
+                            api.rename_relative(
+                                movable_leaf.handle,
+                                session.root.handle,
+                                "nested-renamed",
+                                replace=False,
+                            )
+                    filesystem.replace_file_cas(
+                        leaf,
+                        "current.json",
+                        expected=None,
+                        payload=b"pointer",
+                    )
+                finally:
+                    session._close_directory_chain(opened)
+
+                self.assertEqual(
+                    (root / "nested" / "current.json").read_bytes(), b"pointer"
+                )
+
+    def test_filesystem_cas_rollback_restores_target_with_movable_snapshot(self) -> None:
+        class FailTemporaryPublishApi(Kernel32Api):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failed = False
+
+            def rename_relative(
+                self,
+                handle: int,
+                parent_handle: int,
+                destination_name: str,
+                *,
+                replace: bool,
+            ) -> None:
+                if not self.failed and self.final_path(handle).endswith(".tmp"):
+                    self.failed = True
+                    raise OSError("synthetic clean publish failure")
+                super().rename_relative(
+                    handle,
+                    parent_handle,
+                    destination_name,
+                    replace=replace,
+                )
+
+        api = FailTemporaryPublishApi()
+        filesystem = WindowsFilesystem(api)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pointer = root / "current.json"
+            pointer.write_bytes(b"old-pointer")
+            with filesystem.open_verified(
+                str(root), directory=True, writable=True
+            ) as parent:
+                with self.assertRaisesRegex(OSError, "clean publish failure"):
+                    filesystem.replace_file_cas(
+                        parent,
+                        "current.json",
+                        expected=b"old-pointer",
+                        payload=b"new-pointer",
+                    )
+
+            self.assertEqual(pointer.read_bytes(), b"old-pointer")
+            self.assertEqual([path.name for path in root.iterdir()], ["current.json"])
+
+    def test_session_renames_and_deletes_flat_directory_with_movable_sources(
+        self,
+    ) -> None:
+        filesystem = WindowsFilesystem(Kernel32Api())
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            root.mkdir()
+            with filesystem.open_cache_root(
+                str(root),
+                marker,
+                payload=marker_payload,
+                maximum=512,
+                create=True,
+            ) as session:
+                session.ensure_directory(("generations",))
+                identity = session.create_directory(
+                    ("generations",), ".staging-native"
+                )
+                session.write_new_file(
+                    ("generations", ".staging-native"), "manifest.json", b"{}"
+                )
+                session.rename_directory(
+                    ("generations",),
+                    ".staging-native",
+                    identity,
+                    "generation-native",
+                )
+                inventory = session.snapshot_flat_directory(
+                    ("generations", "generation-native")
+                )
+                self.assertTrue(
+                    session.delete_flat_directory(
+                        ("generations",),
+                        "generation-native",
+                        identity,
+                        quarantine_name=".generation-native.delete",
+                        expected_inventory=inventory,
+                        expected_payloads={"manifest.json": b"{}"},
+                    )
+                )
+
+                self.assertEqual(session.list_directory(("generations",)), [])
 
 
 class FakeWindowsApi:
@@ -499,6 +675,7 @@ class WindowsFilesystemTest(unittest.TestCase):
         self.api = FakeWindowsApi()
         self.fs = WindowsFilesystem(self.api)
         self.root = r"C:\Users\manager\.cache\papa-shin-stock"
+        self.api.add_directory(str(PureWindowsPath(self.root).parent), (7, 69))
         self.api.add_directory(self.root, (7, 70))
 
     def test_destructive_open_pins_identity_and_denies_delete_sharing(self) -> None:
@@ -1090,43 +1267,334 @@ class WindowsFilesystemTest(unittest.TestCase):
         )
         self.assertEqual(self.api.list_directory(self.root), ["current.json"])
 
-    def test_atomic_replace_uses_share_all_identity_verified_rename_parent(
+    def test_cache_root_uses_share_all_mutation_parent_and_marker_anchor(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            retained_root_handle = session.root.handle
+            retained_marker_handle = session.marker.handle
+            session.write_new_file((), "current.json", b"new-pointer")
+
+        retained_root_open = next(
+            call
+            for call in self.api.open_calls
+            if self.api.canonical(call[0]) == self.api.canonical(self.root)
+            and call[2] == FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        )
+        self.assertEqual(
+            retained_root_open[2],
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        marker_open = next(
+            call
+            for call in self.api.child_open_calls
+            if call[0] == retained_root_handle
+            and call[1] == marker
+            and call[4] == OPEN_EXISTING
+        )
+        self.assertEqual(marker_open[3] & FILE_SHARE_DELETE, 0)
+        self.assertEqual(
+            {parent for _source, parent, _name, _replace in self.api.relative_rename_calls},
+            {retained_root_handle},
+        )
+        self.assertIn(retained_marker_handle, self.api.close_calls)
+
+    def test_nested_mutation_parent_is_share_all_with_pinned_ancestor(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            session.ensure_directory(("nested",))
+            call_count = len(self.api.child_open_calls)
+            session.write_new_file(("nested",), "current.json", b"pointer")
+
+        mutation_calls = self.api.child_open_calls[call_count:]
+        leaf_open = next(call for call in mutation_calls if call[1] == "nested")
+        self.assertEqual(
+            leaf_open[3],
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        root_anchor = next(
+            call
+            for call in self.api.open_calls
+            if self.api.canonical(call[0]) == self.api.canonical(self.root)
+            and call[2] == FILE_SHARE_READ | FILE_SHARE_WRITE
+            and call[1] & GENERIC_WRITE
+        )
+        self.assertEqual(root_anchor[2] & FILE_SHARE_DELETE, 0)
+
+    def test_cache_root_reopen_identity_change_fails_closed(self) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        original_create_file = self.api.create_file
+
+        def create_file_with_root_replacement(
+            path: str,
+            access: int,
+            share: int,
+            creation: int,
+            flags: int,
+        ) -> int:
+            if (
+                self.api.canonical(path) == self.api.canonical(self.root)
+                and share == FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            ):
+                self.api.nodes[self.api.canonical(self.root)]["identity"] = (7, 999)
+            return original_create_file(path, access, share, creation, flags)
+
+        self.api.create_file = create_file_with_root_replacement  # type: ignore[method-assign]
+        with self.assertRaisesRegex(WindowsFilesystemError, "identity changed"):
+            self.fs.open_cache_root(
+                self.root,
+                marker,
+                payload=marker_payload,
+                maximum=512,
+                create=True,
+            )
+
+        self.assertEqual(self.api.relative_rename_calls, [])
+
+    def test_cache_root_post_publish_final_path_change_fails_closed(self) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        original_rename_relative = self.api.rename_relative
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            def rename_then_move_root(
+                handle: int,
+                parent_handle: int,
+                destination_name: str,
+                *,
+                replace: bool,
+            ) -> None:
+                original_rename_relative(
+                    handle,
+                    parent_handle,
+                    destination_name,
+                    replace=replace,
+                )
+                if destination_name == "current.json":
+                    self.api.nodes[self.api.canonical(self.root)]["path"] = (
+                        self.root + "-moved"
+                    )
+
+            self.api.rename_relative = rename_then_move_root  # type: ignore[method-assign]
+            with self.assertRaisesRegex(WindowsFilesystemError, "final path changed"):
+                session.write_new_file((), "current.json", b"pointer")
+
+    def test_cas_reopens_temporary_and_rollback_as_movable_before_rename(
         self,
     ) -> None:
         pointer = self.root + r"\current.json"
         self.api.add_file(pointer, (7, 109), b"old-pointer")
 
         with self.fs.open_verified(
-            self.root, directory=True, destructive=True, writable=True
-        ) as root:
-            pinned_parent_handle = root.handle
+            self.root, directory=True, writable=True
+        ) as parent:
             self.fs.replace_file_cas(
-                root,
+                parent,
                 "current.json",
                 expected=b"old-pointer",
                 payload=b"new-pointer",
             )
 
-        rename_parent_handles = {
-            parent_handle
-            for _source, parent_handle, _destination, _replace in self.api.relative_rename_calls
-        }
-        self.assertEqual(len(rename_parent_handles), 1)
-        self.assertNotIn(pinned_parent_handle, rename_parent_handles)
-        rename_parent_handle = next(iter(rename_parent_handles))
-        rename_parent_open = next(
+        for suffix in (".tmp", ".rollback"):
+            calls = [
+                call
+                for call in self.api.child_open_calls
+                if call[1].endswith(suffix)
+            ]
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][2] & GENERIC_WRITE, GENERIC_WRITE)
+            self.assertEqual(calls[0][3] & FILE_SHARE_DELETE, 0)
+            self.assertEqual(calls[1][2] & DELETE, DELETE)
+            self.assertEqual(calls[1][2] & GENERIC_WRITE, 0)
+            self.assertEqual(
+                calls[1][3],
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            )
+
+    def test_cas_temporary_identity_change_before_movable_reopen_fails_closed(
+        self,
+    ) -> None:
+        original_create_child = self.api.create_child
+
+        def replace_temporary_before_reopen(
+            parent_handle: int,
+            name: str,
+            access: int,
+            share: int,
+            creation: int,
+            flags: int,
+        ) -> int:
+            if name.endswith(".tmp") and creation == OPEN_EXISTING:
+                key = self.api.canonical(self.root + "\\" + name)
+                self.api.nodes[key]["identity"] = (7, 999)
+            return original_create_child(
+                parent_handle, name, access, share, creation, flags
+            )
+
+        self.api.create_child = replace_temporary_before_reopen  # type: ignore[method-assign]
+        with self.fs.open_verified(
+            self.root, directory=True, writable=True
+        ) as parent:
+            with self.assertRaisesRegex(WindowsFilesystemError, "identity changed"):
+                self.fs.replace_file_cas(
+                    parent,
+                    "current.json",
+                    expected=None,
+                    payload=b"new-pointer",
+                )
+
+        self.assertNotIn(self.api.canonical(self.root + r"\current.json"), self.api.nodes)
+
+    def test_directory_rename_and_cleanup_sources_are_movable(self) -> None:
+        generations = self.root + r"\generations"
+        staging = generations + r"\.staging"
+        victim = generations + r"\generation-old"
+        self.api.add_directory(generations, (7, 400))
+        self.api.add_directory(staging, (7, 401))
+        self.api.add_directory(victim, (7, 402))
+
+        with self.fs.open_verified(
+            generations, directory=True, writable=True
+        ) as parent:
+            self.fs.rename_directory(
+                parent,
+                ".staging",
+                WindowsIdentity(7, 401),
+                "generation-new",
+            )
+            self.fs.delete_flat_directory_handle(
+                parent,
+                "generation-old",
+                WindowsIdentity(7, 402),
+                quarantine_name=".generation-old.delete",
+            )
+
+        for name in (".staging", "generation-old"):
+            source_open = next(
+                call for call in self.api.child_open_calls if call[1] == name
+            )
+            self.assertEqual(
+                source_open[3],
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            )
+
+    def test_directory_chain_close_attempts_all_handles_after_leaf_close_failure(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            self.api.add_directory(self.root + r"\one", (7, 420))
+            self.api.add_directory(self.root + r"\one\two", (7, 421))
+            _leaf, opened = session._open_directory_chain(("one", "two"))
+            opened_handles = [handle.handle for handle in opened]
+            self.api.close_failure_handles.add(opened_handles[-1])
+            with self.assertRaisesRegex(OSError, "synthetic close failure"):
+                session._close_directory_chain(opened)
+
+            self.assertTrue(set(opened_handles).issubset(self.api.close_calls))
+            self.assertTrue(set(opened_handles).isdisjoint(self.api.handles))
+
+    def test_directory_chain_open_failure_preserves_primary_and_closes_all(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            self.api.add_directory(self.root + r"\one", (7, 430))
+            self.api.add_directory(self.root + r"\one\two", (7, 431))
+            original_close = self.api.close
+
+            def fail_two_close(handle: int) -> None:
+                key = self.api.handles.get(handle)
+                should_fail = key == self.api.canonical(self.root + r"\one\two")
+                original_close(handle)
+                if should_fail:
+                    raise OSError("synthetic close failure")
+
+            self.api.close = fail_two_close  # type: ignore[method-assign]
+            with self.assertRaises(FileNotFoundError):
+                session._open_directory_chain(("one", "two", "missing"))
+
+            self.assertFalse(
+                any(
+                    key
+                    in {
+                        self.api.canonical(self.root + r"\one"),
+                        self.api.canonical(self.root + r"\one\two"),
+                    }
+                    for key in self.api.handles.values()
+                )
+            )
+
+    def test_legacy_flat_cleanup_uses_pinned_ancestor_and_share_all_parent(
+        self,
+    ) -> None:
+        generations = self.root + r"\generations"
+        victim = generations + r"\generation-old"
+        self.api.add_directory(generations, (7, 440))
+        self.api.add_directory(victim, (7, 441))
+
+        self.fs.delete_flat_directory(
+            generations,
+            "generation-old",
+            WindowsIdentity(7, 441),
+            quarantine_name=".generation-old.delete",
+        )
+
+        ancestor_open = next(
             call
             for call in self.api.open_calls
             if self.api.canonical(call[0]) == self.api.canonical(self.root)
-            and call[2]
-            == FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         )
+        parent_open = next(
+            call for call in self.api.child_open_calls if call[1] == "generations"
+        )
+        self.assertEqual(ancestor_open[2] & FILE_SHARE_DELETE, 0)
         self.assertEqual(
-            rename_parent_open[2],
+            parent_open[3],
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         )
-        self.assertEqual(rename_parent_open[1] & GENERIC_WRITE, GENERIC_WRITE)
-        self.assertIn(rename_parent_handle, self.api.close_calls)
 
     def test_atomic_replace_reopens_quarantine_immutable_before_publish(self) -> None:
         pointer = self.root + r"\current.json"
