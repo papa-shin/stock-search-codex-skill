@@ -919,6 +919,10 @@ class StockSearchTest(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    os.name == "posix",
+    "POSIX backend white-box: CacheLock, runtime-status dirfd и atomic write hooks",
+)
 class SearchFreshnessIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

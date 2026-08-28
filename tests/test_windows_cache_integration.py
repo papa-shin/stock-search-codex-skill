@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import argparse
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -16,15 +17,79 @@ from unittest.mock import patch
 from tests.test_cache import CacheFixture, FakeHttpClient, manifest_bytes
 
 from papa_shin_stock import cache as cache_module
-from papa_shin_stock.cache import StockCache
+from papa_shin_stock import schema as schema_module
+from papa_shin_stock.cache import CacheState, StockCache
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
-from papa_shin_stock.http_client import HttpResponse
+from papa_shin_stock.http_client import DownloadReceipt, HttpResponse
+from papa_shin_stock.query import SearchQuery
+from papa_shin_stock.schema import StockSearcher
 from papa_shin_stock._windows_fs import (
     MarkerEvidence,
     WindowsFilesystemError,
     WindowsIdentity,
 )
+
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+SEARCH_PRODUCTS = (FIXTURES_DIR / "products.jsonl").read_bytes()
+SEARCH_OFFERS = (FIXTURES_DIR / "offers.jsonl").read_bytes()
+
+
+def search_manifest_bytes() -> bytes:
+    return json.dumps(
+        {
+            "generation_id": "synthetic-generation",
+            "generated_at": "2026-08-27T10:00:00+00:00",
+            "files": {
+                "products": {
+                    "url": "products.jsonl",
+                    "bytes": len(SEARCH_PRODUCTS),
+                    "sha256": hashlib.sha256(SEARCH_PRODUCTS).hexdigest(),
+                },
+                "offers": {
+                    "url": "offers.jsonl",
+                    "bytes": len(SEARCH_OFFERS),
+                    "sha256": hashlib.sha256(SEARCH_OFFERS).hexdigest(),
+                },
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class SearchFixtureHttpClient:
+    def __init__(self, response: HttpResponse | None = None) -> None:
+        self.response = response or HttpResponse(
+            status=200,
+            headers={"ETag": '"synthetic-generation"'},
+            body=search_manifest_bytes(),
+        )
+
+    def get_manifest(
+        self, etag: str | None = None, last_modified: str | None = None
+    ) -> HttpResponse:
+        return self.response
+
+    def download(
+        self,
+        url: str,
+        destination: Path,
+        expected_bytes: int,
+        expected_sha256: str,
+        progress: object | None = None,
+    ) -> DownloadReceipt:
+        payload = (
+            SEARCH_PRODUCTS
+            if destination.name == "products.jsonl"
+            else SEARCH_OFFERS
+        )
+        destination.write_bytes(payload)
+        if callable(progress):
+            progress()
+        return DownloadReceipt(
+            bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest()
+        )
 
 
 class LocalWindowsRoot:
@@ -614,6 +679,258 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             ),
             **kwargs,
         )
+
+    def _search_config(self) -> StockConfig:
+        return StockConfig(
+            manifest_url="https://stock.example.test/manifest.json",
+            username="synthetic-user",
+            password="synthetic-password",
+            product_id_field="private_product_key",
+            offer_product_id_field="private_offer_product_key",
+            cache_dir=self.root,
+        )
+
+    def _public_search(self, config: StockConfig) -> dict[str, object]:
+        files = StockCache(self.root, object()).current_generation()
+        query = SearchQuery.from_args(argparse.Namespace())
+        return StockSearcher(files, config).search(query).to_public_dict()
+
+    def test_failure_then_304_is_visible_to_search_without_mutating_generation(
+        self,
+    ) -> None:
+        config = self._search_config()
+
+        class FailingClient:
+            def get_manifest(
+                self, etag: str | None = None, last_modified: str | None = None
+            ) -> HttpResponse:
+                raise StockError("network_error", "Синтетическая ошибка сети", 3)
+
+        not_modified = SearchFixtureHttpClient(
+            HttpResponse(status=304, headers={}, body=b"")
+        )
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            pointer = json.loads(self._pointer_payload())
+            generation = self.root / "generations" / pointer["directory_name"]
+            immutable_state = (generation / "state.json").read_bytes()
+
+            stale = StockCache(self.root, FailingClient()).refresh(config)
+            stale_public = self._public_search(config)
+            fresh = StockCache(self.root, not_modified).refresh(config)
+            fresh_public = self._public_search(config)
+
+        self.assertEqual(stale.status, "stale_cache")
+        self.assertTrue(stale_public["generation"]["stale"])
+        self.assertEqual(stale_public["warnings"][0]["code"], "network_error")
+        self.assertEqual(fresh.status, "not_modified")
+        self.assertFalse(fresh_public["generation"]["stale"])
+        self.assertEqual(fresh_public["warnings"], [])
+        self.assertEqual((generation / "state.json").read_bytes(), immutable_state)
+
+    def test_stale_runtime_revision_cannot_overwrite_later_304(self) -> None:
+        config = self._search_config()
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            original = CacheState.load(self.root)
+            self.assertIsNotNone(original)
+            lock = cache_module._WindowsCacheLock.acquire(self.root)
+            self.addCleanup(lock.release)
+            stale = StockCache(self.root, object())._record_runtime_status_windows(
+                original, True, "network_error", lock
+            )
+            fresh = StockCache(self.root, object())._record_runtime_status_windows(
+                stale, False, None, lock
+            )
+            with self.assertRaisesRegex(StockError, "cache_locked"):
+                StockCache(self.root, object())._record_runtime_status_windows(
+                    stale, True, "network_error", lock
+                )
+            lock.release()
+            final = CacheState.load(self.root)
+
+        self.assertIsNotNone(final)
+        self.assertEqual(final.runtime_revision, fresh.runtime_revision)
+        self.assertFalse(final.stale)
+
+    def test_failure_then_304_then_failure_preserves_latest_checked_at(self) -> None:
+        config = self._search_config()
+
+        class FailingClient:
+            def get_manifest(
+                self, etag: str | None = None, last_modified: str | None = None
+            ) -> HttpResponse:
+                raise StockError("network_error", "Синтетическая ошибка сети", 3)
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            initial = CacheState.load(self.root)
+            self.assertIsNotNone(initial)
+            first_stale = StockCache(self.root, FailingClient()).refresh(config)
+            fresh = StockCache(
+                self.root,
+                SearchFixtureHttpClient(
+                    HttpResponse(status=304, headers={}, body=b"")
+                ),
+            ).refresh(config)
+            second_stale = StockCache(self.root, FailingClient()).refresh(config)
+
+        self.assertEqual(first_stale.checked_at, initial.checked_at)
+        self.assertNotEqual(fresh.checked_at, initial.checked_at)
+        self.assertEqual(second_stale.checked_at, fresh.checked_at)
+        self.assertTrue(second_stale.stale)
+
+    def test_malformed_windows_runtime_status_is_rejected_by_cache_and_search(
+        self,
+    ) -> None:
+        config = self._search_config()
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            state = CacheState.load(self.root)
+            self.assertIsNotNone(state)
+            runtime = state.files.runtime_status
+            self.assertIsNotNone(runtime)
+            valid = runtime.read_bytes()
+            invalid_values = (
+                b"[]",
+                b"{malformed",
+                valid.replace(b"synthetic-generation", b"foreign-generation"),
+            )
+            for value in invalid_values:
+                with self.subTest(value=value[:32]):
+                    runtime.write_bytes(value)
+                    with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                        CacheState.load(self.root)
+                    with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                        StockCache(self.root, object()).current_generation()
+                    runtime.write_bytes(valid)
+
+    def test_runtime_write_failure_releases_lock_and_preserves_generation(
+        self,
+    ) -> None:
+        config = self._search_config()
+        original_replace = LocalWindowsRoot.replace_file_cas
+        fail_runtime = True
+
+        def replace_or_fail(
+            session: LocalWindowsRoot,
+            parent_parts: tuple[str, ...],
+            name: str,
+            *,
+            expected: bytes | None,
+            payload: bytes,
+        ) -> WindowsIdentity:
+            if fail_runtime and name.startswith(".runtime-status-"):
+                raise OSError("synthetic runtime publication failure")
+            return original_replace(
+                session,
+                parent_parts,
+                name,
+                expected=expected,
+                payload=payload,
+            )
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            pointer = self._pointer_payload()
+            with patch.object(
+                LocalWindowsRoot, "replace_file_cas", new=replace_or_fail
+            ):
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    StockCache(
+                        self.root,
+                        SearchFixtureHttpClient(
+                            HttpResponse(status=304, headers={}, body=b"")
+                        ),
+                    ).refresh(config)
+            fail_runtime = False
+            recovered = StockCache(
+                self.root,
+                SearchFixtureHttpClient(
+                    HttpResponse(status=304, headers={}, body=b"")
+                ),
+            ).refresh(config)
+
+        self.assertEqual(first.generation_id, recovered.generation_id)
+        self.assertEqual(recovered.status, "not_modified")
+        self.assertEqual(self._pointer_payload(), pointer)
+        self.assertFalse((self.root / ".refresh.lock").exists())
+
+    def test_windows_304_search_verifies_and_streams_each_payload_once(self) -> None:
+        config = self._search_config()
+        verified_bytes = 0
+        streamed_bytes = 0
+        original_verify = LocalWindowsRoot.verify_file
+        original_rows = schema_module._rows
+
+        def count_verify(
+            session: LocalWindowsRoot,
+            parent_parts: tuple[str, ...],
+            name: str,
+            *,
+            expected_bytes: int,
+            expected_sha256: str,
+            progress: object | None = None,
+        ) -> None:
+            nonlocal verified_bytes
+            verified_bytes += expected_bytes
+            original_verify(
+                session,
+                parent_parts,
+                name,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_sha256,
+                progress=progress,
+            )
+
+        def count_rows(path: Path, maximum_rows: int, *integrity: object) -> object:
+            nonlocal streamed_bytes
+            streamed_bytes += path.stat().st_size
+            yield from original_rows(path, maximum_rows, *integrity)
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, SearchFixtureHttpClient()).refresh(config)
+            verified_bytes = 0
+            with patch.object(
+                LocalWindowsRoot, "verify_file", new=count_verify
+            ), patch.object(schema_module, "_rows", side_effect=count_rows):
+                refreshed = StockCache(
+                    self.root,
+                    SearchFixtureHttpClient(
+                        HttpResponse(status=304, headers={}, body=b"")
+                    ),
+                ).refresh(config)
+                public = self._public_search(config)
+
+        payload_bytes = len(SEARCH_PRODUCTS) + len(SEARCH_OFFERS)
+        self.assertEqual(refreshed.status, "not_modified")
+        self.assertEqual(public["status"], "ok")
+        self.assertEqual(verified_bytes, payload_bytes)
+        self.assertEqual(streamed_bytes, payload_bytes)
 
     def test_local_windows_touch_omits_unsupported_symlink_argument(self) -> None:
         session = self.windows.open_cache_root(
@@ -1508,6 +1825,54 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
         self.assertEqual((first.status, second.status), ("updated", "updated"))
         pointer = json.loads((self.root / "current.json").read_text(encoding="utf-8"))
         self.assertEqual(pointer["generation_id"], "generation-c")
+        self.assertEqual(
+            [path.name for path in (self.root / "generations").iterdir()],
+            [pointer["directory_name"]],
+        )
+        self.assertFalse((self.root / ".refresh.lock").exists())
+        self.assertEqual(list(self.root.glob(".refresh.lock.release-*")), [])
+
+    def test_two_real_parallel_refreshes_leave_one_generation_and_no_lock_artifacts(
+        self,
+    ) -> None:
+        entered_manifest = threading.Event()
+        continue_refresh = threading.Event()
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        class BlockingClient(FakeHttpClient):
+            def get_manifest(
+                nested_self,
+                etag: str | None = None,
+                last_modified: str | None = None,
+            ) -> HttpResponse:
+                entered_manifest.set()
+                if not continue_refresh.wait(timeout=5):
+                    raise RuntimeError("synthetic parallel refresh timeout")
+                return super().get_manifest(etag, last_modified)
+
+        def refresh(client: FakeHttpClient) -> None:
+            try:
+                results.append(StockCache(self.root, client).refresh(self.config))
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=refresh, args=(BlockingClient(),))
+        first.start()
+        self.assertTrue(entered_manifest.wait(timeout=5))
+        second = threading.Thread(target=refresh, args=(FakeHttpClient(),))
+        second.start()
+        second.join(timeout=5)
+        continue_refresh.set()
+        first.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([result.status for result in results], ["updated"])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], StockError)
+        self.assertEqual(errors[0].code, "cache_locked")
+        pointer = json.loads((self.root / "current.json").read_text(encoding="utf-8"))
         self.assertEqual(
             [path.name for path in (self.root / "generations").iterdir()],
             [pointer["directory_name"]],

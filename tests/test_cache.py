@@ -183,6 +183,10 @@ class CacheFixture:
         ]
 
 
+@unittest.skipUnless(
+    os.name == "posix",
+    "POSIX backend white-box: dirfd, inode, symlink, mode и fsync semantics",
+)
 class StockCacheTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
