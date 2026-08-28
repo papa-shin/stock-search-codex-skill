@@ -35,6 +35,8 @@ cd -- "$PAPA_SHIN_SKILL_DIR"
 
 ## Установка в Windows
 
+> Важно: установка skill и synthetic tests доступны, но реальный refresh кэша на нативном Windows пока fail-closed. Изолированные Win32 handle primitives имеют mock-покрытие; end-to-end поддержка требует завершения общей directory-I/O abstraction и подтверждения в Windows CI. Для рабочего обновления кэша используйте macOS/Linux или WSL.
+
 В PowerShell выберите launcher. Для Python Launcher используйте `py -3.11`; если Python 3.11+ доступен командой `python`, задайте `$PapaShinPython = "python"` и `$PapaShinPythonArgs = @()`:
 
 ```powershell
