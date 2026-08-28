@@ -1796,14 +1796,13 @@ class WindowsFilesystem:
                 temporary.rebind(destination)
                 published = confirmed_at(temporary, destination)
                 if published:
-                    try:
-                        self.api.flush(parent.handle)
-                    finally:
-                        dispose_quarantined_target()
+                    self.api.flush(parent.handle)
+                    dispose_quarantined_target()
                 else:
                     temporary.rebind(temporary_path)
                     rollback_quarantined_target()
                 raise
+            published = True
             temporary.rebind(destination)
             if (
                 WindowsIdentity(*self.api.identity(temporary.handle))
@@ -1813,11 +1812,8 @@ class WindowsFilesystem:
                 )
             ):
                 raise WindowsFilesystemError("atomic replacement was not confirmed")
-            published = True
-            try:
-                self.api.flush(parent.handle)
-            finally:
-                dispose_quarantined_target()
+            self.api.flush(parent.handle)
+            dispose_quarantined_target()
             return temporary.identity
         finally:
             temporary_cleanup_error: OSError | None = None

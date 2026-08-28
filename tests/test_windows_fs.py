@@ -1086,6 +1086,123 @@ class WindowsFilesystemTest(unittest.TestCase):
         )
         self.assertEqual(self.api.list_directory(self.root), ["current.json"])
 
+    def _assert_post_publish_attestation_failure_preserves_both_versions(
+        self,
+        *,
+        identity_error: bool,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        pointer_key = self.api.canonical(pointer)
+        self.api.add_file(pointer, (7, 111), b"old-pointer")
+        original_identity = self.api.identity
+        original_final_path = self.api.final_path
+
+        def is_published(handle: int) -> bool:
+            node = self.api.nodes[self.api.handles[handle]]
+            return (
+                self.api.handles[handle] == pointer_key
+                and node["content"] == b"new-pointer"
+            )
+
+        def fail_published_identity(handle: int) -> tuple[int, int]:
+            if identity_error and is_published(handle):
+                raise OSError("synthetic post-publish identity failure")
+            return original_identity(handle)
+
+        def mismatch_published_path(handle: int) -> str:
+            if not identity_error and is_published(handle):
+                return self.root + r"\unexpected.json"
+            return original_final_path(handle)
+
+        self.api.identity = fail_published_identity  # type: ignore[method-assign]
+        self.api.final_path = mismatch_published_path  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaises(OSError):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        names = self.api.list_directory(self.root)
+        self.assertIn("current.json", names)
+        self.assertEqual(self.api.nodes[pointer_key]["content"], b"new-pointer")
+        old_names = [name for name in names if name.endswith(".old")]
+        self.assertEqual(len(old_names), 1)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(self.root + "\\" + old_names[0])][
+                "content"
+            ],
+            b"old-pointer",
+        )
+        self.assertFalse(any(name.endswith(".tmp") for name in names))
+
+    def test_atomic_replace_identity_error_after_publish_preserves_both_versions(
+        self,
+    ) -> None:
+        self._assert_post_publish_attestation_failure_preserves_both_versions(
+            identity_error=True
+        )
+
+    def test_atomic_replace_path_mismatch_after_publish_preserves_both_versions(
+        self,
+    ) -> None:
+        self._assert_post_publish_attestation_failure_preserves_both_versions(
+            identity_error=False
+        )
+
+    def test_atomic_replace_publish_flush_failure_preserves_old_quarantine(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 112), b"old-pointer")
+        original_flush = self.api.flush
+        parent_flushes = 0
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            root_handle = root.handle
+
+            def fail_publish_and_disposal_flush(handle: int) -> None:
+                nonlocal parent_flushes
+                if handle == root_handle:
+                    parent_flushes += 1
+                    if parent_flushes == 2:
+                        raise OSError("primary publication flush failure")
+                    if parent_flushes == 3:
+                        raise OSError("secondary disposal flush failure")
+                original_flush(handle)
+
+            self.api.flush = fail_publish_and_disposal_flush  # type: ignore[method-assign]
+            with self.assertRaises(OSError) as raised:
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(str(raised.exception), "primary publication flush failure")
+        names = self.api.list_directory(self.root)
+        self.assertIn("current.json", names)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(pointer)]["content"],
+            b"new-pointer",
+        )
+        old_names = [name for name in names if name.endswith(".old")]
+        self.assertEqual(len(old_names), 1)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(self.root + "\\" + old_names[0])][
+                "content"
+            ],
+            b"old-pointer",
+        )
+
     def test_atomic_replace_preserves_successor_created_before_publish(self) -> None:
         pointer = self.root + r"\current.json"
         self.api.add_file(pointer, (7, 115), b"old-pointer")
