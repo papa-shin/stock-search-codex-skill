@@ -1351,9 +1351,18 @@ class WindowsFilesystem:
         writable: bool = False,
         pin_namespace: bool = False,
         immutable: bool = False,
+        movable: bool = False,
     ) -> VerifiedHandle:
         if writable and immutable:
             raise WindowsFilesystemError("immutable handle cannot be writable")
+        if movable and (not destructive or not immutable):
+            raise WindowsFilesystemError(
+                "movable handle must be destructive and immutable"
+            )
+        if movable and pin_namespace:
+            raise WindowsFilesystemError(
+                "movable handle cannot pin the namespace"
+            )
         requested = self._child(parent.path, name)
         access = FILE_READ_ATTRIBUTES | GENERIC_READ
         if destructive:
@@ -1363,7 +1372,7 @@ class WindowsFilesystem:
         share = FILE_SHARE_READ
         if not immutable:
             share |= FILE_SHARE_WRITE
-        if not destructive and not pin_namespace and not immutable:
+        if movable or (not destructive and not pin_namespace and not immutable):
             share |= FILE_SHARE_DELETE
         flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
@@ -1743,6 +1752,7 @@ class WindowsFilesystem:
                     directory=False,
                     destructive=True,
                     immutable=True,
+                    movable=True,
                 )
             except OSError as error:
                 if not self._is_missing_error(error):

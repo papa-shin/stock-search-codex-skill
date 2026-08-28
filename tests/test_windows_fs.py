@@ -216,7 +216,7 @@ class NativeKernel32ApiTest(unittest.TestCase):
             finally:
                 api.close(parent_handle)
 
-    def test_filesystem_cas_replaces_target_held_without_delete_share(self) -> None:
+    def test_filesystem_cas_replaces_immutable_target_via_quarantine(self) -> None:
         api = Kernel32Api()
         filesystem = WindowsFilesystem(api)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1085,6 +1085,52 @@ class WindowsFilesystemTest(unittest.TestCase):
             [False, False],
         )
         self.assertEqual(self.api.list_directory(self.root), ["current.json"])
+
+    def test_atomic_replace_opens_target_movable_but_immutable(self) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 111), b"old-pointer")
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            self.fs.replace_file_cas(
+                root,
+                "current.json",
+                expected=b"old-pointer",
+                payload=b"new-pointer",
+            )
+
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(pointer)]["content"], b"new-pointer"
+        )
+        self.assertEqual(self.api.list_directory(self.root), ["current.json"])
+        target_open = next(
+            call for call in self.api.child_open_calls if call[1] == "current.json"
+        )
+        self.assertEqual(target_open[3], FILE_SHARE_READ | FILE_SHARE_DELETE)
+        self.assertEqual(target_open[3] & FILE_SHARE_WRITE, 0)
+
+    def test_movable_child_rejects_namespace_pin_before_open(self) -> None:
+        before = len(self.api.child_open_calls)
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(
+                WindowsFilesystemError,
+                "movable handle cannot pin the namespace",
+            ):
+                self.fs.open_child(
+                    root,
+                    "current.json",
+                    directory=False,
+                    destructive=True,
+                    immutable=True,
+                    movable=True,
+                    pin_namespace=True,
+                )
+
+        self.assertEqual(len(self.api.child_open_calls), before)
 
     def _assert_post_publish_attestation_failure_preserves_both_versions(
         self,
