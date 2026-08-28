@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import os
+import tempfile
 import time
 import unittest
 import sys
@@ -13,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from papa_shin_stock._windows_fs import (
     CREATE_NEW,
     DELETE,
+    FILE_ATTRIBUTE_NORMAL,
     FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE,
@@ -20,10 +24,197 @@ from papa_shin_stock._windows_fs import (
     FILE_SHARE_WRITE,
     GENERIC_READ,
     GENERIC_WRITE,
+    Kernel32Api,
+    OPEN_EXISTING,
     WindowsFilesystem,
     WindowsFilesystemError,
     WindowsIdentity,
 )
+
+
+# Keep the Windows ABI widths stable while running the contract test on POSIX.
+class _ExpectedFileRenameInformation(ctypes.Structure):
+    _fields_ = [
+        ("ReplaceIfExists", ctypes.c_ubyte),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
+    ]
+
+
+class _ExpectedFileRenameInformationEx(ctypes.Structure):
+    _fields_ = [
+        ("Flags", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
+    ]
+
+
+class _RecordingKernel32RenameApi:
+    def __init__(self) -> None:
+        self.rename_calls: list[tuple[object, ...]] = []
+
+    def SetFileInformationByHandle(self, *arguments: object) -> int:
+        self.rename_calls.append(arguments)
+        return 1
+
+
+class _RecordingNtdllRenameApi:
+    def __init__(self, *, status: int = 0, dos_error: int = 0) -> None:
+        self.status = status
+        self.dos_error = dos_error
+        self.rename_calls: list[tuple[int, int, bytes]] = []
+        self.status_conversions: list[int] = []
+
+    def NtSetInformationFile(
+        self,
+        handle: int,
+        _io_status: object,
+        information: object,
+        length: int,
+        information_class: int,
+    ) -> int:
+        self.rename_calls.append(
+            (
+                int(handle),
+                int(information_class),
+                ctypes.string_at(information, int(length)),
+            )
+        )
+        return self.status
+
+    def RtlNtStatusToDosError(self, status: int) -> int:
+        self.status_conversions.append(int(status))
+        return self.dos_error
+
+
+class Kernel32ApiTest(unittest.TestCase):
+    @staticmethod
+    def api(
+        *, native_status: int = 0, dos_error: int = 0
+    ) -> tuple[
+        Kernel32Api,
+        _RecordingKernel32RenameApi,
+        _RecordingNtdllRenameApi,
+    ]:
+        api = object.__new__(Kernel32Api)
+        kernel32 = _RecordingKernel32RenameApi()
+        ntdll = _RecordingNtdllRenameApi(
+            status=native_status,
+            dos_error=dos_error,
+        )
+        api.kernel32 = kernel32
+        api.ntdll = ntdll
+        return api, kernel32, ntdll
+
+    def test_relative_rename_uses_native_contract_and_retained_parent(self) -> None:
+        api, kernel32, ntdll = self.api()
+
+        api.rename_relative(101, 201, "owner.json", replace=False)
+        api.rename_relative(102, 202, "current.json", replace=True)
+
+        self.assertEqual(kernel32.rename_calls, [])
+        self.assertEqual(
+            [(handle, kind) for handle, kind, _payload in ntdll.rename_calls],
+            [(101, 10), (102, 65)],
+        )
+
+        legacy_payload = ntdll.rename_calls[0][2]
+        legacy = _ExpectedFileRenameInformation.from_buffer_copy(legacy_payload)
+        legacy_name_offset = _ExpectedFileRenameInformation.FileName.offset
+        legacy_name = legacy_payload[
+            legacy_name_offset : legacy_name_offset + legacy.FileNameLength
+        ]
+        self.assertEqual(legacy.ReplaceIfExists, 0)
+        self.assertEqual(legacy.RootDirectory, 201)
+        self.assertEqual(legacy.FileNameLength, len(legacy_name))
+        self.assertEqual(
+            len(legacy_payload),
+            ctypes.sizeof(_ExpectedFileRenameInformation) + len(legacy_name),
+        )
+        self.assertEqual(legacy_name.decode("utf-16-le"), "owner.json")
+
+        extended_payload = ntdll.rename_calls[1][2]
+        extended = _ExpectedFileRenameInformationEx.from_buffer_copy(
+            extended_payload
+        )
+        extended_name_offset = _ExpectedFileRenameInformationEx.FileName.offset
+        extended_name = extended_payload[
+            extended_name_offset : extended_name_offset + extended.FileNameLength
+        ]
+        self.assertEqual(extended.Flags, 0x00000003)
+        self.assertEqual(extended.RootDirectory, 202)
+        self.assertEqual(extended.FileNameLength, len(extended_name))
+        self.assertEqual(
+            len(extended_payload),
+            ctypes.sizeof(_ExpectedFileRenameInformationEx)
+            + len(extended_name),
+        )
+        self.assertEqual(extended_name.decode("utf-16-le"), "current.json")
+
+    def test_relative_rename_maps_native_collision_for_cas(self) -> None:
+        status_object_name_collision = -1073741771
+        api, kernel32, ntdll = self.api(
+            native_status=status_object_name_collision,
+            dos_error=183,
+        )
+
+        with self.assertRaises(FileExistsError):
+            api.rename_relative(101, 201, "owner.json", replace=False)
+
+        self.assertEqual(kernel32.rename_calls, [])
+        self.assertEqual(
+            ntdll.status_conversions,
+            [status_object_name_collision],
+        )
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows")
+class NativeKernel32ApiTest(unittest.TestCase):
+    def test_relative_rename_publishes_and_replaces_with_retained_parent(self) -> None:
+        api = Kernel32Api()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent_handle = api.create_file(
+                str(root),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL
+                | FILE_FLAG_BACKUP_SEMANTICS
+                | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            try:
+                for source_name, target_name, replace in (
+                    ("source-new.json", "published.json", False),
+                    ("source-replace.json", "current.json", True),
+                ):
+                    source = root / source_name
+                    target = root / target_name
+                    source.write_bytes(source_name.encode("ascii"))
+                    if replace:
+                        target.write_bytes(b"old")
+                    source_handle = api.create_file(
+                        str(source),
+                        DELETE | GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    )
+                    try:
+                        api.rename_relative(
+                            source_handle,
+                            parent_handle,
+                            target_name,
+                            replace=replace,
+                        )
+                    finally:
+                        api.close(source_handle)
+                    self.assertFalse(source.exists())
+                    self.assertEqual(target.read_bytes(), source_name.encode("ascii"))
+            finally:
+                api.close(parent_handle)
 
 
 class FakeWindowsApi:

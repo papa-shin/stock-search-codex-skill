@@ -40,9 +40,7 @@ _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_ID_BOTH_DIRECTORY_INFO = 10
 _FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11
 _FILE_ID_INFO = 18
-_FILE_RENAME_INFO = 3
 _FILE_DISPOSITION_INFO = 4
-_FILE_RENAME_INFO_EX = 22
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _FILE_OPEN = 1
 _FILE_CREATE = 2
@@ -59,6 +57,9 @@ _MAX_DIRECTORY_QUERY_CALLS = 64
 _MAX_DIRECTORY_ENTRIES = 4096
 _FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
 _FILE_RENAME_POSIX_SEMANTICS = 0x00000002
+# Native FILE_INFORMATION_CLASS values, not FILE_INFO_BY_HANDLE_CLASS values.
+_FILE_RENAME_INFORMATION = 10
+_FILE_RENAME_INFORMATION_EX = 65
 
 
 class WindowsFilesystemError(OSError):
@@ -175,21 +176,21 @@ class _FILE_DISPOSITION_INFO_STRUCT(ctypes.Structure):
     _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
-class _FILE_RENAME_INFO_HEADER(ctypes.Structure):
+class _FILE_RENAME_INFORMATION_HEADER(ctypes.Structure):
     _fields_ = [
         ("ReplaceIfExists", ctypes.c_ubyte),
         ("RootDirectory", ctypes.c_void_p),
-        ("FileNameLength", ctypes.c_ulong),
-        ("FileName", ctypes.c_wchar * 1),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
     ]
 
 
-class _FILE_RENAME_INFO_EX_HEADER(ctypes.Structure):
+class _FILE_RENAME_INFORMATION_EX_HEADER(ctypes.Structure):
     _fields_ = [
-        ("Flags", ctypes.c_ulong),
+        ("Flags", ctypes.c_uint32),
         ("RootDirectory", ctypes.c_void_p),
-        ("FileNameLength", ctypes.c_ulong),
-        ("FileName", ctypes.c_wchar * 1),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
     ]
 
 
@@ -309,6 +310,14 @@ class Kernel32Api:
             wintypes.ULONG,
         ]
         self.ntdll.NtCreateFile.restype = wintypes.LONG
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IO_STATUS_BLOCK),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        self.ntdll.NtSetInformationFile.restype = wintypes.LONG
         self.ntdll.RtlNtStatusToDosError.argtypes = [wintypes.LONG]
         self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
@@ -523,13 +532,17 @@ class Kernel32Api:
         header_type: type[ctypes.Structure]
         information_class: int
         if replace:
-            header_type = _FILE_RENAME_INFO_EX_HEADER
-            information_class = _FILE_RENAME_INFO_EX
+            header_type = _FILE_RENAME_INFORMATION_EX_HEADER
+            information_class = _FILE_RENAME_INFORMATION_EX
         else:
-            header_type = _FILE_RENAME_INFO_HEADER
-            information_class = _FILE_RENAME_INFO
+            header_type = _FILE_RENAME_INFORMATION_HEADER
+            information_class = _FILE_RENAME_INFORMATION
         name_offset = header_type.FileName.offset
-        buffer = ctypes.create_string_buffer(name_offset + len(encoded))
+        # NtSetInformationFile expects the complete fixed header in addition to
+        # the variable-length UTF-16 name, including the structure's tail
+        # padding.  Using only ``FileName.offset`` produces an undersized x64
+        # record and is rejected with STATUS_INVALID_PARAMETER.
+        buffer = ctypes.create_string_buffer(ctypes.sizeof(header_type) + len(encoded))
         header = header_type.from_buffer(buffer)
         if replace:
             header.Flags = (
@@ -540,10 +553,17 @@ class Kernel32Api:
         header.RootDirectory = parent_handle
         header.FileNameLength = len(encoded)
         ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded, len(encoded))
-        if not self.kernel32.SetFileInformationByHandle(
-            handle, information_class, buffer, len(buffer)
-        ):
-            self._raise("relative handle rename failed")
+        io_status = _IO_STATUS_BLOCK()
+        status = self.ntdll.NtSetInformationFile(
+            handle,
+            ctypes.byref(io_status),
+            buffer,
+            len(buffer),
+            information_class,
+        )
+        if status < 0:
+            code = int(self.ntdll.RtlNtStatusToDosError(status))
+            self._raise_code(code, "relative handle rename failed")
 
     def dispose(self, handle: int) -> None:
         value = _FILE_DISPOSITION_INFO_STRUCT(1)
