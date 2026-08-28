@@ -340,6 +340,67 @@ class StockCacheTest(unittest.TestCase):
         )
         self.assertEqual(marker.read_bytes(), displaced.read_bytes())
 
+    @unittest.skipUnless(os.name == "posix", "dirfd identity проверяется на POSIX")
+    def test_same_token_marker_replacement_after_last_read_fails_closed(self) -> None:
+        root = Path(self.temp_dir.name) / "same-token-after-last-read"
+        root.mkdir()
+        initial = cache_module._attest_cache_root(root, create=True)
+        initial.close()
+        marker = root / ".papa-shin-stock-cache-root.json"
+        parked = root / ".original-cache-root-marker"
+        original_payload = marker.read_bytes()
+        real_read = cache_module._read_cache_root_marker
+        replaced_identity: os.stat_result | None = None
+        reads = 0
+
+        def replace_after_read(path: Path, descriptor: int | None) -> object:
+            nonlocal reads, replaced_identity
+            evidence = real_read(path, descriptor)
+            reads += 1
+            if reads == 1:
+                os.replace(marker, parked)
+                marker.write_bytes(original_payload)
+                os.chmod(marker, 0o600)
+                replaced_identity = marker.stat()
+            return evidence
+
+        with patch.object(
+            cache_module,
+            "_read_cache_root_marker",
+            side_effect=replace_after_read,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=False)
+
+        self.assertEqual(marker.read_bytes(), original_payload)
+        self.assertIsNotNone(replaced_identity)
+        self.assertTrue(
+            cache_module._same_file_identity(marker.stat(), replaced_identity)
+        )
+
+    @unittest.skipUnless(os.name == "posix", "dirfd identity проверяется на POSIX")
+    def test_same_token_marker_replacement_after_attestation_fails_closed(self) -> None:
+        root = Path(self.temp_dir.name) / "same-token-after-attestation"
+        root.mkdir()
+        attestation = cache_module._attest_cache_root(root, create=True)
+        self.addCleanup(attestation.close)
+        marker = root / ".papa-shin-stock-cache-root.json"
+        parked = root / ".original-cache-root-marker"
+        original_payload = marker.read_bytes()
+
+        os.replace(marker, parked)
+        marker.write_bytes(original_payload)
+        os.chmod(marker, 0o600)
+        replacement_identity = marker.stat()
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            attestation.assert_current()
+
+        self.assertTrue(
+            cache_module._same_file_identity(marker.stat(), replacement_identity)
+        )
+        self.assertEqual(marker.read_bytes(), original_payload)
+
     def test_marker_inserted_during_initialization_is_preserved_fail_closed(
         self,
     ) -> None:
@@ -440,7 +501,8 @@ class StockCacheTest(unittest.TestCase):
 
         self.assertGreater(writes, 1)
         self.assertRegex(
-            cache_module._read_cache_root_marker(root, None), r"^[0-9a-f]{32}$"
+            cache_module._read_cache_root_marker(root, None).ownership_token,
+            r"^[0-9a-f]{32}$",
         )
 
     def test_marker_replacement_during_validation_is_not_deleted(self) -> None:

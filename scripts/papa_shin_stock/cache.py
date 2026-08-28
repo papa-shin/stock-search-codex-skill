@@ -109,12 +109,16 @@ class CacheRootAttestation:
         root: Path,
         descriptor: int | None,
         identity: os.stat_result,
-        ownership_token: str,
+        marker_evidence: _PublishedCacheRootMarker,
     ) -> None:
         self.root = root
         self.descriptor = descriptor
         self.identity = identity
-        self.ownership_token = ownership_token
+        self.marker_evidence = marker_evidence
+
+    @property
+    def ownership_token(self) -> str:
+        return self.marker_evidence.ownership_token
 
     def assert_current(self) -> None:
         try:
@@ -131,8 +135,17 @@ class CacheRootAttestation:
                 or not _same_file_identity(self.identity, observed)
             ):
                 raise _cache_unavailable()
-            token = _read_cache_root_marker(self.root, self.descriptor)
-            if token != self.ownership_token:
+            marker_evidence = _read_cache_root_marker(self.root, self.descriptor)
+            if marker_evidence != self.marker_evidence:
+                raise _cache_unavailable()
+            confirmed_root = self.root.lstat()
+            if (
+                not stat.S_ISDIR(confirmed_root.st_mode)
+                or _is_windows_directory_reparse_point(
+                    self.root, confirmed_root
+                )
+                or not _same_file_identity(self.identity, confirmed_root)
+            ):
                 raise _cache_unavailable()
         except StockError:
             raise
@@ -2790,13 +2803,13 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
                 raise _cache_unavailable()
             pinned = hardened
             published_marker = _publish_cache_root_marker(root, descriptor)
-            token = _assert_published_cache_root_marker(
+            marker_evidence = _assert_published_cache_root_marker(
                 descriptor, published_marker
             )
             initialized_now = True
         else:
             published_marker = None
-            token = _read_cache_root_marker(root, descriptor)
+            marker_evidence = _read_cache_root_marker(root, descriptor)
         if initialized_now and not _cache_root_inventory_is_initialization_safe(
             descriptor
         ):
@@ -2812,23 +2825,25 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
         if initialized_now:
             if published_marker is None:
                 raise _cache_unavailable()
-            token = _assert_published_cache_root_marker(
+            marker_evidence = _assert_published_cache_root_marker(
                 descriptor, published_marker
             )
             provisional_attestation = CacheRootAttestation(
-                root, descriptor, pinned, token
+                root, descriptor, pinned, marker_evidence
             )
             provisional_attestation.assert_current()
             if not _cache_root_inventory_is_initialization_safe(descriptor):
                 raise _cache_unavailable()
-            token = _assert_published_cache_root_marker(
+            marker_evidence = _assert_published_cache_root_marker(
                 descriptor, published_marker
             )
             provisional_attestation.assert_current()
         if initialization_locked:
             _fcntl.flock(descriptor, _fcntl.LOCK_UN)
             initialization_locked = False
-        attestation = CacheRootAttestation(root, descriptor, pinned, token)
+        attestation = CacheRootAttestation(
+            root, descriptor, pinned, marker_evidence
+        )
         attestation.assert_current()
         descriptor = None
         return attestation
@@ -2950,7 +2965,7 @@ def _publish_cache_root_marker(
 
 def _assert_published_cache_root_marker(
     root_descriptor: int, evidence: _PublishedCacheRootMarker
-) -> str:
+) -> _PublishedCacheRootMarker:
     file_descriptor = -1
     try:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -2977,15 +2992,26 @@ def _assert_published_cache_root_marker(
         payload = os.read(file_descriptor, _CACHE_ROOT_MARKER_MAX_BYTES + 1)
         token = _parse_cache_root_marker_payload(payload)
         confirmed = os.fstat(file_descriptor)
+        canonical = os.stat(
+            _CACHE_ROOT_MARKER_NAME,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
         if (
             confirmed.st_dev != evidence.device
             or confirmed.st_ino != evidence.inode
             or stat.S_IFMT(confirmed.st_mode) != evidence.file_type
             or confirmed.st_nlink != evidence.link_count
+            or canonical.st_dev != evidence.device
+            or canonical.st_ino != evidence.inode
+            or stat.S_IFMT(canonical.st_mode) != evidence.file_type
+            or canonical.st_nlink != evidence.link_count
+            or stat.S_IMODE(confirmed.st_mode) != _PRIVATE_FILE_MODE
+            or stat.S_IMODE(canonical.st_mode) != _PRIVATE_FILE_MODE
             or token != evidence.ownership_token
         ):
             raise _cache_unavailable()
-        return token
+        return evidence
     except StockError:
         raise
     except (
@@ -3036,7 +3062,9 @@ def _parse_cache_root_marker_payload(payload: bytes) -> str:
     return token
 
 
-def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:
+def _read_cache_root_marker(
+    root: Path, descriptor: int | None
+) -> _PublishedCacheRootMarker:
     marker_path = root / _CACHE_ROOT_MARKER_NAME
     file_descriptor = -1
     try:
@@ -3078,9 +3106,39 @@ def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:
         payload = os.read(file_descriptor, _CACHE_ROOT_MARKER_MAX_BYTES + 1)
         token = _parse_cache_root_marker_payload(payload)
         confirmed = os.fstat(file_descriptor)
-        if not _same_file_identity(opened, confirmed) or confirmed.st_nlink != 1:
+        canonical = (
+            os.stat(
+                _CACHE_ROOT_MARKER_NAME,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if descriptor is not None
+            else marker_path.lstat()
+        )
+        if (
+            not _same_file_identity(opened, confirmed)
+            or confirmed.st_nlink != 1
+            or not stat.S_ISREG(confirmed.st_mode)
+            or (
+                os.name == "posix"
+                and stat.S_IMODE(confirmed.st_mode) != _PRIVATE_FILE_MODE
+            )
+            or not _same_file_identity(confirmed, canonical)
+            or stat.S_IFMT(canonical.st_mode) != stat.S_IFREG
+            or canonical.st_nlink != 1
+            or (
+                os.name == "posix"
+                and stat.S_IMODE(canonical.st_mode) != _PRIVATE_FILE_MODE
+            )
+        ):
             raise _cache_unavailable()
-        return token
+        return _PublishedCacheRootMarker(
+            ownership_token=token,
+            device=confirmed.st_dev,
+            inode=confirmed.st_ino,
+            file_type=stat.S_IFMT(confirmed.st_mode),
+            link_count=confirmed.st_nlink,
+        )
     except StockError:
         raise
     except (
