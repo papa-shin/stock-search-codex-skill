@@ -2960,16 +2960,33 @@ def _publish_cache_root_marker(root: Path, descriptor: int | None) -> str:
 def _unlink_cache_root_initializer_temp_if_identity(
     descriptor: int, name: str, expected: os.stat_result
 ) -> None:
-    observed = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
     if (
-        not stat.S_ISREG(expected.st_mode)
-        or not stat.S_ISREG(observed.st_mode)
+        Path(name).name != name
+        or name in {"", ".", ".."}
+        or not stat.S_ISREG(expected.st_mode)
         or expected.st_nlink not in {1, 2}
-        or observed.st_nlink != expected.st_nlink
-        or not _same_file_identity(expected, observed)
     ):
         raise _cache_unavailable()
-    os.unlink(name, dir_fd=descriptor)
+    quarantine = (
+        f".papa-shin-stock-cache-root.init-cleanup-{uuid.uuid4().hex}.tmp"
+    )
+    os.rename(
+        name,
+        quarantine,
+        src_dir_fd=descriptor,
+        dst_dir_fd=descriptor,
+    )
+    moved = os.stat(quarantine, dir_fd=descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(moved.st_mode)
+        or moved.st_nlink != expected.st_nlink
+        or not _same_file_identity(expected, moved)
+    ):
+        # A replacement is foreign. Retaining one unique quarantine fails closed;
+        # retrying the now-absent source cannot create an unbounded orphan chain.
+        raise _cache_unavailable()
+    os.unlink(quarantine, dir_fd=descriptor)
+    _fsync_directory_descriptor(descriptor)
 
 
 def _unlink_cache_root_marker_if_token(

@@ -394,8 +394,79 @@ class StockCacheTest(unittest.TestCase):
                 cache_module._attest_cache_root(root, create=True)
 
         self.assertIsNotNone(replacement_name)
-        self.assertEqual((root / replacement_name).read_bytes(), foreign_payload)
+        self.assertFalse((root / replacement_name).exists())
+        quarantines = list(
+            root.glob(".papa-shin-stock-cache-root.init-cleanup-*.tmp")
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), foreign_payload)
         self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
+
+    def test_initializer_temp_swap_at_destructive_step_is_quarantined(self) -> None:
+        root = Path(self.temp_dir.name) / "initializer-temp-unlink-race"
+        root.mkdir(mode=0o700)
+        candidate_name = ".papa-shin-stock-cache-root.init-" + "d" * 32 + ".tmp"
+        candidate = root / candidate_name
+        candidate.write_bytes(b"owned initializer")
+        os.chmod(candidate, 0o600)
+        expected = candidate.stat()
+        parked = root / f"{candidate_name}.owned"
+        foreign_payload = b"foreign replacement"
+        real_rename = os.rename
+        swapped = False
+
+        def swap_before_destructive_rename(
+            source: str,
+            destination: str,
+            **kwargs: object,
+        ) -> None:
+            nonlocal swapped
+            if source == candidate_name and not swapped:
+                swapped = True
+                descriptor = kwargs["src_dir_fd"]
+                self.assertIsInstance(descriptor, int)
+                real_rename(
+                    source,
+                    parked.name,
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                )
+                replacement_descriptor = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=descriptor,
+                )
+                try:
+                    os.write(replacement_descriptor, foreign_payload)
+                finally:
+                    os.close(replacement_descriptor)
+            real_rename(source, destination, **kwargs)
+
+        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            with patch.object(
+                cache_module.os,
+                "rename",
+                side_effect=swap_before_destructive_rename,
+            ):
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    cache_module._unlink_cache_root_initializer_temp_if_identity(
+                        descriptor,
+                        candidate_name,
+                        expected,
+                    )
+        finally:
+            os.close(descriptor)
+
+        self.assertTrue(swapped)
+        self.assertEqual(parked.read_bytes(), b"owned initializer")
+        self.assertFalse(candidate.exists())
+        quarantines = list(
+            root.glob(".papa-shin-stock-cache-root.init-cleanup-*.tmp")
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), foreign_payload)
 
     def test_insertion_after_root_hardening_blocks_initialization(self) -> None:
         root = Path(self.temp_dir.name) / "late-post-hardening-insertion"
