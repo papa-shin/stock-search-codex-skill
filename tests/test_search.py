@@ -4,13 +4,15 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
@@ -991,6 +993,142 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         files = StockCache(self.cache_root, object()).current_generation()
         query = SearchQuery.from_args(argparse.Namespace())
         return StockSearcher(files, self.config).search(query).to_public_dict()
+
+    def _write_generation(self, directory_name: str, generation_id: str) -> Path:
+        directory = self.cache_root / "generations" / directory_name
+        directory.mkdir()
+        products = (FIXTURES_DIR / "products.jsonl").read_bytes().replace(
+            b"synthetic-generation", generation_id.encode("ascii")
+        )
+        offers = (FIXTURES_DIR / "offers.jsonl").read_bytes().replace(
+            b"synthetic-generation", generation_id.encode("ascii")
+        )
+        manifest = {
+            "generation_id": generation_id,
+            "generated_at": "2026-08-27T11:00:00+00:00",
+            "files": {
+                "products": {
+                    "url": "products.jsonl",
+                    "bytes": len(products),
+                    "sha256": hashlib.sha256(products).hexdigest(),
+                },
+                "offers": {
+                    "url": "offers.jsonl",
+                    "bytes": len(offers),
+                    "sha256": hashlib.sha256(offers).hexdigest(),
+                },
+            },
+        }
+        (directory / "manifest.json").write_text(
+            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+        )
+        (directory / "products.jsonl").write_bytes(products)
+        (directory / "offers.jsonl").write_bytes(offers)
+        (directory / "state.json").write_text(
+            json.dumps(
+                {
+                    "generation_id": generation_id,
+                    "generated_at": "2026-08-27T11:00:00+00:00",
+                    "checked_at": "2026-08-27T11:01:00+00:00",
+                    "manifest_etag": None,
+                    "manifest_last_modified": None,
+                    "stale": False,
+                    "warning_code": None,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    def test_generation_snapshot_survives_cleanup_and_new_search_uses_successor(
+        self,
+    ) -> None:
+        cache = StockCache(self.cache_root, object())
+        query = SearchQuery.from_args(argparse.Namespace())
+
+        with cache.generation_snapshot() as snapshot_a:
+            generation_b = self._write_generation(
+                "generation-successor", "synthetic-generation-b"
+            )
+            (self.cache_root / "current.json").write_text(
+                json.dumps(
+                    {
+                        "generation_id": "synthetic-generation-b",
+                        "directory_name": generation_b.name,
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            shutil.rmtree(self.generation)
+
+            result_a = StockSearcher(snapshot_a, self.config).search(query)
+
+        with cache.generation_snapshot() as snapshot_b:
+            result_b = StockSearcher(snapshot_b, self.config).search(query)
+
+        self.assertEqual(result_a.generation["id"], "synthetic-generation")
+        self.assertEqual(result_b.generation["id"], "synthetic-generation-b")
+        self.assertEqual(result_a.summary, result_b.summary)
+
+    def test_generation_snapshot_closes_every_partial_open_on_failure(self) -> None:
+        opened: list[int] = []
+        real_open = cache_module._open_private_child_regular_file
+
+        def fail_after_products(parent_descriptor: int, name: str) -> int:
+            if name == "offers.jsonl":
+                raise OSError("synthetic snapshot open failure")
+            descriptor = real_open(parent_descriptor, name)
+            opened.append(descriptor)
+            return descriptor
+
+        with patch.object(
+            cache_module,
+            "_open_private_child_regular_file",
+            side_effect=fail_after_products,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                StockCache(self.cache_root, object()).generation_snapshot()
+
+        self.assertGreaterEqual(len(opened), 2)
+        for descriptor in opened:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_generation_snapshot_rejects_oversized_pointer_before_parsing(self) -> None:
+        (self.cache_root / "current.json").write_text(
+            json.dumps(
+                {
+                    "generation_id": "synthetic-generation",
+                    "directory_name": "g" * (cache_module._WINDOWS_POINTER_MAX_BYTES + 1),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            cache_module.CurrentPointer,
+            "from_value",
+            side_effect=AssertionError("oversized pointer was parsed"),
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                StockCache(self.cache_root, object()).generation_snapshot()
+
+    @unittest.skipUnless(hasattr(os, "link"), "hard links are required")
+    def test_generation_snapshot_rejects_hardlinked_payload_without_chmod(self) -> None:
+        external = Path(self.temp_dir.name) / "external-products.jsonl"
+        external.write_bytes((self.generation / "products.jsonl").read_bytes())
+        external.chmod(0o644)
+        original_mode = stat.S_IMODE(external.stat().st_mode)
+        products = self.generation / "products.jsonl"
+        products.unlink()
+        os.link(external, products)
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, object()).generation_snapshot()
+
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), original_mode)
 
     def runtime_status_path(self) -> Path:
         return self.cache_root / ".runtime-status-generation-existing.json"
@@ -2113,8 +2251,8 @@ class SearchStockCliTest(unittest.TestCase):
             with patch.object(search_stock.StockConfig, "load", return_value=config):
                 with patch.object(
                     search_stock.StockCache,
-                    "current_generation",
-                    return_value=files,
+                    "generation_snapshot",
+                    return_value=nullcontext(files),
                 ):
                     with redirect_stdout(output), redirect_stderr(errors):
                         exit_code = search_stock.main([])
@@ -2189,8 +2327,8 @@ class SearchStockCliTest(unittest.TestCase):
             with patch.object(search_stock.StockConfig, "load", return_value=config):
                 with patch.object(
                     search_stock.StockCache,
-                    "current_generation",
-                    return_value=files,
+                    "generation_snapshot",
+                    return_value=nullcontext(files),
                 ):
                     with redirect_stdout(output), redirect_stderr(errors):
                         exit_code = search_stock.main([])
@@ -2342,8 +2480,8 @@ class SearchStockCliTest(unittest.TestCase):
                     with patch.object(search_stock.StockConfig, "load", return_value=config):
                         with patch.object(
                             search_stock.StockCache,
-                            "current_generation",
-                            return_value=files,
+                            "generation_snapshot",
+                            return_value=nullcontext(files),
                         ):
                             with redirect_stdout(stdout), redirect_stderr(stderr):
                                 exit_code = search_stock.main(["--max-price", raw])

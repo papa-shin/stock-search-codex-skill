@@ -1381,7 +1381,10 @@ class WindowsFilesystem:
         pin_namespace: bool = False,
         immutable: bool = False,
         movable: bool = False,
+        snapshot: bool = False,
     ) -> VerifiedHandle:
+        if snapshot and (destructive or writable or pin_namespace or immutable or movable):
+            raise WindowsFilesystemError("snapshot handle must be read-only")
         if writable and immutable:
             raise WindowsFilesystemError("immutable handle cannot be writable")
         if movable and pin_namespace:
@@ -1397,9 +1400,9 @@ class WindowsFilesystem:
         if writable:
             access |= GENERIC_WRITE | FILE_WRITE_ATTRIBUTES
         share = FILE_SHARE_READ
-        if not immutable:
+        if not immutable and (not snapshot or directory):
             share |= FILE_SHARE_WRITE
-        if movable or (not destructive and not pin_namespace and not immutable):
+        if snapshot or movable or (not destructive and not pin_namespace and not immutable):
             share |= FILE_SHARE_DELETE
         flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
@@ -1428,6 +1431,28 @@ class WindowsFilesystem:
             )
         except BaseException:
             self.api.close(handle)
+            raise
+
+    def open_snapshot_chain(
+        self,
+        root: VerifiedHandle,
+        parts: tuple[str, ...],
+    ) -> list[VerifiedHandle]:
+        """Open an object-bound read chain that permits concurrent cleanup."""
+        current = root
+        opened: list[VerifiedHandle] = []
+        try:
+            for name in parts:
+                current = self.open_child(
+                    current,
+                    name,
+                    directory=True,
+                    snapshot=True,
+                )
+                opened.append(current)
+            return opened
+        except BaseException:
+            WindowsCacheRoot._close_directory_chain(opened)
             raise
 
     def _initialize_marker_handle(

@@ -173,6 +173,26 @@ class Kernel32ApiTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "requires native Windows")
 class NativeKernel32ApiTest(unittest.TestCase):
+    def test_snapshot_handle_reads_original_after_path_is_replaced(self) -> None:
+        filesystem = WindowsFilesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            source = root_path / "products.jsonl"
+            moved = root_path / "products.old"
+            source.write_bytes(b"generation-a")
+            with filesystem.open_verified(root_path, directory=True) as root:
+                with filesystem.open_child(
+                    root,
+                    source.name,
+                    directory=False,
+                    snapshot=True,
+                ) as snapshot:
+                    os.replace(source, moved)
+                    source.write_bytes(b"generation-b")
+                    self.assertEqual(
+                        filesystem.api.read(snapshot.handle, 64), b"generation-a"
+                    )
+
     def test_relative_rename_publishes_and_replaces_with_retained_parent(self) -> None:
         api = Kernel32Api()
         with tempfile.TemporaryDirectory() as temporary:
@@ -751,6 +771,56 @@ class WindowsFilesystemTest(unittest.TestCase):
         self.assertEqual(share, FILE_SHARE_READ | FILE_SHARE_WRITE)
         self.assertEqual(share & FILE_SHARE_DELETE, 0)
         self.assertEqual(flags & FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT)
+
+    def test_snapshot_child_is_read_only_and_shares_read_and_delete_only(self) -> None:
+        source = self.root + r"\products.jsonl"
+        self.api.add_file(source, (7, 171), b"generation-a")
+
+        with self.fs.open_verified(self.root, directory=True) as root:
+            with self.fs.open_child(
+                root, "products.jsonl", directory=False, snapshot=True
+            ):
+                pass
+
+        _, name, access, share, _, _ = self.api.child_open_calls[-1]
+        self.assertEqual(name, "products.jsonl")
+        self.assertEqual(access & GENERIC_READ, GENERIC_READ)
+        self.assertEqual(access & (GENERIC_WRITE | DELETE), 0)
+        self.assertEqual(share, FILE_SHARE_READ | FILE_SHARE_DELETE)
+
+    def test_snapshot_directory_shares_writes_for_concurrent_refresh(self) -> None:
+        generations = self.root + r"\generations"
+        self.api.add_directory(generations, (7, 173))
+
+        with self.fs.open_verified(self.root, directory=True) as root:
+            with self.fs.open_child(
+                root, "generations", directory=True, snapshot=True
+            ):
+                pass
+
+        _, name, access, share, _, _ = self.api.child_open_calls[-1]
+        self.assertEqual(name, "generations")
+        self.assertEqual(access & GENERIC_READ, GENERIC_READ)
+        self.assertEqual(access & (GENERIC_WRITE | DELETE), 0)
+        self.assertEqual(
+            share,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+
+    def test_snapshot_chain_closes_partial_open_in_reverse(self) -> None:
+        generations = self.root + r"\generations"
+        self.api.add_directory(generations, (7, 172))
+
+        with self.fs.open_verified(self.root, directory=True) as root:
+            before = len(self.api.close_calls)
+            with self.assertRaises(FileNotFoundError):
+                self.fs.open_snapshot_chain(
+                    root, ("generations", "missing-generation")
+                )
+
+        closed = self.api.close_calls[before:]
+        self.assertGreaterEqual(len(closed), 2)
+        self.assertGreater(closed[0], closed[-1])
 
     def test_directory_open_uses_backup_semantics_and_rejects_reparse(self) -> None:
         junction = self.root + r"\junction"

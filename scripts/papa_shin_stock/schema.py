@@ -15,6 +15,7 @@ from pathlib import Path
 
 from papa_shin_stock.cache import (
     GenerationFiles,
+    GenerationSnapshot,
     load_runtime_status,
 )
 from papa_shin_stock.config import StockConfig
@@ -420,13 +421,13 @@ class _Spool:
         except (sqlite3.Error,OSError,ValueError,TypeError,OverflowError,RecursionError,InvalidOperation) as error: raise _spool_unavailable() from error
 
 class StockSearcher:
-    def __init__(self, files: GenerationFiles, config: StockConfig) -> None: self.files=files; self.config=config
+    def __init__(self, files: GenerationFiles | GenerationSnapshot, config: StockConfig) -> None: self.files=files; self.config=config
     def search(self, query: SearchQuery) -> SearchResult:
         with _Spool() as spool:
             generation,warnings=_generation(self.files)
             integrity = self.files.integrity
             for row in _rows(
-                self.files.products,
+                ((self.files, "products") if isinstance(self.files, GenerationSnapshot) else self.files.products),
                 MAX_PRODUCT_ROWS,
                 integrity.products_bytes if integrity is not None else None,
                 integrity.products_sha256 if integrity is not None else None,
@@ -434,7 +435,7 @@ class StockSearcher:
                 assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
                 if _match_product(product,row,query): spool.add_product(product)
             for row in _rows(
-                self.files.offers,
+                ((self.files, "offers") if isinstance(self.files, GenerationSnapshot) else self.files.offers),
                 MAX_OFFER_ROWS,
                 integrity.offers_bytes if integrity is not None else None,
                 integrity.offers_sha256 if integrity is not None else None,
@@ -446,7 +447,7 @@ class StockSearcher:
             summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
 
 def _rows(
-    path: Path,
+    path: Path | tuple[GenerationSnapshot, str],
     maximum_rows: int,
     expected_bytes: int | None = None,
     expected_sha256: str | None = None,
@@ -456,7 +457,12 @@ def _rows(
             raise _cache_unavailable()
         digest = hashlib.sha256() if expected_sha256 is not None else None
         received = 0
-        with path.open("rb") as stream:
+        source = (
+            path[0].open_payload(path[1])
+            if isinstance(path, tuple)
+            else path.open("rb")
+        )
+        with source as stream:
             row_count = 0
             while True:
                 raw = stream.readline(MAX_JSONL_LINE_BYTES + 2)
@@ -505,20 +511,23 @@ def _rows(
     except StockError: raise
     except OSError as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
 
-def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
+def _generation(files: GenerationFiles | GenerationSnapshot) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
     try:
-        manifest_payload=files.manifest.read_bytes()
+        manifest_payload=(files.manifest_payload if isinstance(files,GenerationSnapshot) else files.manifest.read_bytes())
         if files.integrity is not None and hashlib.sha256(manifest_payload).hexdigest()!=files.integrity.manifest_sha256: raise _cache_unavailable()
         manifest=_parse(manifest_payload.decode("utf-8"))
     except (OSError,UnicodeError,ValueError,TypeError,OverflowError,RecursionError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
     generated_at=manifest.get("generated_at") if isinstance(manifest,dict) else None
     if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not is_bounded_unicode_scalar(files.generation_id) or not is_iso_8601_timestamp(generated_at) or (files.integrity is not None and generated_at!=files.integrity.generated_at): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
-    path=files.runtime_status or files.manifest.parent/"state.json"
-    if path.exists() or files.runtime_status is not None:
-        state=load_runtime_status(path,files.generation_id)
-        checked_at=state.checked_at; stale=state.stale; code=state.warning_code
+    if isinstance(files,GenerationSnapshot):
+        checked_at=files.checked_at; stale=files.stale; code=files.warning_code
     else:
-        checked_at=generated_at; stale=False; code=None
+        path=files.runtime_status or files.manifest.parent/"state.json"
+        if path.exists() or files.runtime_status is not None:
+            state=load_runtime_status(path,files.generation_id)
+            checked_at=state.checked_at; stale=state.stale; code=state.warning_code
+        else:
+            checked_at=generated_at; stale=False; code=None
     return {"id":files.generation_id,"generated_at":generated_at,"checked_at":checked_at,"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and code is not None else ())
 
 def _product(row: dict[str,object], ident: str) -> Product:

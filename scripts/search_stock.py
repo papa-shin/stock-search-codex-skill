@@ -55,8 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
 def search_default(namespace: argparse.Namespace) -> dict[str, object]:
     query = SearchQuery.from_args(namespace)
     config = StockConfig.load()
-    files = StockCache(config.cache_dir, SafeHttpClient.for_config(config)).current_generation()
-    return StockSearcher(files, config).search(query).to_public_dict()
+    cache = StockCache(config.cache_dir, SafeHttpClient.for_config(config))
+    with cache.generation_snapshot() as snapshot:
+        return StockSearcher(snapshot, config).search(query).to_public_dict()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,6 +155,107 @@ class GenerationFiles:
                     os.close(descriptor)
             except (OSError, StockError) as error:
                 raise _cache_unavailable() from error
+
+
+class _WindowsSnapshotRaw(io.RawIOBase):
+    def __init__(self, handle: Any) -> None:
+        super().__init__()
+        self._handle = handle
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        payload = self._handle.api.read(self._handle.handle, len(buffer))
+        buffer[: len(payload)] = payload
+        return len(payload)
+
+
+class GenerationSnapshot:
+    """Object-bound, coherent view of one generation for a complete search."""
+
+    def __init__(
+        self,
+        files: GenerationFiles,
+        manifest_payload: bytes,
+        *,
+        checked_at: str,
+        stale: bool,
+        warning_code: str | None,
+        payload_handles: dict[str, object],
+        retained: list[object],
+    ) -> None:
+        self.generation_id = files.generation_id
+        self.integrity = files.integrity
+        self.files = files
+        self.manifest_payload = manifest_payload
+        self.checked_at = checked_at
+        self.stale = stale
+        self.warning_code = warning_code
+        self._payload_handles = payload_handles
+        self._retained = retained
+        self._opened: set[str] = set()
+        self._closed = False
+
+    @contextmanager
+    def open_payload(self, name: str):
+        if self._closed or name not in {"products", "offers"}:
+            raise _cache_unavailable()
+        if name in self._opened:
+            raise _cache_unavailable()
+        self._opened.add(name)
+        handle = self._payload_handles[name]
+        try:
+            if isinstance(handle, int):
+                duplicate = os.dup(handle)
+                try:
+                    os.lseek(duplicate, 0, os.SEEK_SET)
+                    with os.fdopen(duplicate, "rb") as stream:
+                        duplicate = -1
+                        yield stream
+                finally:
+                    if duplicate >= 0:
+                        os.close(duplicate)
+            else:
+                with io.BufferedReader(_WindowsSnapshotRaw(handle)) as stream:
+                    yield stream
+        except StockError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise _cache_unavailable() from error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        first_error: BaseException | None = None
+        for resource in reversed(self._retained):
+            try:
+                if isinstance(resource, int):
+                    os.close(resource)
+                else:
+                    resource.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self._retained.clear()
+        if first_error is not None:
+            raise _cache_unavailable() from first_error
+
+    def __enter__(self) -> "GenerationSnapshot":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.close()
+        except StockError:
+            if exc_type is None:
+                raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,7 +536,13 @@ class CurrentPointer:
     @classmethod
     def load_from_directory(cls, descriptor: int) -> "CurrentPointer":
         try:
-            value = _parse_json(_read_private_child_text(descriptor, "current.json"))
+            value = _parse_json(
+                _read_private_child_text_bounded(
+                    descriptor,
+                    "current.json",
+                    _WINDOWS_POINTER_MAX_BYTES,
+                )
+            )
         except (
             OSError,
             UnicodeError,
@@ -3296,6 +3405,193 @@ class StockCache:
             raise _cache_unavailable()
         return state.files
 
+    def generation_snapshot(self) -> GenerationSnapshot:
+        """Retain all objects needed by a search while cleanup may run."""
+        try:
+            if _is_native_windows():
+                return self._generation_snapshot_windows()
+            return self._generation_snapshot_posix()
+        except StockError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise _cache_unavailable() from error
+
+    def _generation_snapshot_posix(self) -> GenerationSnapshot:
+        attestation: CacheRootAttestation | None = None
+        retained: list[object] = []
+        try:
+            attestation = _attest_cache_root(self.root, create=False)
+            retained.append(attestation)
+            if attestation.descriptor is None:
+                raise _cache_unavailable()
+            pointer = CurrentPointer.load_from_directory(attestation.descriptor)
+            generations = self.root / "generations"
+            generations_descriptor = _open_private_child_directory(
+                attestation.descriptor, self.root, generations
+            )
+            retained.append(generations_descriptor)
+            generation = generations / pointer.directory_name
+            generation_descriptor = _open_private_child_directory(
+                generations_descriptor, generations, generation
+            )
+            retained.append(generation_descriptor)
+            descriptors: dict[str, int] = {}
+            for name in (
+                "manifest.json",
+                "products.jsonl",
+                "offers.jsonl",
+                "state.json",
+            ):
+                descriptor = _open_private_child_regular_file(
+                    generation_descriptor, name
+                )
+                descriptors[name] = descriptor
+                retained.append(descriptor)
+            manifest_payload = _read_descriptor_bounded(
+                descriptors["manifest.json"], _WINDOWS_MANIFEST_MAX_BYTES
+            )
+            state_payload = _read_descriptor_bounded(
+                descriptors["state.json"], _WINDOWS_STATE_MAX_BYTES
+            )
+            manifest = Manifest.parse(manifest_payload)
+            runtime_payload = _read_optional_root_payload_bounded(
+                attestation.descriptor,
+                _runtime_status_path(self.root, pointer.directory_name).name,
+                _WINDOWS_RUNTIME_MAX_BYTES,
+            )
+            checked_at, stale, warning_code = _snapshot_metadata(
+                pointer,
+                manifest,
+                state_payload,
+                runtime_payload,
+            )
+            repeated = CurrentPointer.load_from_directory(attestation.descriptor)
+            if repeated != pointer:
+                raise _cache_unavailable()
+            attestation.assert_current()
+            files = GenerationFiles.from_directory(
+                pointer.generation_id,
+                generation,
+                integrity=_generation_integrity(manifest),
+            )
+            return GenerationSnapshot(
+                files,
+                manifest_payload,
+                checked_at=checked_at,
+                stale=stale,
+                warning_code=warning_code,
+                payload_handles={
+                    "products": descriptors["products.jsonl"],
+                    "offers": descriptors["offers.jsonl"],
+                },
+                retained=retained,
+            )
+        except BaseException:
+            for resource in reversed(retained):
+                try:
+                    if isinstance(resource, int):
+                        os.close(resource)
+                    else:
+                        resource.close()
+                except BaseException:
+                    pass
+            raise
+
+    def _generation_snapshot_windows(self) -> GenerationSnapshot:
+        attestation: CacheRootAttestation | None = None
+        retained: list[object] = []
+        try:
+            attestation = _attest_cache_root(self.root, create=False)
+            retained.append(attestation)
+            session = _windows_session(attestation)
+            pointer = CurrentPointer.from_value(
+                _parse_windows_json(
+                    session.read_file((), "current.json", _WINDOWS_POINTER_MAX_BYTES)
+                )
+            )
+            generation_parts = ("generations", pointer.directory_name)
+            chain = session.filesystem.open_snapshot_chain(
+                session.root, generation_parts
+            )
+            retained.extend(chain)
+            generation = chain[-1]
+            handles: dict[str, Any] = {}
+            for name in (
+                _WINDOWS_GENERATION_OWNER_NAME,
+                "manifest.json",
+                "products.jsonl",
+                "offers.jsonl",
+                "state.json",
+            ):
+                handle = session.filesystem.open_child(
+                    generation,
+                    name,
+                    directory=False,
+                    snapshot=True,
+                )
+                handles[name] = handle
+                retained.append(handle)
+            ownership = _parse_windows_generation_ownership(
+                session.filesystem._read_open_file(
+                    handles[_WINDOWS_GENERATION_OWNER_NAME],
+                    _WINDOWS_GENERATION_OWNER_MAX_BYTES,
+                ),
+                attestation.ownership_token,
+            )
+            if ownership.generation_id != pointer.generation_id:
+                raise _cache_unavailable()
+            manifest_payload = session.filesystem._read_open_file(
+                handles["manifest.json"], _WINDOWS_MANIFEST_MAX_BYTES
+            )
+            state_payload = session.filesystem._read_open_file(
+                handles["state.json"], _WINDOWS_STATE_MAX_BYTES
+            )
+            manifest = Manifest.parse(manifest_payload)
+            runtime_path = _runtime_status_path(self.root, pointer.directory_name)
+            runtime_payload = session.read_optional_file(
+                (), runtime_path.name, _WINDOWS_RUNTIME_MAX_BYTES
+            )
+            checked_at, stale, warning_code = _snapshot_metadata(
+                pointer,
+                manifest,
+                state_payload,
+                runtime_payload,
+                expected_root_token=attestation.ownership_token,
+                expected_generation_ownership_token=ownership.ownership_token,
+            )
+            repeated = CurrentPointer.from_value(
+                _parse_windows_json(
+                    session.read_file((), "current.json", _WINDOWS_POINTER_MAX_BYTES)
+                )
+            )
+            if repeated != pointer:
+                raise _cache_unavailable()
+            attestation.assert_current()
+            files = GenerationFiles.from_directory(
+                pointer.generation_id,
+                self.root / "generations" / pointer.directory_name,
+                integrity=_generation_integrity(manifest),
+            )
+            return GenerationSnapshot(
+                files,
+                manifest_payload,
+                checked_at=checked_at,
+                stale=stale,
+                warning_code=warning_code,
+                payload_handles={
+                    "products": handles["products.jsonl"],
+                    "offers": handles["offers.jsonl"],
+                },
+                retained=retained,
+            )
+        except BaseException:
+            for resource in reversed(retained):
+                try:
+                    resource.close()
+                except BaseException:
+                    pass
+            raise
+
     def _record_runtime_status(
         self,
         state: CacheState,
@@ -5698,6 +5994,91 @@ def _read_private_child_bytes(parent_descriptor: int, name: str) -> bytes:
             _close_optional_descriptor(descriptor)
 
 
+def _read_descriptor_bounded(descriptor: int, maximum: int) -> bytes:
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > maximum:
+            raise _cache_unavailable()
+        payload = os.pread(descriptor, maximum + 1, 0)
+        if len(payload) != opened.st_size or len(payload) > maximum:
+            raise _cache_unavailable()
+        return payload
+    except StockError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+
+
+def _read_optional_root_payload_bounded(
+    root_descriptor: int,
+    name: str,
+    maximum: int,
+) -> bytes | None:
+    try:
+        descriptor = _open_private_child_regular_file(root_descriptor, name)
+    except StockError as error:
+        try:
+            missing = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise error
+        if missing is not None:
+            raise error
+        return None
+    try:
+        return _read_descriptor_bounded(descriptor, maximum)
+    finally:
+        _close_optional_descriptor(descriptor)
+
+
+def _snapshot_metadata(
+    pointer: CurrentPointer,
+    manifest: Manifest,
+    state_payload: bytes,
+    runtime_payload: bytes | None,
+    *,
+    expected_root_token: str | None = None,
+    expected_generation_ownership_token: str | None = None,
+) -> tuple[str, bool, str | None]:
+    if manifest.generation_id != pointer.generation_id:
+        raise _cache_unavailable()
+    state_value = _parse_windows_json(state_payload)
+    if not isinstance(state_value, dict):
+        raise _cache_unavailable()
+    manifest_etag = state_value.get("manifest_etag")
+    manifest_last_modified = state_value.get("manifest_last_modified")
+    if (
+        state_value.get("generation_id") != pointer.generation_id
+        or state_value.get("generated_at") != manifest.generated_at
+        or not isinstance(state_value.get("checked_at"), str)
+        or not state_value["checked_at"]
+        or (manifest_etag is not None and not isinstance(manifest_etag, str))
+        or (
+            manifest_last_modified is not None
+            and not isinstance(manifest_last_modified, str)
+        )
+    ):
+        raise _cache_unavailable()
+    if runtime_payload is None:
+        runtime = validate_runtime_status(state_value, pointer.generation_id)
+    elif expected_root_token is None:
+        runtime = validate_runtime_status(
+            _parse_windows_json(runtime_payload), pointer.generation_id
+        )
+    else:
+        runtime = _validate_windows_runtime_payload(
+            runtime_payload,
+            expected_generation_id=pointer.generation_id,
+            expected_directory_name=pointer.directory_name,
+            expected_root_token=expected_root_token,
+            expected_generation_ownership_token=(
+                expected_generation_ownership_token
+            ),
+        )
+    return runtime.checked_at, runtime.stale, runtime.warning_code
+
+
 def _open_private_child_regular_file(
     parent_descriptor: int,
     name: str,
@@ -5711,15 +6092,16 @@ def _open_private_child_regular_file(
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(observed.st_mode):
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
             raise _cache_unavailable()
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not _same_file_identity(
-            observed,
-            opened,
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not _same_file_identity(observed, opened)
         ):
             raise _cache_unavailable()
         opened = _harden_private_descriptor(
@@ -5732,9 +6114,10 @@ def _open_private_child_regular_file(
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(confirmed.st_mode) or not _same_file_identity(
-            opened,
-            confirmed,
+        if (
+            not stat.S_ISREG(confirmed.st_mode)
+            or confirmed.st_nlink != 1
+            or not _same_file_identity(opened, confirmed)
         ):
             raise _cache_unavailable()
         return descriptor
@@ -5759,6 +6142,22 @@ def _read_private_child_text(parent_descriptor: int, name: str) -> str:
     finally:
         if descriptor >= 0:
             _close_optional_descriptor(descriptor)
+
+
+def _read_private_child_text_bounded(
+    parent_descriptor: int,
+    name: str,
+    maximum: int,
+) -> str:
+    descriptor = _open_private_child_regular_file(parent_descriptor, name)
+    try:
+        return _read_descriptor_bounded(descriptor, maximum).decode("utf-8")
+    except StockError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        _close_optional_descriptor(descriptor)
 
 
 def _stat_private_child_regular_file(

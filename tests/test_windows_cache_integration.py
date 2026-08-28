@@ -1832,6 +1832,92 @@ class WindowsCacheWorkflowNativeTest(unittest.TestCase):
         self.assertFalse((self.root / ".refresh.lock").exists())
         self.assertEqual(list(self.root.glob(".refresh.lock.release-*")), [])
 
+    def test_snapshot_search_survives_native_cleanup_and_successor_is_current(
+        self,
+    ) -> None:
+        class GenerationClient:
+            def __init__(self, generation_id: str) -> None:
+                self.generation_id = generation_id
+                self.products = SEARCH_PRODUCTS.replace(
+                    b"synthetic-generation", generation_id.encode("ascii")
+                )
+                self.offers = SEARCH_OFFERS.replace(
+                    b"synthetic-generation", generation_id.encode("ascii")
+                )
+
+            def get_manifest(
+                self,
+                etag: str | None = None,
+                last_modified: str | None = None,
+            ) -> HttpResponse:
+                body = json.dumps(
+                    {
+                        "generation_id": self.generation_id,
+                        "generated_at": "2026-08-27T10:00:00+00:00",
+                        "files": {
+                            "products": {
+                                "url": "products.jsonl",
+                                "bytes": len(self.products),
+                                "sha256": hashlib.sha256(
+                                    self.products
+                                ).hexdigest(),
+                            },
+                            "offers": {
+                                "url": "offers.jsonl",
+                                "bytes": len(self.offers),
+                                "sha256": hashlib.sha256(self.offers).hexdigest(),
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return HttpResponse(status=200, headers={}, body=body)
+
+            def download(
+                self,
+                url: str,
+                destination: Path,
+                expected_bytes: int,
+                expected_sha256: str,
+                progress: object | None = None,
+            ) -> DownloadReceipt:
+                payload = (
+                    self.products
+                    if destination.name == "products.jsonl"
+                    else self.offers
+                )
+                destination.write_bytes(payload)
+                if callable(progress):
+                    progress()
+                return DownloadReceipt(
+                    bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest()
+                )
+
+        config = StockConfig(
+            manifest_url="https://stock.example.test/manifest.json",
+            username="reader",
+            password="secret",
+            product_id_field="private_product_key",
+            offer_product_id_field="private_offer_product_key",
+            cache_dir=self.root,
+        )
+        query = SearchQuery.from_args(argparse.Namespace())
+        cache = StockCache(self.root, GenerationClient("synthetic-generation-a"))
+        cache.refresh(config)
+
+        with cache.generation_snapshot() as snapshot_a:
+            StockCache(
+                self.root, GenerationClient("synthetic-generation-b")
+            ).refresh(config)
+            result_a = StockSearcher(snapshot_a, config).search(query)
+
+        with cache.generation_snapshot() as snapshot_b:
+            result_b = StockSearcher(snapshot_b, config).search(query)
+
+        self.assertEqual(result_a.generation["id"], "synthetic-generation-a")
+        self.assertEqual(result_b.generation["id"], "synthetic-generation-b")
+        self.assertEqual(result_a.summary, result_b.summary)
+
     def test_two_real_parallel_refreshes_leave_one_generation_and_no_lock_artifacts(
         self,
     ) -> None:
