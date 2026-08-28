@@ -647,6 +647,65 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(set(tokens)), 1)
 
+    def test_initializer_waits_for_in_progress_marker_publication(self) -> None:
+        root = Path(self.temp_dir.name) / "in-progress-marker"
+        root.mkdir()
+        publisher_waiting = threading.Event()
+        contender_observed_marker = threading.Event()
+        release_publisher = threading.Event()
+        tokens: list[str] = []
+        errors: list[BaseException] = []
+        real_write_all = cache_module._write_all
+        real_marker_exists = cache_module._cache_root_marker_exists
+
+        def delay_marker_payload(descriptor: int, payload: bytes) -> None:
+            publisher_waiting.set()
+            if not release_publisher.wait(timeout=5):
+                raise AssertionError("marker publisher was not released")
+            real_write_all(descriptor, payload)
+
+        def observe_marker(descriptor: int) -> bool:
+            exists = real_marker_exists(descriptor)
+            if (
+                threading.current_thread().name == "marker-contender"
+                and exists
+            ):
+                contender_observed_marker.set()
+            return exists
+
+        def initialize() -> None:
+            try:
+                attestation = cache_module._attest_cache_root(root, create=True)
+                tokens.append(attestation.ownership_token)
+                attestation.close()
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch.object(cache_module, "_write_all", side_effect=delay_marker_payload),
+            patch.object(
+                cache_module,
+                "_cache_root_marker_exists",
+                side_effect=observe_marker,
+            ),
+        ):
+            publisher = threading.Thread(target=initialize, name="marker-publisher")
+            contender = threading.Thread(target=initialize, name="marker-contender")
+            publisher.start()
+            self.assertTrue(publisher_waiting.wait(timeout=5))
+            contender.start()
+            self.assertTrue(contender_observed_marker.wait(timeout=5))
+            contender.join(timeout=1)
+            release_publisher.set()
+            publisher.join(timeout=5)
+            contender.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(contender.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(tokens), 2)
+        self.assertEqual(len(set(tokens)), 1)
+
     def test_root_marker_removal_before_cleanup_fails_closed(self) -> None:
         cache_module._attest_cache_root(self.cache_root, create=True).close()
         self.fixture.seed_generation()

@@ -4312,9 +4312,10 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
         if pinned.st_uid != effective_uid:
             raise _cache_unavailable()
 
-        if not _cache_root_marker_exists(descriptor):
-            if not create:
-                raise _cache_unavailable()
+        marker_exists = _cache_root_marker_exists(descriptor)
+        if not marker_exists and not create:
+            raise _cache_unavailable()
+        if create:
             _fcntl.flock(descriptor, _fcntl.LOCK_EX)
             initialization_locked = True
         if not _cache_root_marker_exists(descriptor):
