@@ -105,6 +105,12 @@ case "$(uname -s)" in
       exit 1
     }
     setfacl -b -- "$PAPA_SHIN_SECRETS_DIR"
+    setfacl -k -- "$PAPA_SHIN_SECRETS_DIR"
+    if getfacl -cp -- "$PAPA_SHIN_SECRETS_DIR" | \
+      grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)'; then
+      echo 'Не удалось очистить ACL каталога' >&2
+      exit 1
+    fi
     ;;
   *) echo 'Неподдерживаемая ОС' >&2; exit 1 ;;
 esac
@@ -113,7 +119,14 @@ PAPA_SHIN_CONFIG="$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env"
 if test -f "$PAPA_SHIN_CONFIG"; then
   case "$(uname -s)" in
     Darwin) chmod -N "$PAPA_SHIN_CONFIG" ;;
-    Linux) setfacl -b -- "$PAPA_SHIN_CONFIG" ;;
+    Linux)
+      setfacl -b -- "$PAPA_SHIN_CONFIG"
+      if getfacl -cp -- "$PAPA_SHIN_CONFIG" | \
+        grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)'; then
+        echo 'Не удалось очистить ACL файла' >&2
+        exit 1
+      fi
+      ;;
   esac
   chmod 600 "$PAPA_SHIN_CONFIG"
 fi
