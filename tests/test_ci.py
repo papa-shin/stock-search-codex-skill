@@ -8,6 +8,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ValidationDependencyLockTest(unittest.TestCase):
+    def test_ci_actions_are_immutable_node24_releases(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            workflow.count(
+                "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
+            ),
+            2,
+        )
+        self.assertEqual(
+            workflow.count(
+                "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+            ),
+            2,
+        )
+
     def test_pyyaml_validation_dependency_is_binary_hash_locked(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
