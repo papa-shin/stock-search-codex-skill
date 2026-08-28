@@ -282,7 +282,7 @@ class NativeKernel32ApiTest(unittest.TestCase):
                 session.write_new_file((), "current.json", b"pointer")
                 self.assertEqual((root / "current.json").read_bytes(), b"pointer")
 
-    def test_nested_ancestor_pins_leaf_while_leaf_child_cas_succeeds(self) -> None:
+    def test_nested_leaf_move_is_detected_without_mutating_replacement(self) -> None:
         api = Kernel32Api()
         filesystem = WindowsFilesystem(api)
         marker = ".papa-shin-stock-cache-root.json"
@@ -309,24 +309,74 @@ class NativeKernel32ApiTest(unittest.TestCase):
                         destructive=True,
                         movable=True,
                     ) as movable_leaf:
-                        with self.assertRaises(OSError):
-                            api.rename_relative(
-                                movable_leaf.handle,
-                                session.root.handle,
-                                "nested-renamed",
-                                replace=False,
-                            )
-                    filesystem.replace_file_cas(
-                        leaf,
-                        "current.json",
-                        expected=None,
-                        payload=b"pointer",
-                    )
+                        api.rename_relative(
+                            movable_leaf.handle,
+                            session.root.handle,
+                            "nested-moved",
+                            replace=False,
+                        )
+                    (root / "nested").mkdir()
+                    with self.assertRaisesRegex(
+                        WindowsFilesystemError, "final path changed"
+                    ):
+                        filesystem.replace_file_cas(
+                            leaf,
+                            "current.json",
+                            expected=None,
+                            payload=b"pointer",
+                        )
                 finally:
                     session._close_directory_chain(opened)
 
+                self.assertFalse((root / "nested" / "current.json").exists())
+                self.assertFalse((root / "nested-moved" / "current.json").exists())
+                (root / "nested").rmdir()
+                (root / "nested-moved").rmdir()
+                (root / "nested").mkdir()
+
+                original_rename_relative = api.rename_relative
+                original_flush = api.flush
+                attacked = False
+
+                def move_leaf_after_publish(handle: int) -> None:
+                    nonlocal attacked
+                    original_flush(handle)
+                    if (
+                        not attacked
+                        and filesystem._final_path_matches(
+                            api, handle, str(root / "nested")
+                        )
+                        and (root / "nested" / "current.json").exists()
+                    ):
+                        attacked = True
+                        with filesystem.open_child(
+                            session.root,
+                            "nested",
+                            directory=True,
+                            destructive=True,
+                            movable=True,
+                        ) as movable_leaf:
+                            original_rename_relative(
+                                movable_leaf.handle,
+                                session.root.handle,
+                                "nested-moved-after",
+                                replace=False,
+                            )
+                        (root / "nested").mkdir()
+
+                api.flush = move_leaf_after_publish  # type: ignore[method-assign]
+                with self.assertRaisesRegex(
+                    WindowsFilesystemError, "final path changed"
+                ):
+                    session.write_new_file(
+                        ("nested",), "current.json", b"pointer"
+                    )
+
+                self.assertTrue(attacked)
+                self.assertFalse((root / "nested" / "current.json").exists())
                 self.assertEqual(
-                    (root / "nested" / "current.json").read_bytes(), b"pointer"
+                    (root / "nested-moved-after" / "current.json").read_bytes(),
+                    b"pointer",
                 )
 
     def test_filesystem_cas_rollback_restores_target_with_movable_snapshot(self) -> None:
@@ -1566,6 +1616,101 @@ class WindowsFilesystemTest(unittest.TestCase):
                     for key in self.api.handles.values()
                 )
             )
+
+    def test_nested_parent_move_during_publish_fails_without_touching_replacement(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        nested = self.root + r"\nested"
+        moved = self.root + r"\nested-moved"
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            self.api.add_directory(nested, (7, 435))
+            original_rename_relative = self.api.rename_relative
+            attacked = False
+
+            def move_parent_then_publish(
+                handle: int,
+                parent_handle: int,
+                destination_name: str,
+                *,
+                replace: bool,
+            ) -> None:
+                nonlocal attacked
+                source_path = str(self.api.nodes[self.api.handles[handle]]["path"])
+                if not attacked and source_path.endswith(".tmp"):
+                    attacked = True
+                    self.api.rename(parent_handle, moved)
+                    self.api.add_directory(nested, (7, 436))
+                original_rename_relative(
+                    handle,
+                    parent_handle,
+                    destination_name,
+                    replace=replace,
+                )
+
+            self.api.rename_relative = move_parent_then_publish  # type: ignore[method-assign]
+            with self.assertRaisesRegex(
+                WindowsFilesystemError, "atomic replacement was not confirmed"
+            ):
+                session.write_new_file(("nested",), "current.json", b"pointer")
+
+        self.assertTrue(attacked)
+        self.assertNotIn(self.api.canonical(nested + r"\current.json"), self.api.nodes)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(moved + r"\current.json")]["content"],
+            b"pointer",
+        )
+
+    def test_session_post_operation_detects_moved_parent_without_replacement_write(
+        self,
+    ) -> None:
+        marker = ".papa-shin-stock-cache-root.json"
+        marker_payload = b'{"kind":"cache-root","schema_version":1}'
+        nested = self.root + r"\nested"
+        moved = self.root + r"\nested-moved-after"
+
+        with self.fs.open_cache_root(
+            self.root,
+            marker,
+            payload=marker_payload,
+            maximum=512,
+            create=True,
+        ) as session:
+            self.api.add_directory(nested, (7, 437))
+            original_flush = self.api.flush
+            attacked = False
+
+            def move_parent_after_publish(handle: int) -> None:
+                nonlocal attacked
+                original_flush(handle)
+                if (
+                    not attacked
+                    and self.api.handles.get(handle) == self.api.canonical(nested)
+                    and self.api.canonical(nested + r"\current.json")
+                    in self.api.nodes
+                ):
+                    attacked = True
+                    self.api.rename(handle, moved)
+                    self.api.add_directory(nested, (7, 438))
+
+            self.api.flush = move_parent_after_publish  # type: ignore[method-assign]
+            with self.assertRaisesRegex(WindowsFilesystemError, "final path changed"):
+                session.write_new_file(("nested",), "current.json", b"pointer")
+
+        self.assertTrue(attacked)
+        self.assertNotIn(self.api.canonical(nested + r"\current.json"), self.api.nodes)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(moved + r"\current.json")]["content"],
+            b"pointer",
+        )
 
     def test_legacy_flat_cleanup_uses_pinned_ancestor_and_share_all_parent(
         self,

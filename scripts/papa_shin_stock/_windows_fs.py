@@ -711,8 +711,11 @@ class WindowsCacheRoot:
         try:
             if mutation_parent and parts:
                 # The retained root shares delete so root-level child renames
-                # can proceed.  For a nested mutation, this duplicate pins the
-                # first component's name while the leaf parent remains movable.
+                # can proceed.  For a nested mutation, this duplicate retains
+                # the traversal object while the leaf parent remains movable.
+                # Windows may still rename that leaf; pre/post parent
+                # attestation detects the drift and operations stay bound to
+                # the originally opened object, never a path replacement.
                 current = self.filesystem.open_verified(
                     self.root.path,
                     directory=True,
@@ -933,6 +936,7 @@ class WindowsCacheRoot:
             identity = self.filesystem.replace_file_cas(
                 parent, name, expected=None, payload=payload
             )
+            parent.assert_current()
             self.assert_current()
             return identity
         finally:
@@ -953,6 +957,7 @@ class WindowsCacheRoot:
             identity = self.filesystem.replace_file_cas(
                 parent, name, expected=expected, payload=payload
             )
+            parent.assert_current()
             self.assert_current()
             return identity
         finally:
@@ -1096,6 +1101,7 @@ class WindowsCacheRoot:
             self.filesystem.rename_directory(
                 parent, source_name, expected, destination_name
             )
+            parent.assert_current()
             self.assert_current()
         finally:
             self._close_directory_chain(opened)
@@ -1124,6 +1130,7 @@ class WindowsCacheRoot:
                 expected_payloads=expected_payloads,
                 expected_write_times=expected_write_times,
             )
+            parent.assert_current()
             self.assert_current()
             return removed
         finally:
