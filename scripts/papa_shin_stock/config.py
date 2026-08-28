@@ -50,7 +50,9 @@ class StockConfig:
     def resolve_product_id(self, row: dict[str, object]) -> str:
         value = row.get(self.product_id_field)
         if type(value) not in (str, int) or str(value) == "":
-            raise StockError("query_invalid", "У товара отсутствует идентификатор", 4)
+            raise StockError(
+                "manifest_invalid", "Некорректные машинные данные", 3
+            )
         return str(value)
 
 

@@ -206,10 +206,10 @@ class StockConfigTest(unittest.TestCase):
             {"product_id": 1.5},
         ):
             with self.subTest(row=row):
-                with self.assertRaisesRegex(StockError, "query_invalid") as raised:
+                with self.assertRaisesRegex(StockError, "manifest_invalid") as raised:
                     config.resolve_product_id(row)
 
-                self.assertEqual(raised.exception.exit_code, 4)
+                self.assertEqual(raised.exception.exit_code, 3)
 
 
 if __name__ == "__main__":

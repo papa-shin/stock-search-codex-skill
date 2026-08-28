@@ -537,14 +537,17 @@ def _product(row: dict[str,object], ident: str) -> Product:
     return Product(_text(ident),_text(row.get("name")),_text(row.get("article")),_text(row.get("product_type")),public,_int(row.get("total_quantity")),_unknown(ident,row,chars))
 def _match_product(p: Product,row: dict[str,object],q: SearchQuery) -> bool:
     if p.total_quantity<q.min_total_quantity:return False
-    if q.size is not None and (not isinstance(row.get("size"),str) or normalize_tire_size(row["size"])!=q.size):return False
+    if q.size is not None and (not isinstance(row.get("size"),str) or _source_tire_size(row["size"])!=q.size):return False
     for field in ("product_type","season","spikes","run_flat","disk_type","truck_axis","truck_construction"):
         if (wanted:=getattr(q,field)) is not None and (p.product_type if field=="product_type" else row.get(field))!=wanted:return False
     return True
 def _offer_id(row: dict[str,object],field:str)->str:
     value=row.get(field)
-    if not isinstance(value,(str,int)) or isinstance(value,bool) or not str(value):raise StockError("query_invalid","У предложения отсутствует идентификатор товара",4)
+    if not isinstance(value,(str,int)) or isinstance(value,bool) or not str(value):raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return str(value)
+def _source_tire_size(value:str)->str:
+    try:return normalize_tire_size(value)
+    except StockError as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
 def _offer(row:dict[str,object])->Offer:return Offer(_text(row.get("supplier")),_decimal(row.get("price")),_int(row.get("delivery_days")),_int(row.get("quantity")))
 def _match_offer(o:Offer,q:SearchQuery)->bool:return (q.supplier is None or o.supplier==q.supplier) and (q.max_price is None or o.price<=q.max_price) and (q.max_delivery_days is None or o.delivery_days<=q.max_delivery_days)
 def _unknown(ident:str,row:dict[str,object],chars:dict[str,object])->tuple[dict[str,str],...]:

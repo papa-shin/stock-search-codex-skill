@@ -2227,6 +2227,7 @@ class SearchStockCliTest(unittest.TestCase):
         manifest: bytes,
         products: bytes,
         offers: bytes,
+        arguments: list[str] | None = None,
     ) -> tuple[int, str, str, str]:
         with tempfile.TemporaryDirectory() as temporary:
             generation = Path(temporary) / "synthetic-generation"
@@ -2255,9 +2256,60 @@ class SearchStockCliTest(unittest.TestCase):
                     return_value=nullcontext(files),
                 ):
                     with redirect_stdout(output), redirect_stderr(errors):
-                        exit_code = search_stock.main([])
+                        exit_code = search_stock.main(arguments or [])
 
             return exit_code, output.getvalue(), errors.getvalue(), temporary
+
+    def test_valid_size_query_reports_malformed_source_size_as_manifest_error(
+        self,
+    ) -> None:
+        product = json.loads(
+            (FIXTURES_DIR / "products.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        product["size"] = "not-a-size"
+
+        exit_code, output, errors, private_path = self._run_generation_cli(
+            manifest=(FIXTURES_DIR / "manifest.json").read_bytes(),
+            products=(json.dumps(product, separators=(",", ":")) + "\n").encode(),
+            offers=b"",
+            arguments=["--size", "205/55R16"],
+        )
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(errors, "")
+        self.assertNotIn(private_path, output)
+        self.assertEqual(
+            json.loads(output),
+            {
+                "status": "error",
+                "error": {
+                    "code": "manifest_invalid",
+                    "message": "Некорректные машинные данные",
+                },
+            },
+        )
+
+    def test_missing_offer_product_id_is_manifest_error(self) -> None:
+        offer = {
+            "content_generation_id": "synthetic-generation",
+            "supplier": "Synthetic Supplier",
+            "price": "7000",
+            "delivery_days": 1,
+            "quantity": 4,
+        }
+
+        exit_code, output, errors, private_path = self._run_generation_cli(
+            manifest=(FIXTURES_DIR / "manifest.json").read_bytes(),
+            products=(FIXTURES_DIR / "products.jsonl").read_bytes(),
+            offers=(json.dumps(offer, separators=(",", ":")) + "\n").encode(),
+        )
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(errors, "")
+        self.assertNotIn(private_path, output)
+        self.assertEqual(json.loads(output)["error"]["code"], "manifest_invalid")
 
     def test_success_writes_one_public_json_document(self) -> None:
         output = StringIO()
