@@ -127,7 +127,19 @@ def _validated_cache_dir(path: Path) -> Path:
         skill_root = _SKILL_ROOT.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise _invalid_config() from error
-    if resolved == skill_root or skill_root in resolved.parents:
+    home = Path.home().resolve(strict=False)
+    default_cache = _DEFAULT_CACHE_DIR.resolve(strict=False)
+    anchor = Path(resolved.anchor)
+    if (
+        resolved == anchor
+        or len(resolved.parts) <= 3
+        or resolved == home
+        or resolved in home.parents
+        or (resolved != default_cache and resolved in default_cache.parents)
+        or resolved == skill_root
+        or skill_root in resolved.parents
+        or resolved in skill_root.parents
+    ):
         raise _invalid_config()
     return resolved
 

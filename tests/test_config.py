@@ -149,6 +149,40 @@ class StockConfigTest(unittest.TestCase):
 
         self.assertNotIn(str(private_path), str(raised.exception))
 
+    def test_broad_cache_directories_are_rejected(self) -> None:
+        skill_root = SCRIPTS_DIR.parent.resolve()
+        broad_paths = {
+            Path(skill_root.anchor),
+            Path(skill_root.anchor) / "tmp",
+            Path.home().resolve(),
+            Path.home().resolve().parent,
+            Path.home().resolve() / ".codex",
+            Path.home().resolve() / ".codex" / "cache",
+            skill_root,
+            skill_root.parent,
+            skill_root / "nested-cache",
+        }
+        for cache_directory in broad_paths:
+            with self.subTest(cache_directory=cache_directory):
+                config_path = self.write_env(
+                    self.complete_env(
+                        f"PAPA_SHIN_STOCK_CACHE_DIR={cache_directory}\n"
+                    )
+                )
+                with self.assertRaisesRegex(StockError, "config_invalid"):
+                    StockConfig.load(config_path)
+
+    def test_leaf_cache_directory_under_home_is_allowed(self) -> None:
+        cache_directory = Path.home() / ".codex" / "cache" / "papa-shin-stock-test"
+        config = StockConfig.load(
+            self.write_env(
+                self.complete_env(
+                    f"PAPA_SHIN_STOCK_CACHE_DIR={cache_directory}\n"
+                )
+            )
+        )
+        self.assertEqual(config.cache_dir, cache_directory.resolve())
+
     def test_load_rejects_non_assignment_line_with_safe_error(self) -> None:
         config_path = self.write_env(self.complete_env("source unsafe.env\n"))
 

@@ -132,6 +132,7 @@ class CacheFixture:
         generation_id: str = "generation-a",
         directory_name: str = "generation-existing",
     ) -> None:
+        cache_module._attest_cache_root(self.root, create=True).close()
         generation = self.root / "generations" / directory_name
         generation.mkdir(parents=True)
         (generation / "manifest.json").write_bytes(manifest_bytes(generation_id))
@@ -171,6 +172,7 @@ class StockCacheTest(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.cache_root = Path(self.temp_dir.name) / "cache"
         self.cache_root.mkdir()
+        cache_module._attest_cache_root(self.cache_root, create=True).close()
         self.fixture = CacheFixture(self.cache_root)
         self.config = StockConfig(
             manifest_url="https://stock.example.test/manifest.json",
@@ -180,6 +182,141 @@ class StockCacheTest(unittest.TestCase):
             offer_product_id_field="product_id",
             cache_dir=self.cache_root,
         )
+
+    def test_existing_empty_cache_root_is_initialized_with_strict_marker(self) -> None:
+        root = Path(self.temp_dir.name) / "empty-cache"
+        root.mkdir(mode=0o755)
+
+        attestation = cache_module._attest_cache_root(root, create=True)
+        self.addCleanup(attestation.close)
+
+        marker = root / ".papa-shin-stock-cache-root.json"
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(payload), {"kind", "schema_version", "ownership_token"}
+        )
+        self.assertEqual(payload["kind"], "papa-shin-stock-cache-root")
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertRegex(payload["ownership_token"], r"^[0-9a-f]{32}$")
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
+    def test_unmarked_nonempty_cache_root_is_rejected_without_mutation(self) -> None:
+        root = Path(self.temp_dir.name) / "victim"
+        root.mkdir(mode=0o755)
+        victim = root / "unrelated.txt"
+        victim.write_bytes(b"do-not-touch")
+        before_mode = stat.S_IMODE(root.stat().st_mode)
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+
+        self.assertEqual(victim.read_bytes(), b"do-not-touch")
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
+
+    def test_invalid_cache_root_markers_fail_closed(self) -> None:
+        invalid_payloads = {
+            "malformed": b"not-json",
+            "oversized": b"{" + b" " * 513 + b"}",
+            "duplicate": b'{"kind":"papa-shin-stock-cache-root","kind":"x","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef"}',
+            "extra": b'{"kind":"papa-shin-stock-cache-root","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef","extra":true}',
+            "trailing": b'{"kind":"papa-shin-stock-cache-root","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef"}\n',
+        }
+        for label, payload in invalid_payloads.items():
+            with self.subTest(label=label):
+                root = Path(self.temp_dir.name) / f"invalid-{label}"
+                root.mkdir()
+                marker = root / ".papa-shin-stock-cache-root.json"
+                marker.write_bytes(payload)
+                os.chmod(marker, 0o600)
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    cache_module._attest_cache_root(root, create=False)
+
+    def test_symlink_cache_root_marker_is_rejected(self) -> None:
+        root = Path(self.temp_dir.name) / "symlink-marker"
+        root.mkdir()
+        target = Path(self.temp_dir.name) / "marker-target"
+        target.write_text(
+            '{"kind":"papa-shin-stock-cache-root","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef"}',
+            encoding="utf-8",
+        )
+        try:
+            (root / ".papa-shin-stock-cache-root.json").symlink_to(target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(type(error).__name__)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=False)
+
+    def test_directory_cache_root_marker_is_rejected_without_hardening(self) -> None:
+        root = Path(self.temp_dir.name) / "directory-marker"
+        root.mkdir(mode=0o755)
+        marker = root / ".papa-shin-stock-cache-root.json"
+        marker.mkdir()
+        before_mode = stat.S_IMODE(root.stat().st_mode)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=False)
+        self.assertTrue(marker.is_dir())
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+
+    def test_concurrent_empty_root_initializers_converge_on_one_marker(self) -> None:
+        root = Path(self.temp_dir.name) / "concurrent-marker"
+        root.mkdir()
+        barrier = threading.Barrier(2)
+        tokens: list[str] = []
+        errors: list[BaseException] = []
+
+        def initialize() -> None:
+            try:
+                barrier.wait()
+                attestation = cache_module._attest_cache_root(root, create=True)
+                tokens.append(attestation.ownership_token)
+                attestation.close()
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=initialize) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(tokens)), 1)
+
+    def test_root_marker_removal_before_cleanup_fails_closed(self) -> None:
+        cache_module._attest_cache_root(self.cache_root, create=True).close()
+        self.fixture.seed_generation()
+        inactive = self.cache_root / "generations" / "generation-inactive"
+        inactive.mkdir()
+        (inactive / "victim.txt").write_text("keep", encoding="utf-8")
+        with CacheLock.acquire(self.cache_root) as lock:
+            (self.cache_root / ".papa-shin-stock-cache-root.json").unlink()
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                StockCache(
+                    self.cache_root, FakeHttpClient()
+                )._cleanup_inactive_generations(lock)
+        self.assertTrue((inactive / "victim.txt").exists())
+
+    def test_root_marker_swap_before_cleanup_fails_closed(self) -> None:
+        self.fixture.seed_generation()
+        inactive = self.cache_root / "generations" / "generation-inactive"
+        inactive.mkdir()
+        victim = inactive / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        marker = self.cache_root / ".papa-shin-stock-cache-root.json"
+        with CacheLock.acquire(self.cache_root) as lock:
+            replacement = self.cache_root / ".replacement-cache-root-marker"
+            replacement.write_bytes(
+                cache_module._cache_root_marker_payload("f" * 32)
+            )
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, marker)
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                StockCache(
+                    self.cache_root, FakeHttpClient()
+                )._cleanup_inactive_generations(lock)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
 
     def _expire_current_refresh_lock(self) -> None:
         self._expire_refresh_lock_at(self.cache_root)
@@ -200,6 +337,7 @@ class StockCacheTest(unittest.TestCase):
         generation = root / "generations" / pointer["directory_name"]
         directories = [root, root / "generations", generation]
         files = [
+            root / ".papa-shin-stock-cache-root.json",
             root / ".runtime-status.commit.lock",
             root / "current.json",
             root / f".runtime-status-{generation.name}.json",
@@ -271,6 +409,7 @@ class StockCacheTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_refresh_creates_private_cache_tree_under_umask_000(self) -> None:
+        (self.cache_root / ".papa-shin-stock-cache-root.json").unlink()
         self.cache_root.rmdir()
         previous_umask = os.umask(0o000)
         try:
@@ -283,6 +422,7 @@ class StockCacheTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_refresh_creates_private_cache_tree_under_umask_0777(self) -> None:
+        (self.cache_root / ".papa-shin-stock-cache-root.json").unlink()
         self.cache_root.rmdir()
         previous_umask = os.umask(0o777)
         try:

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -50,6 +51,14 @@ _LOCK_INIT_DIRECTORY = re.compile(r"\.refresh\.lock\.init-[0-9a-f]{32}\Z")
 _MAX_STATUS_TEXT = 256
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+_CACHE_ROOT_MARKER_NAME = ".papa-shin-stock-cache-root.json"
+_CACHE_ROOT_MARKER_KIND = "papa-shin-stock-cache-root"
+_CACHE_ROOT_MARKER_VERSION = 1
+_CACHE_ROOT_MARKER_MAX_BYTES = 512
+_CACHE_ROOT_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
+_CACHE_ROOT_INIT_TEMP = re.compile(
+    r"\.papa-shin-stock-cache-root\.init-[0-9a-f]{32}\.tmp\Z"
+)
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
     errno.EINVAL,
@@ -93,6 +102,65 @@ class GenerationFiles:
                     os.close(descriptor)
             except (OSError, StockError) as error:
                 raise _cache_unavailable() from error
+
+
+class CacheRootAttestation:
+    """Pinned proof that a cache root is an explicitly owned leaf directory."""
+
+    def __init__(
+        self,
+        root: Path,
+        descriptor: int | None,
+        identity: os.stat_result,
+        ownership_token: str,
+    ) -> None:
+        self.root = root
+        self.descriptor = descriptor
+        self.identity = identity
+        self.ownership_token = ownership_token
+
+    def assert_current(self) -> None:
+        try:
+            if self.descriptor is not None:
+                opened = os.fstat(self.descriptor)
+                if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+                    self.identity, opened
+                ):
+                    raise _cache_unavailable()
+            observed = self.root.lstat()
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or _is_windows_directory_reparse_point(self.root, observed)
+                or not _same_file_identity(self.identity, observed)
+            ):
+                raise _cache_unavailable()
+            token = _read_cache_root_marker(self.root, self.descriptor)
+            if token != self.ownership_token:
+                raise _cache_unavailable()
+        except StockError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise _cache_unavailable() from error
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        self.descriptor = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise _cache_unavailable() from error
+
+    def __enter__(self) -> "CacheRootAttestation":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +226,19 @@ class CacheState:
 
     @classmethod
     def load(
+        cls,
+        cache_dir: Path,
+        progress: Callable[[], None] | None = None,
+    ) -> "CacheState | None":
+        if _lstat_optional(cache_dir) is None:
+            return None
+        with _attest_cache_root(cache_dir, create=False) as attestation:
+            state = cls._load_attested(cache_dir, progress)
+            attestation.assert_current()
+            return state
+
+    @classmethod
+    def _load_attested(
         cls,
         cache_dir: Path,
         progress: Callable[[], None] | None = None,
@@ -473,8 +554,13 @@ class _RefreshLockPublishLock(RuntimeCommitLock):
 
 
 class _PrivateDownloadDestination:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        root_attestation: CacheRootAttestation | None = None,
+    ) -> None:
         self.path = path
+        self.root_attestation = root_attestation
         self.descriptor = _open_private_regular_file(
             path,
             flags=os.O_RDWR | os.O_CREAT | os.O_EXCL,
@@ -516,6 +602,8 @@ class _PrivateDownloadDestination:
             return stream.write(payload)
 
     def unlink(self, missing_ok: bool = False) -> None:
+        if self.root_attestation is not None:
+            self.root_attestation.assert_current()
         observed = _lstat_optional(self.path)
         if observed is None:
             if missing_ok:
@@ -591,15 +679,23 @@ def _acquire_runtime_commit_descriptor(root: Path) -> int:
 
 
 class CacheLock:
-    def __init__(self, path: Path, token: str, identity: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        token: str,
+        identity: tuple[int, int],
+        root_attestation: CacheRootAttestation,
+    ) -> None:
         self.path = path
         self.token = token
         self.identity = identity
+        self.root_attestation = root_attestation
 
     @classmethod
     def acquire(cls, root: Path) -> "CacheLock":
+        root_attestation: CacheRootAttestation | None = None
         try:
-            _ensure_private_directory(root, create=True, parents=True)
+            root_attestation = _attest_cache_root(root, create=True)
         except (OSError, StockError) as error:
             raise StockError(
                 "cache_locked", "Не удалось установить блокировку кэша", 6
@@ -632,7 +728,10 @@ class CacheLock:
 
             try:
                 with _RefreshLockPublishLock.acquire(root):
-                    cls._cleanup_stale_init_directories(root, candidate.name)
+                    root_attestation.assert_current()
+                    cls._cleanup_stale_init_directories(
+                        root, candidate.name, root_attestation
+                    )
                     observed_lock = _lstat_optional(path)
                     if observed_lock is not None:
                         if not stat.S_ISDIR(observed_lock.st_mode):
@@ -640,7 +739,7 @@ class CacheLock:
                                 "cache_locked", "Обновление кэша уже выполняется", 6
                             )
                         _ensure_private_directory(path)
-                        if not cls._reclaim_stale(path):
+                        if not cls._reclaim_stale(path, root_attestation):
                             remaining = _lstat_optional(path)
                             if remaining is not None:
                                 raise StockError(
@@ -649,6 +748,7 @@ class CacheLock:
                                     6,
                                 )
                     try:
+                        root_attestation.assert_current()
                         os.rename(candidate, path)
                     except OSError as error:
                         raise StockError(
@@ -665,13 +765,20 @@ class CacheLock:
                                 "Право на обновление кэша было утрачено",
                                 6,
                             )
-                        acquired = cls(path, token, candidate_identity)
+                        root_attestation.assert_current()
+                        acquired = cls(
+                            path, token, candidate_identity, root_attestation
+                        )
                         acquired.assert_owned()
+                        root_attestation = None
                     except BaseException:
                         discarded = False
                         try:
                             discarded = cls._discard_published_lock_if_owned_locked(
-                                path, token, candidate_identity
+                                path,
+                                token,
+                                candidate_identity,
+                                root_attestation,
                             )
                         except BaseException:
                             pass
@@ -681,7 +788,11 @@ class CacheLock:
             except BaseException:
                 if published:
                     if cls._discard_published_lock_if_owned(
-                        root, path, token, candidate_identity
+                        root,
+                        path,
+                        token,
+                        candidate_identity,
+                        root_attestation,
                     ):
                         published = False
                 raise
@@ -691,8 +802,14 @@ class CacheLock:
                 )
             return acquired
         finally:
-            if not published:
-                _remove_private_directory(candidate)
+            if not published and root_attestation is not None:
+                try:
+                    root_attestation.assert_current()
+                    _remove_private_directory(candidate)
+                except StockError:
+                    pass
+            if root_attestation is not None:
+                root_attestation.close()
 
     @classmethod
     def _discard_published_lock_if_owned(
@@ -701,11 +818,12 @@ class CacheLock:
         path: Path,
         token: str,
         identity: tuple[int, int],
+        root_attestation: CacheRootAttestation | None = None,
     ) -> bool:
         try:
             with _RefreshLockPublishLock.acquire(root):
                 return cls._discard_published_lock_if_owned_locked(
-                    path, token, identity
+                    path, token, identity, root_attestation
                 )
         except BaseException:
             return False
@@ -716,6 +834,7 @@ class CacheLock:
         path: Path,
         token: str,
         identity: tuple[int, int],
+        root_attestation: CacheRootAttestation | None = None,
     ) -> bool:
         root = path.parent
         root_descriptor = _open_private_directory(root)
@@ -750,6 +869,8 @@ class CacheLock:
                 f"{path.name}.abort-{token}-{uuid.uuid4().hex}"
             )
             try:
+                if root_attestation is not None:
+                    root_attestation.assert_current()
                 os.rename(
                     path.name,
                     quarantine.name,
@@ -789,12 +910,16 @@ class CacheLock:
                 pass
 
     @classmethod
-    def _reclaim_stale(cls, path: Path) -> bool:
+    def _reclaim_stale(
+        cls,
+        path: Path,
+        root_attestation: CacheRootAttestation | None = None,
+    ) -> bool:
         if cls._contains_unsafe_lock_artifact(path):
             return False
         observed = cls._read_owner(path)
         if observed is None:
-            return cls._reclaim_stale_ownerless(path)
+            return cls._reclaim_stale_ownerless(path, root_attestation)
         observed_token, created_at = observed
         if time.time() - created_at <= _LOCK_TTL_SECONDS:
             return False
@@ -809,6 +934,8 @@ class CacheLock:
 
         quarantine = path.with_name(f"{path.name}.reclaim-{uuid.uuid4().hex}")
         try:
+            if root_attestation is not None:
+                root_attestation.assert_current()
             os.rename(path, quarantine)
         except OSError:
             return False
@@ -820,11 +947,17 @@ class CacheLock:
             or time.time() - moved[1] <= _LOCK_TTL_SECONDS
         ):
             return False
+        if root_attestation is not None:
+            root_attestation.assert_current()
         _remove_private_directory(quarantine)
         return True
 
     @classmethod
-    def _reclaim_stale_ownerless(cls, path: Path) -> bool:
+    def _reclaim_stale_ownerless(
+        cls,
+        path: Path,
+        root_attestation: CacheRootAttestation | None = None,
+    ) -> bool:
         observed = cls._directory_identity(path)
         if observed is None or time.time_ns() - observed[2] <= int(
             _LOCK_TTL_SECONDS * 1_000_000_000
@@ -835,11 +968,15 @@ class CacheLock:
 
         quarantine = path.with_name(f"{path.name}.reclaim-{uuid.uuid4().hex}")
         try:
+            if root_attestation is not None:
+                root_attestation.assert_current()
             os.rename(path, quarantine)
         except OSError:
             return False
         if cls._directory_identity(quarantine) != observed:
             return False
+        if root_attestation is not None:
+            root_attestation.assert_current()
         _remove_private_directory(quarantine)
         return True
 
@@ -882,7 +1019,10 @@ class CacheLock:
 
     @classmethod
     def _cleanup_stale_init_directories(
-        cls, root: Path, current_candidate_name: str
+        cls,
+        root: Path,
+        current_candidate_name: str,
+        root_attestation: CacheRootAttestation | None = None,
     ) -> None:
         try:
             entries = list(root.iterdir())
@@ -908,7 +1048,7 @@ class CacheLock:
                 raise StockError(
                     "cache_locked", "Обновление кэша уже выполняется", 6
                 )
-            cls._reclaim_stale(entry)
+            cls._reclaim_stale(entry, root_attestation)
 
     @staticmethod
     def _read_owner(path: Path) -> tuple[str, float] | None:
@@ -1019,6 +1159,7 @@ class CacheLock:
         return token, timestamp
 
     def assert_owned(self) -> None:
+        self.root_attestation.assert_current()
         if self._directory_fencing_identity(self.path) != self.identity:
             raise StockError(
                 "cache_locked", "Право на обновление кэша было утрачено", 6
@@ -1040,25 +1181,33 @@ class CacheLock:
         self.assert_owned()
 
     def release(self) -> None:
-        if self._directory_fencing_identity(self.path) != self.identity:
-            return
-        owner = self._read_owner(self.path)
-        if owner is None or owner[0] != self.token:
-            return
-
-        quarantine = self.path.with_name(
-            f"{self.path.name}.release-{self.token}-{uuid.uuid4().hex}"
-        )
         try:
-            os.rename(self.path, quarantine)
-        except OSError:
-            return
+            self.root_attestation.assert_current()
+            if self._directory_fencing_identity(self.path) != self.identity:
+                return
+            owner = self._read_owner(self.path)
+            if owner is None or owner[0] != self.token:
+                return
 
-        if self._directory_fencing_identity(quarantine) != self.identity:
+            quarantine = self.path.with_name(
+                f"{self.path.name}.release-{self.token}-{uuid.uuid4().hex}"
+            )
+            try:
+                self.root_attestation.assert_current()
+                os.rename(self.path, quarantine)
+            except (OSError, StockError):
+                return
+
+            if self._directory_fencing_identity(quarantine) != self.identity:
+                return
+            moved = self._read_owner(quarantine)
+            if moved is not None and moved[0] == self.token:
+                self.root_attestation.assert_current()
+                _remove_private_directory(quarantine)
+        except StockError:
             return
-        moved = self._read_owner(quarantine)
-        if moved is not None and moved[0] == self.token:
-            _remove_private_directory(quarantine)
+        finally:
+            self.root_attestation.close()
 
     def __enter__(self) -> "CacheLock":
         return self
@@ -1273,6 +1422,7 @@ class StockCache:
             _fsync_directory(directory)
             return staged
         except BaseException:
+            lock.assert_owned()
             _remove_private_cache_generation(self.root, directory)
             raise
 
@@ -1284,7 +1434,7 @@ class StockCache:
         expected_sha256: str,
         lock: CacheLock,
     ) -> None:
-        destination = _PrivateDownloadDestination(path)
+        destination = _PrivateDownloadDestination(path, lock.root_attestation)
         try:
             self.client.download(
                 url,
@@ -1449,7 +1599,9 @@ class StockCache:
         _write_bytes_atomic(current_path, previous_pointer)
 
     def _remove_generation_if_inactive(self, directory: Path) -> None:
+        root_attestation: CacheRootAttestation | None = None
         try:
+            root_attestation = _attest_cache_root(self.root, create=False)
             with RuntimeCommitLock.acquire(self.root):
                 current_path = self.root / "current.json"
                 observed_current = _lstat_optional(current_path)
@@ -1467,6 +1619,7 @@ class StockCache:
                     and pointer.directory_name == directory.name
                 ):
                     return
+                root_attestation.assert_current()
                 if not _remove_private_cache_generation(self.root, directory):
                     return
                 try:
@@ -1486,6 +1639,7 @@ class StockCache:
                     if observed_status is not None and stat.S_ISREG(
                         observed_status.st_mode
                     ):
+                        root_attestation.assert_current()
                         _unlink_private_child_regular_file(
                             root_descriptor,
                             self.root,
@@ -1496,6 +1650,12 @@ class StockCache:
                     _close_optional_descriptor(root_descriptor)
         except (OSError, StockError):
             return
+        finally:
+            if root_attestation is not None:
+                try:
+                    root_attestation.close()
+                except StockError:
+                    pass
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
         lock.assert_owned()
@@ -1555,6 +1715,7 @@ class StockCache:
                     ):
                         cleanup_incomplete = True
                         break
+                    lock.root_attestation.assert_current()
                     if not _remove_private_child_directory(
                         generations_descriptor,
                         generations,
@@ -1607,6 +1768,7 @@ class StockCache:
                     ):
                         cleanup_incomplete = True
                         break
+                    lock.root_attestation.assert_current()
                     _unlink_private_child_regular_file(
                         root_descriptor,
                         self.root,
@@ -1846,6 +2008,245 @@ def _assert_runtime_commit_expected(cache_dir: Path, expected: CacheState) -> No
         or current.warning_code != expected.warning_code
     ):
         raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
+
+
+def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
+    """Initialize an empty cache leaf or validate its strict ownership marker."""
+    descriptor: int | None = None
+    try:
+        observed = _lstat_optional(root)
+        if observed is None:
+            if not create:
+                raise _cache_unavailable()
+            _create_cache_root_leaf(root)
+            observed = root.lstat()
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or _is_windows_directory_reparse_point(root, observed)
+        ):
+            raise _cache_unavailable()
+        if os.name == "posix":
+            descriptor = _open_directory_descriptor_without_hardening(root)
+            pinned = os.fstat(descriptor)
+            effective_uid = getattr(os, "geteuid", lambda: pinned.st_uid)()
+            if pinned.st_uid != effective_uid:
+                raise _cache_unavailable()
+        else:
+            pinned = observed
+
+        marker = _lstat_optional(root / _CACHE_ROOT_MARKER_NAME)
+        if marker is None:
+            if not create:
+                raise _cache_unavailable()
+            entries = _list_cache_root_names(root, descriptor)
+            if any(
+                name != _CACHE_ROOT_MARKER_NAME
+                and not _CACHE_ROOT_INIT_TEMP.fullmatch(name)
+                for name in entries
+            ):
+                raise _cache_unavailable()
+            _publish_cache_root_marker(root, descriptor)
+
+        token = _read_cache_root_marker(root, descriptor)
+        if os.name == "posix":
+            os.fchmod(descriptor, _PRIVATE_DIRECTORY_MODE)
+            hardened = os.fstat(descriptor)
+            if (
+                not _same_file_identity(pinned, hardened)
+                or stat.S_IMODE(hardened.st_mode) != _PRIVATE_DIRECTORY_MODE
+            ):
+                raise _cache_unavailable()
+            pinned = hardened
+        attestation = CacheRootAttestation(root, descriptor, pinned, token)
+        descriptor = None
+        attestation.assert_current()
+        return attestation
+    except StockError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        _close_optional_descriptor(descriptor)
+
+
+def _create_cache_root_leaf(root: Path) -> None:
+    if root.parent == root or not root.name:
+        raise _cache_unavailable()
+    missing: list[Path] = []
+    cursor = root
+    while _lstat_optional(cursor) is None:
+        missing.append(cursor)
+        cursor = cursor.parent
+        if cursor == cursor.parent and _lstat_optional(cursor) is None:
+            raise _cache_unavailable()
+    if os.name == "posix":
+        existing_parent = cursor.lstat()
+        if not stat.S_ISDIR(existing_parent.st_mode) or not (
+            _parent_protects_private_directory_bootstrap(existing_parent)
+        ):
+            raise _cache_unavailable()
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+        except FileExistsError:
+            pass
+        observed = directory.lstat()
+        if not stat.S_ISDIR(observed.st_mode) or _is_windows_directory_reparse_point(
+            directory, observed
+        ):
+            raise _cache_unavailable()
+        if os.name == "posix":
+            effective_uid = getattr(os, "geteuid", lambda: observed.st_uid)()
+            if observed.st_uid != effective_uid:
+                raise _cache_unavailable()
+            os.chmod(directory, _PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
+
+
+def _list_cache_root_names(root: Path, descriptor: int | None) -> list[str]:
+    if descriptor is not None:
+        return list(os.listdir(descriptor))
+    return [entry.name for entry in root.iterdir()]
+
+
+def _cache_root_marker_payload(token: str) -> bytes:
+    return json.dumps(
+        {
+            "kind": _CACHE_ROOT_MARKER_KIND,
+            "schema_version": _CACHE_ROOT_MARKER_VERSION,
+            "ownership_token": token,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _publish_cache_root_marker(root: Path, descriptor: int | None) -> None:
+    token = secrets.token_hex(16)
+    temporary_name = f".papa-shin-stock-cache-root.init-{token}.tmp"
+    payload = _cache_root_marker_payload(token)
+    file_descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if descriptor is not None:
+            file_descriptor = os.open(
+                temporary_name,
+                flags,
+                _PRIVATE_FILE_MODE,
+                dir_fd=descriptor,
+            )
+        else:
+            file_descriptor = os.open(root / temporary_name, flags, _PRIVATE_FILE_MODE)
+        if os.name == "posix":
+            os.fchmod(file_descriptor, _PRIVATE_FILE_MODE)
+        with os.fdopen(file_descriptor, "wb") as stream:
+            file_descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            if descriptor is not None:
+                os.link(
+                    temporary_name,
+                    _CACHE_ROOT_MARKER_NAME,
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            else:
+                os.link(root / temporary_name, root / _CACHE_ROOT_MARKER_NAME)
+        except FileExistsError:
+            pass
+        if descriptor is not None:
+            _fsync_directory_descriptor(descriptor)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        try:
+            if descriptor is not None:
+                os.unlink(temporary_name, dir_fd=descriptor)
+            else:
+                (root / temporary_name).unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+
+
+def _read_cache_root_marker(root: Path, descriptor: int | None) -> str:
+    marker_path = root / _CACHE_ROOT_MARKER_NAME
+    file_descriptor = -1
+    try:
+        observed = (
+            os.stat(
+                _CACHE_ROOT_MARKER_NAME,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if descriptor is not None
+            else marker_path.lstat()
+        )
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or _is_windows_directory_reparse_point(marker_path, observed)
+            or observed.st_size > _CACHE_ROOT_MARKER_MAX_BYTES
+        ):
+            raise _cache_unavailable()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = (
+            os.open(_CACHE_ROOT_MARKER_NAME, flags, dir_fd=descriptor)
+            if descriptor is not None
+            else os.open(marker_path, flags)
+        )
+        opened = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file_identity(
+            observed, opened
+        ):
+            raise _cache_unavailable()
+        if os.name == "posix":
+            effective_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
+            if (
+                opened.st_uid != effective_uid
+                or stat.S_IMODE(opened.st_mode) != _PRIVATE_FILE_MODE
+            ):
+                raise _cache_unavailable()
+        payload = os.read(file_descriptor, _CACHE_ROOT_MARKER_MAX_BYTES + 1)
+        if len(payload) > _CACHE_ROOT_MARKER_MAX_BYTES:
+            raise _cache_unavailable()
+        if payload != payload.strip():
+            raise _cache_unavailable()
+        value = _parse_json(payload.decode("utf-8"))
+        if not isinstance(value, dict) or set(value) != {
+            "kind",
+            "schema_version",
+            "ownership_token",
+        }:
+            raise _cache_unavailable()
+        token = value.get("ownership_token")
+        if (
+            value.get("kind") != _CACHE_ROOT_MARKER_KIND
+            or value.get("schema_version") != _CACHE_ROOT_MARKER_VERSION
+            or not isinstance(token, str)
+            or not _CACHE_ROOT_TOKEN.fullmatch(token)
+        ):
+            raise _cache_unavailable()
+        confirmed = os.fstat(file_descriptor)
+        if not _same_file_identity(opened, confirmed):
+            raise _cache_unavailable()
+        return token
+    except StockError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ) as error:
+        raise _cache_unavailable() from error
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
 
 
 def _lstat_optional(path: Path) -> os.stat_result | None:

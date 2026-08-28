@@ -825,6 +825,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.cache_root = Path(self.temp_dir.name) / "cache"
+        cache_module._attest_cache_root(self.cache_root, create=True).close()
         self.generation = self.cache_root / "generations" / "generation-existing"
         self.generation.mkdir(parents=True)
         products = (FIXTURES_DIR / "products.jsonl").read_bytes()
