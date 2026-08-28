@@ -850,11 +850,14 @@ class StockCacheTest(unittest.TestCase):
         parent.mkdir(mode=0o700)
         target = parent / "private-cache"
         parked = parent / "parked-created-cache"
-        outside = Path(self.temp_dir.name) / "outside-directory"
+        outside = parent / "outside-directory"
         outside.mkdir(mode=0o755)
         marker = outside / "must-survive.txt"
         marker.write_text("safe", encoding="utf-8")
         os.chmod(outside, 0o755)
+        outside_before = outside.stat()
+        outside_identity = (outside_before.st_dev, outside_before.st_ino)
+        outside_mode = stat.S_IMODE(outside_before.st_mode)
         real_stat = os.stat
         swapped = False
 
@@ -871,9 +874,23 @@ class StockCacheTest(unittest.TestCase):
                 and kwargs.get("dir_fd") is not None
                 and kwargs.get("follow_symlinks") is False
             ):
+                parent_descriptor = kwargs["dir_fd"]
+                try:
+                    os.rename(
+                        target.name,
+                        parked.name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                    )
+                    os.rename(
+                        outside.name,
+                        target.name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                    )
+                except OSError as error:
+                    raise AssertionError("synthetic directory swap failed") from error
                 swapped = True
-                os.rename(target, parked)
-                os.rename(outside, target)
             return observed
 
         previous_umask = os.umask(0o777)
@@ -889,7 +906,12 @@ class StockCacheTest(unittest.TestCase):
             os.umask(previous_umask)
 
         self.assertTrue(swapped)
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        target_after = target.stat()
+        self.assertEqual(
+            (target_after.st_dev, target_after.st_ino),
+            outside_identity,
+        )
+        self.assertEqual(stat.S_IMODE(target_after.st_mode), outside_mode)
         self.assertEqual((target / marker.name).read_text(encoding="utf-8"), "safe")
 
     @unittest.skipUnless(os.name == "posix", "POSIX parent modes проверяются на POSIX")
@@ -2892,13 +2914,18 @@ class StockCacheTest(unittest.TestCase):
         self.fixture.seed_generation()
         first_at_pointer = threading.Event()
         allow_first_pointer = threading.Event()
-        second_waiting = threading.Event()
-        second_done = threading.Event()
+        second_holds_publish_lock = threading.Event()
+        allow_second_publish = threading.Event()
+        first_before_release = threading.Event()
+        allow_first_release = threading.Event()
+        second_lock_published = threading.Event()
         first_errors: list[BaseException] = []
         second_errors: list[BaseException] = []
         second_results: list[object] = []
         real_write_json = cache_module._write_json_atomic_at
         real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
+        real_cache_acquire = CacheLock.acquire
+        real_cache_release = CacheLock.release
 
         def pause_first_pointer(
             parent_descriptor: int, name: str, value: object
@@ -2916,9 +2943,27 @@ class StockCacheTest(unittest.TestCase):
             root: Path,
             root_attestation: cache_module.CacheRootAttestation | None = None,
         ) -> object:
+            acquired = real_publish_acquire(root, root_attestation)
+            if threading.current_thread().name != "second-activation":
+                return acquired
+            second_holds_publish_lock.set()
+            if not allow_second_publish.wait(timeout=5):
+                acquired.release(suppress_errors=True)
+                raise AssertionError("second publish timeout")
+            return acquired
+
+        def observe_cache_acquire(root: Path) -> CacheLock:
+            acquired = real_cache_acquire(root)
             if threading.current_thread().name == "second-activation":
-                second_waiting.set()
-            return real_publish_acquire(root, root_attestation)
+                second_lock_published.set()
+            return acquired
+
+        def pause_first_release(lock: CacheLock) -> None:
+            if threading.current_thread().name == "first-activation":
+                first_before_release.set()
+                if not allow_first_release.wait(timeout=5):
+                    raise AssertionError("first release timeout")
+            real_cache_release(lock)
 
         def run_first() -> None:
             try:
@@ -2941,32 +2986,36 @@ class StockCacheTest(unittest.TestCase):
                 )
             except BaseException as error:
                 second_errors.append(error)
-            finally:
-                second_done.set()
 
         with patch.object(
             cache_module, "_write_json_atomic_at", side_effect=pause_first_pointer
         ):
-            with patch.object(
-                cache_module._RefreshLockPublishLock,
-                "acquire",
-                side_effect=observe_second_wait,
-            ):
-                first = threading.Thread(target=run_first, name="first-activation")
-                first.start()
-                self.assertTrue(first_at_pointer.wait(timeout=5))
-                self._expire_current_refresh_lock()
-                second = threading.Thread(
-                    target=run_second, name="second-activation"
-                )
-                second.start()
-                self.assertTrue(second_waiting.wait(timeout=5))
-                second_completed_while_first_paused = second_done.wait(timeout=1)
-                allow_first_pointer.set()
-                first.join(timeout=5)
-                second.join(timeout=5)
+            with patch.object(CacheLock, "acquire", side_effect=observe_cache_acquire):
+                with patch.object(CacheLock, "release", pause_first_release):
+                    with patch.object(
+                        cache_module._RefreshLockPublishLock,
+                        "acquire",
+                        side_effect=observe_second_wait,
+                    ):
+                        first = threading.Thread(
+                            target=run_first, name="first-activation"
+                        )
+                        first.start()
+                        self.assertTrue(first_at_pointer.wait(timeout=5))
+                        second = threading.Thread(
+                            target=run_second, name="second-activation"
+                        )
+                        second.start()
+                        allow_first_pointer.set()
+                        self.assertTrue(second_holds_publish_lock.wait(timeout=5))
+                        self.assertTrue(first_before_release.wait(timeout=5))
+                        self._expire_current_refresh_lock()
+                        allow_second_publish.set()
+                        self.assertTrue(second_lock_published.wait(timeout=5))
+                        allow_first_release.set()
+                        first.join(timeout=5)
+                        second.join(timeout=5)
 
-        self.assertFalse(second_completed_while_first_paused)
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(first_errors, [])
