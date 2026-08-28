@@ -760,3 +760,13 @@ Expected: только файлы skill, документация, tests и task
 - Очистка SQLite spool выполняет три bounded fallback-попытки. Неудалённый каталог регистрируется для повторной очистки при завершении процесса; primary error сохраняется, успешная операция с cleanup failure возвращает безопасный `cache_unavailable`, приватный путь не раскрывается.
 - TDD RED подтверждён отдельным прогоном до реализации: новые проверки integer, JSONL/row/spool budget, cleanup registry и строгого help завершались ожидаемыми failures/errors.
 - GREEN подтверждён focused-прогоном `tests.test_search` и полным suite: Python 3.11 и 3.12 — по 202 tests, `OK`. Нативная Windows остаётся непроверенной платформой.
+
+### Task 6 — Fix-wave Cluster C, fix round 1, 28.08.2026
+
+- Добавлены covering index предложений `(id, price COLLATE decimal, delivery_days, quantity DESC)` и индекс кандидатов по наличию предложения, минимальной цене, остатку и ID.
+- Production SQL проверяется через trace + `EXPLAIN QUERY PLAN`: повторные `SCAN o`, correlated full scan и `USE TEMP B-TREE` отсутствуют; trim использует covering index. Bounded scaling подтверждён числом SQLite VM steps на 20 и 2 000 нерелевантных строках без зависимости от wall time.
+- Page budget 8 GiB применяется и проверяется отдельно для `main` и инициализированной `temp` schema. Рост temp-таблицы сверх уменьшенного тестового budget завершается fail-closed; потенциально неограниченный sorter temp-файл исключён устранением всех `USE TEMP B-TREE` в фактических планах поиска.
+- Atexit cleanup больше не использует warnings: callback очищает bounded registry до 64 записей, перехватывает любые terminal failures и пишет через bounded `os.write` ровно одну фиксированную безопасную строку без пути, исходной ошибки и traceback. Subprocess с двумя failures и `PYTHONWARNINGS=error` завершается с кодом 0; закрытый stderr также не приводит к исключению.
+- Документация уточняет отдельные main/temp budgets, суммарный SQLite disk envelope, риск накопления orphan-каталогов и безопасную operator guidance без destructive-команд.
+- TDD RED подтверждён до реализации: планы содержали повторные `SCAN o` и два temp B-tree, VM steps росли линейно, `temp.max_page_count` оставался системным default, registry был неограничен, subprocess сохранял две записи без диагностики.
+- GREEN: focused `tests.test_search` — 66 tests; полный suite Python 3.11 и 3.12 — по 208 tests, `OK`; `compileall` на обеих версиях — `OK`. Нативная Windows остаётся непроверенной платформой.

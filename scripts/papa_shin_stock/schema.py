@@ -3,12 +3,12 @@ from __future__ import annotations
 import atexit
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
 import tempfile
 import threading
-import warnings
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -32,10 +32,14 @@ MAX_PRODUCT_ROWS = 5_000_000
 MAX_OFFER_ROWS = 50_000_000
 MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
 MAX_SPOOL_RECORDS = MAX_PRODUCT_ROWS + MAX_OFFER_ROWS
+MAX_PENDING_SPOOL_CLEANUPS = 64
 
 _SQLITE_PAGE_BYTES = 4096
 _SQLITE_CACHE_KIB = 64 * 1024
 _SPOOL_CLEANUP_ATTEMPTS = 3
+_SPOOL_CLEANUP_DIAGNOSTIC = (
+    b"papa-shin-stock: temporary search cleanup incomplete\n"
+)
 _CANONICAL_NONNEGATIVE_INTEGER = re.compile(r"^(?:0|\+?[1-9][0-9]*)$")
 _PENDING_SPOOL_CLEANUPS: dict[Path, object] = {}
 _PENDING_SPOOL_CLEANUPS_LOCK = threading.Lock()
@@ -106,9 +110,43 @@ def _remove_spool_directory(path: Path) -> bool:
     return False
 
 
-def _register_spool_cleanup(path: Path, temporary: object) -> None:
+def _detach_temporary_finalizer(temporary: object) -> None:
+    try:
+        finalizer = getattr(temporary, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
+    except BaseException:
+        pass
+
+
+def _write_spool_cleanup_diagnostic() -> None:
+    remaining = memoryview(_SPOOL_CLEANUP_DIAGNOSTIC)
+    for _ in range(3):
+        if not remaining:
+            return
+        try:
+            written = os.write(2, remaining)
+        except InterruptedError:
+            continue
+        except BaseException:
+            return
+        if written <= 0:
+            return
+        remaining = remaining[written:]
+
+
+def _register_spool_cleanup(path: Path, temporary: object) -> bool:
+    registered = True
     with _PENDING_SPOOL_CLEANUPS_LOCK:
-        _PENDING_SPOOL_CLEANUPS[path] = temporary
+        if (
+            path not in _PENDING_SPOOL_CLEANUPS
+            and len(_PENDING_SPOOL_CLEANUPS) >= MAX_PENDING_SPOOL_CLEANUPS
+        ):
+            registered = False
+        else:
+            _PENDING_SPOOL_CLEANUPS[path] = temporary
+    _detach_temporary_finalizer(temporary)
+    return registered
 
 
 def _retry_pending_spool_cleanups() -> None:
@@ -122,15 +160,34 @@ def _retry_pending_spool_cleanups() -> None:
                 pass
             with _PENDING_SPOOL_CLEANUPS_LOCK:
                 _PENDING_SPOOL_CLEANUPS.pop(path, None)
-        else:
-            warnings.warn(
-                "Не удалось удалить временное хранилище поиска",
-                ResourceWarning,
-                stacklevel=1,
-            )
+            continue
 
 
-atexit.register(_retry_pending_spool_cleanups)
+def _cleanup_spools_at_exit() -> None:
+    terminal_failure = False
+    try:
+        with _PENDING_SPOOL_CLEANUPS_LOCK:
+            pending = tuple(_PENDING_SPOOL_CLEANUPS.items())
+            _PENDING_SPOOL_CLEANUPS.clear()
+        for path, temporary in pending:
+            try:
+                removed = _remove_spool_directory(path)
+            except BaseException:
+                removed = False
+            if not removed:
+                terminal_failure = True
+                continue
+            try:
+                temporary.cleanup()
+            except BaseException:
+                pass
+    except BaseException:
+        terminal_failure = True
+    if terminal_failure:
+        _write_spool_cleanup_diagnostic()
+
+
+atexit.register(_cleanup_spools_at_exit)
 
 
 class _Spool:
@@ -145,9 +202,14 @@ class _Spool:
             self.db.create_collation("decimal", _decimal_compare)
             self.db.executescript(
                 "CREATE TABLE c("
-                "id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT"
+                "id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT,"
+                "ho INTEGER NOT NULL,mp TEXT"
                 ");"
+                "CREATE INDEX c_by_offer_price_quantity "
+                "ON c(ho DESC,mp COLLATE decimal,q DESC,id);"
                 "CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER);"
+                "CREATE INDEX o_by_product_price_delivery_quantity "
+                "ON o(id,p COLLATE decimal,d,q DESC);"
             )
         except (
             sqlite3.Error,
@@ -173,20 +235,29 @@ class _Spool:
         connection = self._connection()
         if MAX_SPOOL_BYTES < _SQLITE_PAGE_BYTES:
             raise ValueError("invalid spool byte budget")
-        connection.execute(f"PRAGMA page_size={_SQLITE_PAGE_BYTES}")
-        page_row = connection.execute("PRAGMA page_size").fetchone()
-        if page_row is None or not isinstance(page_row[0], int) or page_row[0] <= 0:
-            raise ValueError("invalid SQLite page size")
-        max_pages = MAX_SPOOL_BYTES // page_row[0]
-        max_page_row = connection.execute(
-            f"PRAGMA max_page_count={max_pages}"
-        ).fetchone()
-        if max_page_row is None or max_page_row[0] > max_pages:
-            raise ValueError("SQLite page limit was not applied")
+        self._configure_page_budget("main")
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA mmap_size=0")
         connection.execute(f"PRAGMA cache_size=-{_SQLITE_CACHE_KIB}")
         connection.execute("PRAGMA temp_store=FILE")
+        connection.execute(f"PRAGMA temp.page_size={_SQLITE_PAGE_BYTES}")
+        connection.execute("CREATE TEMP TABLE _spool_budget_probe(value INTEGER)")
+        connection.execute("DROP TABLE temp._spool_budget_probe")
+        self._configure_page_budget("temp")
+        connection.execute(f"PRAGMA temp.cache_size=-{_SQLITE_CACHE_KIB}")
+
+    def _configure_page_budget(self, schema: str) -> None:
+        connection = self._connection()
+        connection.execute(f"PRAGMA {schema}.page_size={_SQLITE_PAGE_BYTES}")
+        page_row = connection.execute(f"PRAGMA {schema}.page_size").fetchone()
+        if page_row is None or type(page_row[0]) is not int or page_row[0] <= 0:
+            raise ValueError("invalid SQLite page size")
+        max_pages = MAX_SPOOL_BYTES // page_row[0]
+        max_page_row = connection.execute(
+            f"PRAGMA {schema}.max_page_count={max_pages}"
+        ).fetchone()
+        if max_page_row != (max_pages,):
+            raise ValueError("SQLite page limit was not applied")
 
     def _cleanup(self) -> BaseException | None:
         failed = False
@@ -214,13 +285,14 @@ class _Spool:
                 cleanup_failed = True
             removed = _remove_spool_directory(name)
             if not removed:
-                _register_spool_cleanup(name, temporary)
+                if not _register_spool_cleanup(name, temporary):
+                    _write_spool_cleanup_diagnostic()
                 failed = True
             elif cleanup_failed:
                 try:
                     temporary.cleanup()
                 except (OSError, ValueError):
-                    pass
+                    _detach_temporary_finalizer(temporary)
             self.temp = None
         return _SpoolCleanupFailure("spool cleanup failed") if failed else None
 
@@ -236,7 +308,7 @@ class _Spool:
     def add_product(self, p: Product) -> None:
         try:
             self._connection().execute(
-                "INSERT INTO c VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO c VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     p.product_id,
                     p.name,
@@ -245,6 +317,8 @@ class _Spool:
                     json.dumps(p.characteristics),
                     p.total_quantity,
                     json.dumps(p.unknown_characteristics),
+                    0,
+                    None,
                 ),
             )
             self.records += 1
@@ -288,12 +362,13 @@ class _Spool:
 
     def add_offer(self, ident: str, offer: Offer, limit: int) -> None:
         try:
+            price = _price_text(offer.price)
             self._connection().execute(
                 "INSERT INTO o VALUES(?,?,?,?,?)",
                 (
                     ident,
                     offer.supplier,
-                    _price_text(offer.price),
+                    price,
                     offer.delivery_days,
                     offer.quantity,
                 ),
@@ -304,6 +379,12 @@ class _Spool:
                 "ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",
                 (ident, ident, limit),
             ).rowcount
+            self._connection().execute(
+                "UPDATE c SET ho=1,mp=CASE "
+                "WHEN mp IS NULL OR ? COLLATE decimal < mp COLLATE decimal "
+                "THEN ? ELSE mp END WHERE id=?",
+                (price, price, ident),
+            )
             self.records += 1 - max(deleted, 0)
             self._assert_record_budget()
         except OverflowError as error:
@@ -322,9 +403,9 @@ class _Spool:
             raise _spool_unavailable() from error
     def result(self, query: SearchQuery) -> tuple[SearchSummary,tuple[Product,...],dict[str,tuple[Offer,...]]]:
         try:
-            required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE EXISTS(SELECT 1 FROM o WHERE o.id=c.id)" if required else ""
+            required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE ho=1" if required else ""
             count,total=self._connection().execute(f"SELECT COUNT(*),COALESCE(SUM(q),0) FROM c {where}").fetchone()
-            rows=self._connection().execute(f"SELECT id,n,a,t,ch,q,u FROM c {where} ORDER BY CASE WHEN EXISTS(SELECT 1 FROM o WHERE o.id=c.id) THEN 0 ELSE 1 END,(SELECT p FROM o WHERE o.id=c.id ORDER BY p COLLATE decimal,d,q DESC LIMIT 1) COLLATE decimal,q DESC,id LIMIT ?",(query.limit,))
+            rows=self._connection().execute(f"SELECT id,n,a,t,ch,q,u FROM c {where} ORDER BY ho DESC,mp COLLATE decimal,q DESC,id LIMIT ?",(query.limit,))
             products=[]; offers={}
             for row in rows:
                 product=Product(row[0],row[1],row[2],row[3],json.loads(row[4]),row[5],tuple(json.loads(row[6]))); products.append(product)

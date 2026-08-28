@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -338,6 +340,127 @@ class StockSearchTest(unittest.TestCase):
                     spool.add_product(oversized)
 
         self.assertNotIn(str(self.generation_dir), str(raised.exception))
+
+    def test_offer_queries_use_composite_index_without_repeated_offer_scans(self) -> None:
+        with schema_module._Spool() as spool:
+            connection = spool._connection()
+            spool.add_product(Product("synthetic", "N", "A", "T", {}, 4, ()))
+            statements: list[str] = []
+            connection.set_trace_callback(statements.append)
+            spool.add_offer(
+                "synthetic",
+                Offer("Synthetic", Decimal("1"), 1, 1),
+                5,
+            )
+            spool.result(
+                SearchQuery.from_args(argparse.Namespace(supplier="Synthetic"))
+            )
+            connection.set_trace_callback(None)
+            relevant = tuple(
+                statement
+                for statement in statements
+                if statement.startswith(("DELETE", "SELECT"))
+            )
+            plans = tuple(
+                (
+                    statement,
+                    tuple(
+                        row[3]
+                        for row in connection.execute(
+                            "EXPLAIN QUERY PLAN " + statement
+                        )
+                    ),
+                )
+                for statement in relevant
+            )
+
+        self.assertTrue(relevant)
+        for statement, details in plans:
+            with self.subTest(statement=statement, details=details):
+                self.assertFalse(
+                    any(detail.startswith("SCAN o") for detail in details)
+                )
+                self.assertNotIn("USE TEMP B-TREE FOR ORDER BY", details)
+        trim_plan = next(
+            details for statement, details in plans if statement.startswith("DELETE")
+        )
+        self.assertTrue(
+            any("USING COVERING INDEX" in detail for detail in trim_plan)
+        )
+        product_plan = next(
+            details
+            for statement, details in plans
+            if statement.startswith("SELECT id,n,a,t,ch,q,u")
+        )
+        self.assertTrue(
+            any("c_by_offer_price_quantity" in detail for detail in product_plan)
+        )
+
+    def test_offer_trim_vm_work_stays_bounded_as_unrelated_rows_grow(self) -> None:
+        def measured_steps(unrelated_rows: int) -> int:
+            with schema_module._Spool() as spool:
+                connection = spool._connection()
+                connection.executemany(
+                    "INSERT INTO o VALUES(?,?,?,?,?)",
+                    (
+                        (f"other-{index}", "S", "1", 1, 1)
+                        for index in range(unrelated_rows)
+                    ),
+                )
+                steps = 0
+
+                def count_step() -> int:
+                    nonlocal steps
+                    steps += 1
+                    return 0
+
+                connection.set_progress_handler(count_step, 1)
+                try:
+                    spool.add_offer(
+                        "target",
+                        Offer("S", Decimal("1"), 1, 1),
+                        5,
+                    )
+                finally:
+                    connection.set_progress_handler(None, 0)
+                return steps
+
+        small = measured_steps(20)
+        large = measured_steps(2_000)
+
+        self.assertLess(large, small * 4)
+
+    def test_main_and_temp_page_budgets_are_applied_and_temp_growth_is_capped(
+        self,
+    ) -> None:
+        maximum_pages = 16
+        with patch.object(
+            schema_module,
+            "MAX_SPOOL_BYTES",
+            maximum_pages * 4096,
+        ):
+            with schema_module._Spool() as spool:
+                connection = spool._connection()
+                main_limit = connection.execute(
+                    "PRAGMA main.max_page_count"
+                ).fetchone()
+                temp_limit = connection.execute(
+                    "PRAGMA temp.max_page_count"
+                ).fetchone()
+                temp_page_size = connection.execute(
+                    "PRAGMA temp.page_size"
+                ).fetchone()
+
+                self.assertEqual(main_limit, (maximum_pages,))
+                self.assertEqual(temp_limit, (maximum_pages,))
+                self.assertEqual(temp_page_size, (4096,))
+
+                connection.execute("CREATE TEMP TABLE temp_growth(value BLOB)")
+                with self.assertRaises(sqlite3.Error):
+                    connection.execute(
+                        "INSERT INTO temp_growth VALUES(zeroblob(?))",
+                        (128 * 1024,),
+                    )
 
     def test_more_than_ten_thousand_products_returns_exact_top_result(self) -> None:
         product = (
@@ -1664,6 +1787,73 @@ class SqliteFailureNormalizationTest(unittest.TestCase):
 
         self.assertFalse(directory.exists())
         self.assertNotIn(directory, schema_module._PENDING_SPOOL_CLEANUPS)
+
+    def test_pending_cleanup_registry_is_bounded(self) -> None:
+        registered: list[Path] = []
+        with patch.object(schema_module, "MAX_PENDING_SPOOL_CLEANUPS", 2):
+            for index in range(3):
+                path = Path(self.temp_dir.name) / f"pending-{index}"
+                registered.append(path)
+                schema_module._register_spool_cleanup(path, object())
+
+        self.assertEqual(len(schema_module._PENDING_SPOOL_CLEANUPS), 2)
+        for path in registered:
+            schema_module._PENDING_SPOOL_CLEANUPS.pop(path, None)
+
+    def test_atexit_terminal_failures_are_safe_once_and_clear_registry(self) -> None:
+        observer = (
+            "import atexit, os\n"
+            "def observe():\n"
+            "    from papa_shin_stock import schema\n"
+            "    os.write(1, (str(len(schema._PENDING_SPOOL_CLEANUPS)) + '\\n').encode())\n"
+            "atexit.register(observe)\n"
+            "from pathlib import Path\n"
+            "from papa_shin_stock import schema\n"
+            "class Temporary:\n"
+            "    def cleanup(self):\n"
+            "        raise PermissionError('/private/cleanup')\n"
+            "for name in ('first', 'second'):\n"
+            "    schema._register_spool_cleanup(Path('/private') / name, Temporary())\n"
+            "schema._remove_spool_directory = lambda path: False\n"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONWARNINGS"] = "error"
+        environment["PYTHONPATH"] = str(SCRIPTS_DIR)
+
+        completed = subprocess.run(
+            [sys.executable, "-c", observer],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "0\n")
+        self.assertEqual(
+            completed.stderr,
+            "papa-shin-stock: temporary search cleanup incomplete\n",
+        )
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertNotIn("/private", completed.stderr)
+
+    def test_atexit_cleanup_does_not_raise_when_stderr_is_unavailable(self) -> None:
+        path = Path(self.temp_dir.name) / "terminal-failure"
+        schema_module._register_spool_cleanup(path, object())
+
+        with patch.object(
+            schema_module,
+            "_remove_spool_directory",
+            return_value=False,
+        ):
+            with patch.object(
+                schema_module.os,
+                "write",
+                side_effect=OSError("/private/stderr"),
+            ):
+                schema_module._cleanup_spools_at_exit()
+
+        self.assertEqual(schema_module._PENDING_SPOOL_CLEANUPS, {})
 
 
 class SearchStockCliTest(unittest.TestCase):
