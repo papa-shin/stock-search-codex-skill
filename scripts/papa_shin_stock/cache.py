@@ -774,38 +774,20 @@ class CacheLock:
                 or not stat.S_ISDIR(moved_identity.st_mode)
                 or (moved_identity.st_dev, moved_identity.st_ino) != identity
             ):
-                cls._restore_owned_quarantine(
-                    root_descriptor,
-                    root,
-                    path.name,
-                    quarantine.name,
-                    canonical,
-                    lock_descriptor,
-                    inventory,
-                    token,
-                )
                 return False
             moved_owner = cls._read_owner_from_directory_descriptor(
                 lock_descriptor,
                 moved_identity,
             )
             if moved_owner is None or moved_owner[0] != token:
-                cls._restore_owned_quarantine(
-                    root_descriptor,
-                    root,
-                    path.name,
-                    quarantine.name,
-                    moved_identity,
-                    lock_descriptor,
-                    inventory,
-                    token,
-                )
                 return False
-            removed = _remove_private_child_directory(
+            removed = _remove_retained_private_child_directory(
                 root_descriptor,
                 root,
                 quarantine.name,
                 moved_identity,
+                lock_descriptor,
+                inventory,
             )
             remaining = _lstat_private_child(
                 root_descriptor,
@@ -824,34 +806,6 @@ class CacheLock:
                 os.close(root_descriptor)
             except OSError:
                 pass
-
-    @classmethod
-    def _restore_owned_quarantine(
-        cls,
-        parent_descriptor: int,
-        parent: Path,
-        name: str,
-        quarantine_name: str,
-        expected: os.stat_result,
-        directory_descriptor: int,
-        inventory: dict[str, os.stat_result],
-        token: str,
-    ) -> bool:
-        owner = cls._read_owner_from_directory_descriptor(
-            directory_descriptor,
-            expected,
-        )
-        if owner is None or owner[0] != token:
-            return False
-        return _restore_private_quarantine(
-            parent_descriptor,
-            parent,
-            name,
-            quarantine_name,
-            expected,
-            directory_descriptor,
-            inventory,
-        )
 
     @classmethod
     def _reclaim_stale(cls, path: Path) -> bool:
@@ -884,11 +838,6 @@ class CacheLock:
             or moved[0] != observed_token
             or time.time() - moved[1] <= _LOCK_TTL_SECONDS
         ):
-            try:
-                if not path.exists():
-                    os.rename(quarantine, path)
-            except OSError:
-                pass
             return False
         _remove_private_directory(quarantine)
         return True
@@ -909,11 +858,6 @@ class CacheLock:
         except OSError:
             return False
         if cls._directory_identity(quarantine) != observed:
-            try:
-                if not path.exists():
-                    os.rename(quarantine, path)
-            except OSError:
-                pass
             return False
         _remove_private_directory(quarantine)
         return True
@@ -1130,21 +1074,10 @@ class CacheLock:
             return
 
         if self._directory_fencing_identity(quarantine) != self.identity:
-            try:
-                if not self.path.exists():
-                    os.rename(quarantine, self.path)
-            except OSError:
-                pass
             return
         moved = self._read_owner(quarantine)
         if moved is not None and moved[0] == self.token:
             _remove_private_directory(quarantine)
-            return
-        try:
-            if not self.path.exists():
-                os.rename(quarantine, self.path)
-        except OSError:
-            pass
 
     def __enter__(self) -> "CacheLock":
         return self
@@ -2538,15 +2471,6 @@ def _remove_private_child_directory(
             or not stat.S_ISDIR(moved.st_mode)
             or not _same_file_identity(observed, moved)
         ):
-            _restore_private_quarantine(
-                parent_descriptor,
-                parent,
-                name,
-                quarantine_name,
-                observed,
-                directory_descriptor,
-                inventory,
-            )
             return False
         if not _empty_private_directory_descriptor(
             directory_descriptor,
@@ -2576,6 +2500,65 @@ def _remove_private_child_directory(
     except OSError:
         return False
     return True
+
+
+def _remove_retained_private_child_directory(
+    parent_descriptor: int,
+    parent: Path,
+    name: str,
+    expected: os.stat_result,
+    directory_descriptor: int,
+    inventory: dict[str, os.stat_result],
+) -> bool:
+    try:
+        observed = _lstat_private_child(
+            parent_descriptor,
+            parent,
+            name,
+            missing_ok=True,
+        )
+        opened = os.fstat(directory_descriptor)
+        if (
+            observed is None
+            or not stat.S_ISDIR(observed.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not _same_file_identity(expected, observed)
+            or not _same_file_identity(expected, opened)
+        ):
+            return False
+        if not _empty_private_directory_descriptor(
+            directory_descriptor,
+            parent / name,
+            inventory,
+        ):
+            return False
+        confirmed = _lstat_private_child(
+            parent_descriptor,
+            parent,
+            name,
+            missing_ok=True,
+        )
+        confirmed_opened = os.fstat(directory_descriptor)
+        if (
+            confirmed is None
+            or not stat.S_ISDIR(confirmed.st_mode)
+            or not stat.S_ISDIR(confirmed_opened.st_mode)
+            or not _same_file_identity(expected, confirmed)
+            or not _same_file_identity(expected, confirmed_opened)
+        ):
+            return False
+        os.rmdir(name, dir_fd=parent_descriptor)
+        return (
+            _lstat_private_child(
+                parent_descriptor,
+                parent,
+                name,
+                missing_ok=True,
+            )
+            is None
+        )
+    except (OSError, StockError):
+        return False
 
 
 def _open_private_child_directory_for_deletion(
@@ -2686,88 +2669,6 @@ def _snapshot_private_flat_directory_descriptor(
         return inventory
     except StockError:
         return None
-
-
-def _private_flat_directory_matches_inventory(
-    descriptor: int,
-    inventory: dict[str, os.stat_result],
-) -> bool:
-    try:
-        if set(_list_private_directory_descriptor(descriptor)) != set(inventory):
-            return False
-        for name, expected in inventory.items():
-            observed = _lstat_private_child_descriptor(
-                descriptor,
-                name,
-                missing_ok=True,
-            )
-            if (
-                observed is None
-                or not stat.S_ISREG(observed.st_mode)
-                or not _same_file_identity(expected, observed)
-            ):
-                return False
-        return True
-    except StockError:
-        return False
-
-
-def _restore_private_quarantine(
-    parent_descriptor: int,
-    parent: Path,
-    name: str,
-    quarantine_name: str,
-    expected: os.stat_result,
-    directory_descriptor: int,
-    inventory: dict[str, os.stat_result],
-) -> bool:
-    try:
-        current = _lstat_private_child(
-            parent_descriptor, parent, name, missing_ok=True
-        )
-        quarantine = _lstat_private_child(
-            parent_descriptor, parent, quarantine_name, missing_ok=True
-        )
-        opened = os.fstat(directory_descriptor)
-        if (
-            current is not None
-            or quarantine is None
-            or not stat.S_ISDIR(quarantine.st_mode)
-            or not stat.S_ISDIR(opened.st_mode)
-            or not _same_file_identity(expected, quarantine)
-            or not _same_file_identity(expected, opened)
-            or not _private_flat_directory_matches_inventory(
-                directory_descriptor,
-                inventory,
-            )
-        ):
-            return False
-        os.rename(
-            quarantine_name,
-            name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-        restored = _lstat_private_child(
-            parent_descriptor,
-            parent,
-            name,
-            missing_ok=True,
-        )
-        remaining = _lstat_private_child(
-            parent_descriptor,
-            parent,
-            quarantine_name,
-            missing_ok=True,
-        )
-        return (
-            restored is not None
-            and stat.S_ISDIR(restored.st_mode)
-            and _same_file_identity(expected, restored)
-            and remaining is None
-        )
-    except (OSError, StockError):
-        return False
 
 
 def _unlink_private_child_regular_file(

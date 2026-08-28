@@ -720,7 +720,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(retained_owners[0].stat().st_mode), 0o600)
 
     @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
-    def test_abort_restore_does_not_publish_replaced_quarantine(self) -> None:
+    def test_abort_orphan_does_not_publish_replaced_quarantine(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
         canonical = self.cache_root / ".refresh.lock"
         real_lstat_child = cache_module._lstat_private_child
@@ -788,7 +788,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(replacement_marker.read_text(encoding="utf-8"), "safe")
 
     @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
-    def test_abort_restore_requires_original_owner_token(self) -> None:
+    def test_abort_owner_change_retains_quarantine(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
         canonical = self.cache_root / ".refresh.lock"
         real_lstat_child = cache_module._lstat_private_child
@@ -842,7 +842,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(owner["token"], replacement_token)
 
     @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
-    def test_abort_restore_requires_original_quarantine_inventory(self) -> None:
+    def test_abort_inventory_change_retains_quarantine(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
         canonical = self.cache_root / ".refresh.lock"
         real_read_owner = CacheLock._read_owner_from_directory_descriptor
@@ -882,6 +882,78 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(canonical.exists())
         self.assertTrue(quarantine.is_dir())
         self.assertEqual(injected_marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_owner_failure_never_reverse_publishes_quarantine(self) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
+        real_rename = cache_module.os.rename
+        owner_reads = 0
+        reverse_attempted = False
+        foreign_marker: Path | None = None
+        parked_owned: Path | None = None
+
+        def fail_moved_owner(
+            directory_descriptor: int,
+            expected: os.stat_result,
+        ) -> tuple[str, float] | None:
+            nonlocal owner_reads
+            owner_reads += 1
+            if owner_reads == 2:
+                return None
+            return real_read_owner(directory_descriptor, expected)
+
+        def swap_at_reverse_publish(
+            source: object,
+            destination: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal foreign_marker, parked_owned, reverse_attempted
+            source_name = os.fspath(source)
+            destination_name = os.fspath(destination)
+            if (
+                source_name.startswith(".refresh.lock.abort-")
+                and destination_name == canonical.name
+            ):
+                reverse_attempted = True
+                quarantine = self.cache_root / source_name
+                parked_owned = quarantine.with_name(f"{quarantine.name}.owned")
+                real_rename(quarantine, parked_owned)
+                quarantine.mkdir(mode=0o700)
+                foreign_marker = quarantine / "must-not-publish.txt"
+                foreign_marker.write_text("safe", encoding="utf-8")
+            real_rename(source, destination, *args, **kwargs)
+
+        with patch.object(
+            CacheLock,
+            "_read_owner_from_directory_descriptor",
+            side_effect=fail_moved_owner,
+        ):
+            with patch.object(
+                cache_module.os,
+                "rename",
+                side_effect=swap_at_reverse_publish,
+            ):
+                removed = CacheLock._discard_published_lock_if_owned_locked(
+                    canonical,
+                    lock.token,
+                    lock.identity,
+                )
+
+        self.assertFalse(removed)
+        self.assertFalse(reverse_attempted)
+        self.assertFalse(canonical.exists())
+        self.assertIsNone(foreign_marker)
+        self.assertIsNone(parked_owned)
+        quarantine = next(self.cache_root.glob(".refresh.lock.abort-*"))
+        self.assertEqual(
+            json.loads((quarantine / "owner.json").read_text(encoding="utf-8"))[
+                "token"
+            ],
+            lock.token,
+        )
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_load_hardens_existing_private_cache_artifacts(self) -> None:
@@ -1662,7 +1734,9 @@ class StockCacheTest(unittest.TestCase):
         lock.assert_owned()
         lock.release()
 
-    def test_heartbeat_during_reclaim_restores_moved_lock(self) -> None:
+    def test_heartbeat_during_reclaim_fences_old_owner_before_successor_publish(
+        self,
+    ) -> None:
         lock = CacheLock.acquire(self.cache_root)
         stale_time = time.time() - 30 * 60 - 1
         (lock.path / "owner.json").write_text(
@@ -1672,24 +1746,54 @@ class StockCacheTest(unittest.TestCase):
         heartbeat_path = lock.path / f"heartbeat-{lock.token}"
         os.utime(heartbeat_path, (stale_time, stale_time))
         real_rename = os.rename
-        first_rename = True
+        reclaim_rename_seen = False
 
-        def heartbeat_then_rename(source: Path, destination: Path) -> None:
-            nonlocal first_rename
-            if first_rename:
-                first_rename = False
+        def heartbeat_then_rename(
+            source: object,
+            destination: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal reclaim_rename_seen
+            if (
+                not reclaim_rename_seen
+                and Path(os.fspath(destination)).name.startswith(
+                    ".refresh.lock.reclaim-"
+                )
+            ):
+                reclaim_rename_seen = True
                 os.utime(heartbeat_path, None)
-            real_rename(source, destination)
+            real_rename(source, destination, *args, **kwargs)
 
         with patch(
             "papa_shin_stock.cache.os.rename",
             side_effect=heartbeat_then_rename,
         ):
-            reclaimed = CacheLock._reclaim_stale(lock.path)
+            successor = CacheLock.acquire(self.cache_root)
+        self.addCleanup(successor.release)
 
-        self.assertFalse(reclaimed)
-        lock.assert_owned()
-        lock.release()
+        self.assertTrue(reclaim_rename_seen)
+        successor.assert_owned()
+        self.assertEqual(
+            json.loads(
+                (self.cache_root / ".refresh.lock" / "owner.json").read_text(
+                    encoding="utf-8"
+                )
+            )["token"],
+            successor.token,
+        )
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            lock.assert_owned()
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            lock.heartbeat()
+        retained = list(self.cache_root.glob(".refresh.lock.reclaim-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            json.loads((retained[0] / "owner.json").read_text(encoding="utf-8"))[
+                "token"
+            ],
+            lock.token,
+        )
 
     def test_previous_cache_hashing_emits_lock_heartbeats(self) -> None:
         self.fixture.seed_generation()
@@ -1766,7 +1870,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.warning_code, "cache_locked")
         self.assertEqual(self.fixture.current_generation_id(), "generation-a")
 
-    def test_release_does_not_delete_lock_whose_owner_changed_after_read(self) -> None:
+    def test_release_owner_change_fences_old_owner_and_retains_orphan(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
         real_read_owner = CacheLock._read_owner
         owner_changed = False
@@ -1787,13 +1891,20 @@ class StockCacheTest(unittest.TestCase):
         with patch.object(CacheLock, "_read_owner", side_effect=read_then_replace_owner):
             lock.release()
 
-        self.assertTrue(lock.path.is_dir())
+        self.assertFalse(lock.path.exists())
+        retained = list(self.cache_root.glob(".refresh.lock.release-*"))
+        self.assertEqual(len(retained), 1)
         self.assertEqual(
-            json.loads((lock.path / "owner.json").read_text(encoding="utf-8"))[
-                "token"
-            ],
+            json.loads(
+                (retained[0] / "owner.json").read_text(encoding="utf-8")
+            )["token"],
             "replacement-writer",
         )
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            lock.assert_owned()
+        successor = CacheLock.acquire(self.cache_root)
+        self.addCleanup(successor.release)
+        successor.assert_owned()
 
     def test_lock_older_than_thirty_minutes_is_reclaimed(self) -> None:
         lock = self.cache_root / ".refresh.lock"
@@ -2046,7 +2157,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.status, "updated")
         self.assertFalse(lock.exists())
 
-    def test_stale_reclaim_does_not_delete_changed_owner_token(self) -> None:
+    def test_stale_reclaim_owner_change_retains_orphan_for_successor(self) -> None:
         lock = self.cache_root / ".refresh.lock"
         lock.mkdir()
         owner_path = lock / "owner.json"
@@ -2077,12 +2188,22 @@ class StockCacheTest(unittest.TestCase):
             real_rename(source, destination, *args, **kwargs)
 
         with patch("papa_shin_stock.cache.os.rename", replace_owner_before_rename):
-            with self.assertRaisesRegex(StockError, "cache_locked"):
-                StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+            successor = CacheLock.acquire(self.cache_root)
+        self.addCleanup(successor.release)
 
-        self.assertTrue(lock.is_dir())
+        successor.assert_owned()
         self.assertEqual(
-            json.loads(owner_path.read_text(encoding="utf-8"))["token"],
+            json.loads((lock / "owner.json").read_text(encoding="utf-8"))[
+                "token"
+            ],
+            successor.token,
+        )
+        retained = list(self.cache_root.glob(".refresh.lock.reclaim-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            json.loads(
+                (retained[0] / "owner.json").read_text(encoding="utf-8")
+            )["token"],
             "replacement-writer",
         )
 
