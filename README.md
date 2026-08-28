@@ -95,49 +95,90 @@ Set-Location -LiteralPath $PapaShinSkillDir
 В macOS/Linux подготовьте закрытый каталог без extended ACL, после чего попросите администратора поместить туда готовый файл. На Linux нужен `setfacl`; если команда недоступна, остановитесь и попросите администратора проверить и очистить ACL:
 
 ```bash
-PAPA_SHIN_SECRETS_DIR="$HOME/.codex/secrets"
-mkdir -p -- "$PAPA_SHIN_SECRETS_DIR"
-case "$(uname -s)" in
-  Darwin) chmod -N "$PAPA_SHIN_SECRETS_DIR" ;;
-  Linux)
-    command -v setfacl >/dev/null 2>&1 || {
-      echo 'Для проверки ACL требуется setfacl' >&2
-      exit 1
-    }
-    setfacl -b -- "$PAPA_SHIN_SECRETS_DIR"
-    setfacl -k -- "$PAPA_SHIN_SECRETS_DIR"
-    if getfacl -cp -- "$PAPA_SHIN_SECRETS_DIR" | \
-      grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)'; then
-      echo 'Не удалось очистить ACL каталога' >&2
-      exit 1
-    fi
-    ;;
-  *) echo 'Неподдерживаемая ОС' >&2; exit 1 ;;
-esac
-chmod 700 "$PAPA_SHIN_SECRETS_DIR"
-PAPA_SHIN_CONFIG="$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env"
-if test -f "$PAPA_SHIN_CONFIG"; then
-  case "$(uname -s)" in
-    Darwin) chmod -N "$PAPA_SHIN_CONFIG" ;;
-    Linux)
-      setfacl -b -- "$PAPA_SHIN_CONFIG"
-      if getfacl -cp -- "$PAPA_SHIN_CONFIG" | \
-        grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)'; then
-        echo 'Не удалось очистить ACL файла' >&2
-        exit 1
+(
+  set -euo pipefail
+  PAPA_SHIN_SECRETS_DIR="$HOME/.codex/secrets"
+  PAPA_SHIN_CONFIG="$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env"
+  PAPA_SHIN_OS=$(uname -s)
+
+  papa_shin_verify_access() {
+    local papa_shin_target=$1
+    local papa_shin_expected_mode=$2
+    if test "$PAPA_SHIN_OS" = Darwin; then
+      local papa_shin_mode_field
+      papa_shin_mode_field=$(ls -lde "$papa_shin_target")
+      papa_shin_mode_field=${papa_shin_mode_field%% *}
+      case "$papa_shin_mode_field" in
+        *+) echo 'Не удалось очистить ACL' >&2; return 1 ;;
+      esac
+      test "$(stat -f '%Lp' "$papa_shin_target")" = "$papa_shin_expected_mode"
+    else
+      local papa_shin_acl
+      papa_shin_acl=$(getfacl -cp -- "$papa_shin_target")
+      if grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)' <<<"$papa_shin_acl"; then
+        echo 'Не удалось очистить ACL' >&2
+        return 1
       fi
+      test "$(stat -c '%a' -- "$papa_shin_target")" = "$papa_shin_expected_mode"
+    fi
+  }
+
+  mkdir -p -- "$PAPA_SHIN_SECRETS_DIR"
+  case "$PAPA_SHIN_OS" in
+    Darwin) chmod -N "$PAPA_SHIN_SECRETS_DIR" ;;
+    Linux)
+      command -v setfacl >/dev/null 2>&1
+      command -v getfacl >/dev/null 2>&1
+      setfacl -b -- "$PAPA_SHIN_SECRETS_DIR"
+      setfacl -k -- "$PAPA_SHIN_SECRETS_DIR"
       ;;
+    *) echo 'Неподдерживаемая ОС' >&2; exit 1 ;;
   esac
-  chmod 600 "$PAPA_SHIN_CONFIG"
-fi
+  chmod 700 "$PAPA_SHIN_SECRETS_DIR"
+  papa_shin_verify_access "$PAPA_SHIN_SECRETS_DIR" 700
+
+  if test -f "$PAPA_SHIN_CONFIG"; then
+    case "$PAPA_SHIN_OS" in
+      Darwin) chmod -N "$PAPA_SHIN_CONFIG" ;;
+      Linux) setfacl -b -- "$PAPA_SHIN_CONFIG" ;;
+    esac
+    chmod 600 "$PAPA_SHIN_CONFIG"
+    papa_shin_verify_access "$PAPA_SHIN_CONFIG" 600
+  fi
+)
 ```
 
 Очистка ACL файла безопасно пропускается до его появления. После установки файла повторите блок, чтобы удалить добавленные ACL и ограничить доступ. В Windows PowerShell создайте точный защищённый DACL по SID текущего пользователя; существующие explicit и inherited ACE при этом не сохраняются:
 
 ```powershell
 $PapaShinSecretsDir = Join-Path $env:USERPROFILE ".codex\secrets"
-New-Item -ItemType Directory -Force -Path $PapaShinSecretsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $PapaShinSecretsDir -ErrorAction Stop | Out-Null
 $PapaShinSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+function Assert-PapaShinAcl {
+  param(
+    [string]$LiteralPath,
+    [System.Security.Principal.SecurityIdentifier]$Sid,
+    [System.Security.AccessControl.InheritanceFlags]$InheritanceFlags
+  )
+  $PapaShinAcl = Get-Acl -LiteralPath $LiteralPath -ErrorAction Stop
+  $PapaShinRules = @($PapaShinAcl.Access)
+  if (-not $PapaShinAcl.AreAccessRulesProtected -or $PapaShinRules.Count -ne 1) {
+    throw "DACL не ограничен единственным правилом"
+  }
+  $PapaShinRule = $PapaShinRules[0]
+  $PapaShinRuleSid = $PapaShinRule.IdentityReference.Translate(
+    [System.Security.Principal.SecurityIdentifier]
+  )
+  if (
+    $PapaShinRuleSid.Value -ne $Sid.Value -or
+    $PapaShinRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+    $PapaShinRule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+    $PapaShinRule.InheritanceFlags -ne $InheritanceFlags -or
+    $PapaShinRule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None
+  ) {
+    throw "DACL не соответствует ожидаемому правилу"
+  }
+}
 $PapaShinDirAcl = [System.Security.AccessControl.DirectorySecurity]::new()
 $PapaShinDirAcl.SetAccessRuleProtection($true, $false)
 $PapaShinDirRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -148,7 +189,11 @@ $PapaShinDirRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 $PapaShinDirAcl.AddAccessRule($PapaShinDirRule)
-Set-Acl -LiteralPath $PapaShinSecretsDir -AclObject $PapaShinDirAcl
+Set-Acl -LiteralPath $PapaShinSecretsDir -AclObject $PapaShinDirAcl -ErrorAction Stop
+Assert-PapaShinAcl `
+  -LiteralPath $PapaShinSecretsDir `
+  -Sid $PapaShinSid `
+  -InheritanceFlags ([System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit")
 $PapaShinConfig = Join-Path $PapaShinSecretsDir "papa-shin-stock.env"
 ```
 
@@ -163,13 +208,11 @@ $PapaShinFileRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 $PapaShinFileAcl.AddAccessRule($PapaShinFileRule)
-Set-Acl -LiteralPath $PapaShinConfig -AclObject $PapaShinFileAcl
-$PapaShinUnexpectedAcl = @($PapaShinSecretsDir, $PapaShinConfig) | ForEach-Object {
-  (Get-Acl -LiteralPath $_).Access
-} | Where-Object {
-  $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $PapaShinSid.Value
-}
-if ($PapaShinUnexpectedAcl) { throw "Обнаружены посторонние ACL" }
+Set-Acl -LiteralPath $PapaShinConfig -AclObject $PapaShinFileAcl -ErrorAction Stop
+Assert-PapaShinAcl `
+  -LiteralPath $PapaShinConfig `
+  -Sid $PapaShinSid `
+  -InheritanceFlags ([System.Security.AccessControl.InheritanceFlags]::None)
 ```
 
 Default config path не зависит от `CODEX_HOME`. Если администратор выбрал другой абсолютный путь, передавайте только путь через `PAPA_SHIN_STOCK_CONFIG` в окружении процесса Codex, не содержимое файла:
