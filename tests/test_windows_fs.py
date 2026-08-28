@@ -26,6 +26,7 @@ from papa_shin_stock._windows_fs import (
     GENERIC_WRITE,
     Kernel32Api,
     OPEN_EXISTING,
+    VerifiedHandle,
     WindowsFilesystem,
     WindowsFilesystemError,
     WindowsIdentity,
@@ -335,36 +336,41 @@ class NativeKernel32ApiTest(unittest.TestCase):
                 (root / "nested").mkdir()
 
                 original_rename_relative = api.rename_relative
-                original_flush = api.flush
+                original_replace_file_cas = filesystem.replace_file_cas
                 attacked = False
 
-                def move_leaf_after_publish(handle: int) -> None:
+                def replace_then_move_leaf(
+                    parent: VerifiedHandle,
+                    name: str,
+                    *,
+                    expected: bytes | None,
+                    payload: bytes,
+                ) -> WindowsIdentity:
                     nonlocal attacked
-                    original_flush(handle)
-                    if (
-                        not attacked
-                        and filesystem._final_path_matches(
-                            api, handle, str(root / "nested")
+                    identity = original_replace_file_cas(
+                        parent,
+                        name,
+                        expected=expected,
+                        payload=payload,
+                    )
+                    attacked = True
+                    with filesystem.open_child(
+                        session.root,
+                        "nested",
+                        directory=True,
+                        destructive=True,
+                        movable=True,
+                    ) as movable_leaf:
+                        original_rename_relative(
+                            movable_leaf.handle,
+                            session.root.handle,
+                            "nested-moved-after",
+                            replace=False,
                         )
-                        and (root / "nested" / "current.json").exists()
-                    ):
-                        attacked = True
-                        with filesystem.open_child(
-                            session.root,
-                            "nested",
-                            directory=True,
-                            destructive=True,
-                            movable=True,
-                        ) as movable_leaf:
-                            original_rename_relative(
-                                movable_leaf.handle,
-                                session.root.handle,
-                                "nested-moved-after",
-                                replace=False,
-                            )
-                        (root / "nested").mkdir()
+                    (root / "nested").mkdir()
+                    return identity
 
-                api.flush = move_leaf_after_publish  # type: ignore[method-assign]
+                filesystem.replace_file_cas = replace_then_move_leaf  # type: ignore[method-assign]
                 with self.assertRaisesRegex(
                     WindowsFilesystemError, "final path changed"
                 ):
@@ -1685,23 +1691,29 @@ class WindowsFilesystemTest(unittest.TestCase):
             create=True,
         ) as session:
             self.api.add_directory(nested, (7, 437))
-            original_flush = self.api.flush
+            original_replace_file_cas = self.fs.replace_file_cas
             attacked = False
 
-            def move_parent_after_publish(handle: int) -> None:
+            def replace_then_move_parent(
+                parent: VerifiedHandle,
+                name: str,
+                *,
+                expected: bytes | None,
+                payload: bytes,
+            ) -> WindowsIdentity:
                 nonlocal attacked
-                original_flush(handle)
-                if (
-                    not attacked
-                    and self.api.handles.get(handle) == self.api.canonical(nested)
-                    and self.api.canonical(nested + r"\current.json")
-                    in self.api.nodes
-                ):
-                    attacked = True
-                    self.api.rename(handle, moved)
-                    self.api.add_directory(nested, (7, 438))
+                identity = original_replace_file_cas(
+                    parent,
+                    name,
+                    expected=expected,
+                    payload=payload,
+                )
+                attacked = True
+                self.api.rename(parent.handle, moved)
+                self.api.add_directory(nested, (7, 438))
+                return identity
 
-            self.api.flush = move_parent_after_publish  # type: ignore[method-assign]
+            self.fs.replace_file_cas = replace_then_move_parent  # type: ignore[method-assign]
             with self.assertRaisesRegex(WindowsFilesystemError, "final path changed"):
                 session.write_new_file(("nested",), "current.json", b"pointer")
 
