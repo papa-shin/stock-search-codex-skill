@@ -1355,13 +1355,11 @@ class WindowsFilesystem:
     ) -> VerifiedHandle:
         if writable and immutable:
             raise WindowsFilesystemError("immutable handle cannot be writable")
-        if movable and (not destructive or not immutable):
-            raise WindowsFilesystemError(
-                "movable handle must be destructive and immutable"
-            )
         if movable and pin_namespace:
+            raise WindowsFilesystemError("movable handle cannot pin the namespace")
+        if movable and (not destructive or immutable or writable):
             raise WindowsFilesystemError(
-                "movable handle cannot pin the namespace"
+                "movable handle must be destructive and read-only"
             )
         requested = self._child(parent.path, name)
         access = FILE_READ_ATTRIBUTES | GENERIC_READ
@@ -1642,13 +1640,27 @@ class WindowsFilesystem:
         operation_token = uuid.uuid4().hex
         temporary_name = f".{name}.{operation_token}.tmp"
         quarantine_name = f".{name}.{operation_token}.old"
+        rollback_name = f".{name}.{operation_token}.rollback"
         temporary_path = self._child(parent.path, temporary_name)
         destination = self._child(parent.path, name)
         quarantine = self._child(parent.path, quarantine_name)
+        rollback_path = self._child(parent.path, rollback_name)
         temporary: VerifiedHandle | None = None
+        rollback: VerifiedHandle | None = None
         target: VerifiedHandle | None = None
-        published = False
+        target_identity: WindowsIdentity | None = None
+        temporary_state = "UNPUBLISHED"
+        rollback_state: str | None = None
+        rollback_ready = False
         target_quarantined = False
+        operation_failed = False
+        deferred_cleanup_errors: list[OSError] = []
+
+        def close_during_recovery(handle: VerifiedHandle) -> None:
+            try:
+                handle.close()
+            except OSError as error:
+                deferred_cleanup_errors.append(error)
 
         def confirmed_at(handle: VerifiedHandle, path: str) -> bool:
             try:
@@ -1662,38 +1674,71 @@ class WindowsFilesystem:
 
         def dispose_quarantined_target() -> None:
             nonlocal target, target_quarantined
-            if target is None or not target_quarantined:
+            if not target_quarantined or target_identity is None:
                 return
-            target.assert_current()
+            if target is not None:
+                close_during_recovery(target)
+                target = None
+            target = self.open_child(
+                parent,
+                quarantine_name,
+                directory=False,
+                destructive=True,
+                expected=target_identity,
+            )
             self.api.dispose(target.handle)
-            target.close()
+            close_during_recovery(target)
             target = None
             target_quarantined = False
             self.api.flush(parent.handle)
 
-        def rollback_quarantined_target() -> bool:
-            nonlocal target_quarantined
-            if target is None or not target_quarantined:
-                return True
+        def reopen_quarantine_immutable() -> None:
+            nonlocal target
+            if target_identity is None or not target_quarantined:
+                return
+            if target is not None:
+                close_during_recovery(target)
+                target = None
+            target = self.open_child(
+                parent,
+                quarantine_name,
+                directory=False,
+                destructive=True,
+                expected=target_identity,
+                immutable=True,
+            )
+
+        def prepare_observed_snapshot() -> bytes:
+            nonlocal rollback, rollback_ready, rollback_state
+            if target is None or expected is None:
+                raise WindowsFilesystemError("Win32 CAS quarantine is unavailable")
+            observed = self._read_open_file(target, len(expected))
+            rollback = self.open_child(
+                parent,
+                rollback_name,
+                directory=False,
+                destructive=True,
+                creation=CREATE_NEW,
+                writable=True,
+            )
+            rollback_state = "UNPUBLISHED"
+            self.api.write(rollback.handle, observed)
+            self.api.flush(rollback.handle)
+            rollback_ready = True
+            return observed
+
+        def restore_observed_snapshot() -> bool:
+            nonlocal rollback_state
+            if rollback is None or not rollback_ready:
+                return False
             try:
                 self.api.rename_relative(
-                    target.handle,
+                    rollback.handle,
                     parent.handle,
                     name,
                     replace=False,
                 )
-            except FileExistsError as error:
-                target.rebind(destination)
-                if confirmed_at(target, destination):
-                    target_quarantined = False
-                    try:
-                        self.api.flush(parent.handle)
-                    except OSError as flush_error:
-                        raise WindowsFilesystemError(
-                            "Win32 CAS rollback durability failed"
-                        ) from flush_error
-                    return True
-                target.rebind(quarantine)
+            except FileExistsError:
                 try:
                     successor = self.open_child(
                         parent,
@@ -1705,33 +1750,39 @@ class WindowsFilesystem:
                     raise WindowsFilesystemError(
                         "Win32 CAS rollback collision was not confirmed"
                     ) from successor_error
-                try:
-                    dispose_quarantined_target()
-                finally:
-                    successor.close()
+                close_during_recovery(successor)
                 return False
             except OSError as error:
-                target.rebind(destination)
-                if confirmed_at(target, destination):
-                    target_quarantined = False
+                rollback.rebind(destination)
+                if confirmed_at(rollback, destination):
+                    rollback_state = "PUBLISHED"
+                    self.api.flush(parent.handle)
                     try:
-                        self.api.flush(parent.handle)
-                    except OSError as flush_error:
-                        raise WindowsFilesystemError(
-                            "Win32 CAS rollback durability failed"
-                        ) from flush_error
-                else:
-                    target.rebind(quarantine)
+                        dispose_quarantined_target()
+                    except OSError as cleanup_error:
+                        deferred_cleanup_errors.append(cleanup_error)
+                    return True
+                rollback.rebind(rollback_path)
+                if not confirmed_at(rollback, rollback_path):
+                    rollback_state = "UNKNOWN"
+                    raise WindowsFilesystemError(
+                        "Win32 CAS rollback state is unknown"
+                    ) from error
+                rollback_state = "UNPUBLISHED"
                 raise WindowsFilesystemError("Win32 CAS rollback failed") from error
-            target.rebind(destination)
-            target.assert_current()
-            target_quarantined = False
+            rollback_state = "PUBLISHED"
+            rollback.rebind(destination)
+            rollback.assert_current()
             try:
                 self.api.flush(parent.handle)
             except OSError as error:
                 raise WindowsFilesystemError(
                     "Win32 CAS rollback durability failed"
                 ) from error
+            try:
+                dispose_quarantined_target()
+            except OSError as cleanup_error:
+                deferred_cleanup_errors.append(cleanup_error)
             return True
 
         try:
@@ -1751,7 +1802,6 @@ class WindowsFilesystem:
                     name,
                     directory=False,
                     destructive=True,
-                    immutable=True,
                     movable=True,
                 )
             except OSError as error:
@@ -1761,11 +1811,16 @@ class WindowsFilesystem:
             if expected is None:
                 if target is not None:
                     raise WindowsFilesystemError("Win32 CAS target appeared")
-            elif target is None or self._read_open_file(
-                target, len(expected)
-            ) != expected:
+            elif target is None:
                 raise WindowsFilesystemError("Win32 CAS target changed")
             if target is not None:
+                target_identity = target.identity
+                if expected is None:
+                    raise WindowsFilesystemError("Win32 CAS target appeared")
+                # A movable handle must share writes for native rename, so this
+                # read is only an early mismatch check, not the CAS decision.
+                if self._read_open_file(target, len(expected)) != expected:
+                    raise WindowsFilesystemError("Win32 CAS target changed")
                 target.assert_current()
                 try:
                     self.api.rename_relative(
@@ -1778,22 +1833,35 @@ class WindowsFilesystem:
                     target.rebind(quarantine)
                     if not confirmed_at(target, quarantine):
                         target.rebind(destination)
-                        raise
+                        raise WindowsFilesystemError(
+                            "Win32 CAS quarantine state is unknown"
+                        )
                     target_quarantined = True
                     try:
-                        self.api.flush(parent.handle)
-                    except OSError:
-                        rollback_quarantined_target()
-                        raise
-                    rollback_quarantined_target()
+                        reopen_quarantine_immutable()
+                        prepare_observed_snapshot()
+                        restore_observed_snapshot()
+                    except OSError as rollback_error:
+                        raise WindowsFilesystemError(
+                            "Win32 CAS rollback failed"
+                        ) from rollback_error
                     raise
                 target.rebind(quarantine)
                 target.assert_current()
                 target_quarantined = True
                 try:
+                    # Closing the fully-shared source and reopening quarantine
+                    # immutable rejects any outstanding writer.  The snapshot
+                    # captured under that handle is the only rollback source.
+                    reopen_quarantine_immutable()
+                    observed = prepare_observed_snapshot()
+                    if observed != expected:
+                        restore_observed_snapshot()
+                        raise WindowsFilesystemError("Win32 CAS target changed")
                     self.api.flush(parent.handle)
                 except OSError:
-                    rollback_quarantined_target()
+                    if rollback_state == "UNPUBLISHED":
+                        restore_observed_snapshot()
                     raise
             try:
                 self.api.rename_relative(
@@ -1804,15 +1872,22 @@ class WindowsFilesystem:
                 )
             except OSError:
                 temporary.rebind(destination)
-                published = confirmed_at(temporary, destination)
-                if published:
-                    self.api.flush(parent.handle)
-                    dispose_quarantined_target()
+                if confirmed_at(temporary, destination):
+                    temporary_state = "PUBLISHED"
+                    try:
+                        self.api.flush(parent.handle)
+                        dispose_quarantined_target()
+                    except OSError as cleanup_error:
+                        deferred_cleanup_errors.append(cleanup_error)
                 else:
                     temporary.rebind(temporary_path)
-                    rollback_quarantined_target()
+                    if confirmed_at(temporary, temporary_path):
+                        temporary_state = "UNPUBLISHED"
+                        restore_observed_snapshot()
+                    else:
+                        temporary_state = "UNKNOWN"
                 raise
-            published = True
+            temporary_state = "PUBLISHED"
             temporary.rebind(destination)
             if (
                 WindowsIdentity(*self.api.identity(temporary.handle))
@@ -1825,24 +1900,40 @@ class WindowsFilesystem:
             self.api.flush(parent.handle)
             dispose_quarantined_target()
             return temporary.identity
+        except BaseException:
+            operation_failed = True
+            raise
         finally:
-            temporary_cleanup_error: OSError | None = None
-            if not published and temporary is not None:
+            cleanup_errors = deferred_cleanup_errors
+            cleanup_needs_flush = False
+            if temporary_state == "UNPUBLISHED" and temporary is not None:
                 try:
                     self.api.dispose(temporary.handle)
-                    temporary.close()
-                    temporary = None
+                    cleanup_needs_flush = True
+                except OSError as error:
+                    cleanup_errors.append(error)
+            if rollback is not None and rollback_state == "UNPUBLISHED":
+                try:
+                    self.api.dispose(rollback.handle)
+                    cleanup_needs_flush = True
+                except OSError as error:
+                    cleanup_errors.append(error)
+            for handle in (target, rollback, temporary):
+                if handle is None:
+                    continue
+                try:
+                    handle.close()
+                except OSError as error:
+                    cleanup_errors.append(error)
+            if cleanup_needs_flush:
+                try:
                     self.api.flush(parent.handle)
                 except OSError as error:
-                    temporary_cleanup_error = error
-            if target is not None:
-                target.close()
-            if temporary is not None:
-                temporary.close()
-            if temporary_cleanup_error is not None:
+                    cleanup_errors.append(error)
+            if cleanup_errors and not operation_failed:
                 raise WindowsFilesystemError(
                     "Win32 CAS temporary cleanup failed"
-                ) from temporary_cleanup_error
+                ) from cleanup_errors[0]
 
     def delete_file_cas(
         self,

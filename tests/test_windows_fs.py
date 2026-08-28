@@ -257,6 +257,7 @@ class FakeWindowsApi:
         self.relative_rename_failure_destination: str | None = None
         self.directory_list_calls: list[int] = []
         self.flush_calls: list[int] = []
+        self.lifecycle_calls: list[tuple[str, int]] = []
         self.flush_failure_handles: set[int] = set()
         self.defer_disposition_until_close = False
         self.pending_disposition_handles: set[int] = set()
@@ -330,6 +331,7 @@ class FakeWindowsApi:
 
     def close(self, handle: int) -> None:
         self.close_calls.append(handle)
+        self.lifecycle_calls.append(("close", handle))
         if handle in self.pending_disposition_handles:
             self.pending_disposition_handles.remove(handle)
             key = self.handles.get(handle)
@@ -456,6 +458,7 @@ class FakeWindowsApi:
             raise OSError("synthetic post-rename API failure")
 
     def dispose(self, handle: int) -> None:
+        self.lifecycle_calls.append(("dispose", handle))
         key = self.handles[handle]
         node = self.nodes[key]
         if bool(node["directory"]) and self.list_directory(str(node["path"])):
@@ -485,6 +488,7 @@ class FakeWindowsApi:
 
     def flush(self, handle: int) -> None:
         self.flush_calls.append(handle)
+        self.lifecycle_calls.append(("flush", handle))
         if handle in self.flush_failure_handles:
             self.flush_failure_handles.remove(handle)
             raise OSError("synthetic flush failure")
@@ -1086,7 +1090,7 @@ class WindowsFilesystemTest(unittest.TestCase):
         )
         self.assertEqual(self.api.list_directory(self.root), ["current.json"])
 
-    def test_atomic_replace_opens_target_movable_but_immutable(self) -> None:
+    def test_atomic_replace_reopens_quarantine_immutable_before_publish(self) -> None:
         pointer = self.root + r"\current.json"
         self.api.add_file(pointer, (7, 111), b"old-pointer")
 
@@ -1107,8 +1111,149 @@ class WindowsFilesystemTest(unittest.TestCase):
         target_open = next(
             call for call in self.api.child_open_calls if call[1] == "current.json"
         )
-        self.assertEqual(target_open[3], FILE_SHARE_READ | FILE_SHARE_DELETE)
-        self.assertEqual(target_open[3] & FILE_SHARE_WRITE, 0)
+        self.assertEqual(
+            target_open[3],
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        quarantine_open = next(
+            call for call in self.api.child_open_calls if call[1].endswith(".old")
+        )
+        self.assertEqual(quarantine_open[3], FILE_SHARE_READ)
+        cleanup_open = next(
+            call
+            for call in reversed(self.api.child_open_calls)
+            if call[1].endswith(".old")
+        )
+        self.assertEqual(cleanup_open[2] & DELETE, DELETE)
+        self.assertEqual(cleanup_open[3], FILE_SHARE_READ | FILE_SHARE_WRITE)
+
+    def test_atomic_replace_restores_verified_observation_after_quarantine_mutation(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 112), b"old-pointer")
+        original_rename = self.api.rename_relative
+
+        def mutate_after_quarantine_move(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            original_rename(
+                handle,
+                parent_handle,
+                destination_name,
+                replace=replace,
+            )
+            if destination_name.endswith(".old"):
+                self.api.nodes[self.api.handles[handle]]["content"] = b"changed"
+
+        self.api.rename_relative = mutate_after_quarantine_move  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(
+                WindowsFilesystemError, "Win32 CAS target changed"
+            ):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(pointer)]["content"], b"changed"
+        )
+        self.assertFalse(
+            any(
+                name.endswith(".tmp")
+                for name in self.api.list_directory(self.root)
+            )
+        )
+
+    def test_atomic_replace_retains_quarantine_when_immutable_reopen_fails(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 113), b"old-pointer")
+        original_create_child = self.api.create_child
+
+        def fail_quarantine_reopen(
+            parent_handle: int,
+            name: str,
+            access: int,
+            share: int,
+            creation: int,
+            flags: int,
+        ) -> int:
+            if name.endswith(".old") and share == FILE_SHARE_READ:
+                raise WindowsFilesystemError(32, "synthetic sharing violation")
+            return original_create_child(
+                parent_handle,
+                name,
+                access,
+                share,
+                creation,
+                flags,
+            )
+
+        self.api.create_child = fail_quarantine_reopen  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "synthetic sharing violation"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertNotIn(self.api.canonical(pointer), self.api.nodes)
+        quarantines = [
+            node
+            for node in self.api.nodes.values()
+            if str(node["path"]).endswith(".old")
+        ]
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0]["content"], b"old-pointer")
+
+    def test_atomic_replace_unknown_quarantine_state_retains_candidate(self) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 114), b"old-pointer")
+        self.api.relative_rename_failures_after_side_effect_remaining = 1
+        original_identity = self.api.identity
+
+        def fail_quarantine_identity(handle: int) -> tuple[int, int]:
+            node = self.api.nodes[self.api.handles[handle]]
+            if str(node["path"]).endswith(".old"):
+                raise OSError("synthetic quarantine attestation failure")
+            return original_identity(handle)
+
+        self.api.identity = fail_quarantine_identity  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(
+                WindowsFilesystemError, "quarantine state is unknown"
+            ):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertNotIn(self.api.canonical(pointer), self.api.nodes)
+        retained = self.api.list_directory(self.root)
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].endswith(".old"))
 
     def test_movable_child_rejects_namespace_pin_before_open(self) -> None:
         before = len(self.api.child_open_calls)
@@ -1290,7 +1435,18 @@ class WindowsFilesystemTest(unittest.TestCase):
             self.api.nodes[self.api.canonical(pointer)]["content"],
             b"successor-pointer",
         )
-        self.assertEqual(self.api.list_directory(self.root), ["current.json"])
+        retained = self.api.list_directory(self.root)
+        self.assertIn("current.json", retained)
+        old_names = [
+            candidate for candidate in retained if candidate.endswith(".old")
+        ]
+        self.assertEqual(len(old_names), 1)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(self.root + "\\" + old_names[0])][
+                "content"
+            ],
+            b"old-pointer",
+        )
 
     def test_atomic_replace_cas_mismatch_preserves_foreign_target(self) -> None:
         pointer = self.root + r"\current.json"
@@ -1355,7 +1511,9 @@ class WindowsFilesystemTest(unittest.TestCase):
             source_name = PureWindowsPath(
                 str(self.api.nodes[self.api.handles[handle]]["path"])
             ).name
-            if destination_name == "current.json" and source_name.endswith(".old"):
+            if destination_name == "current.json" and source_name.endswith(
+                ".rollback"
+            ):
                 raise OSError("synthetic rollback failure")
             original_rename(
                 handle,
@@ -1418,6 +1576,349 @@ class WindowsFilesystemTest(unittest.TestCase):
                 for name in self.api.list_directory(self.root)
             )
         )
+
+    def test_atomic_replace_publish_side_effect_with_unknown_attestation_keeps_both(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        pointer_key = self.api.canonical(pointer)
+        self.api.add_file(pointer, (7, 141), b"old-pointer")
+        self.api.relative_rename_failures_after_side_effect_remaining = 1
+        self.api.relative_rename_failure_destination = "current.json"
+        original_identity = self.api.identity
+
+        def fail_published_identity(handle: int) -> tuple[int, int]:
+            node = self.api.nodes[self.api.handles[handle]]
+            if (
+                self.api.handles[handle] == pointer_key
+                and node["content"] == b"new-pointer"
+            ):
+                raise OSError("synthetic publication attestation failure")
+            return original_identity(handle)
+
+        self.api.identity = fail_published_identity  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "post-rename API failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(self.api.nodes[pointer_key]["content"], b"new-pointer")
+        old_names = [
+            candidate
+            for candidate in self.api.list_directory(self.root)
+            if candidate.endswith(".old")
+        ]
+        self.assertEqual(len(old_names), 1)
+        self.assertEqual(
+            self.api.nodes[self.api.canonical(self.root + "\\" + old_names[0])][
+                "content"
+            ],
+            b"old-pointer",
+        )
+
+    def test_atomic_replace_publish_error_is_not_masked_by_quarantine_close_error(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        pointer_key = self.api.canonical(pointer)
+        self.api.add_file(pointer, (7, 149), b"old-pointer")
+        self.api.relative_rename_failures_after_side_effect_remaining = 1
+        self.api.relative_rename_failure_destination = "current.json"
+        original_rename = self.api.rename_relative
+        quarantine_handle = -1
+
+        def arm_quarantine_close_failure(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            nonlocal quarantine_handle
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                quarantine_handle = next(
+                    candidate
+                    for candidate, key in self.api.handles.items()
+                    if str(self.api.nodes[key]["path"]).endswith(".old")
+                )
+                self.api.close_failure_handles.add(quarantine_handle)
+            original_rename(handle, parent_handle, destination_name, replace=replace)
+
+        self.api.rename_relative = arm_quarantine_close_failure  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "post-rename API failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertGreaterEqual(quarantine_handle, 0)
+        self.assertIn(quarantine_handle, self.api.close_calls)
+        self.assertEqual(self.api.nodes[pointer_key]["content"], b"new-pointer")
+
+    def test_atomic_replace_clean_publish_failure_restores_verified_snapshot(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 142), b"old-pointer")
+        original_rename = self.api.rename_relative
+
+        def fail_clean_publish(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                raise OSError("synthetic clean publish failure")
+            original_rename(handle, parent_handle, destination_name, replace=replace)
+
+        self.api.rename_relative = fail_clean_publish  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "clean publish failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(self.api.list_directory(self.root), ["current.json"])
+        self.assertEqual(self.api.nodes[self.api.canonical(pointer)]["content"], b"old-pointer")
+
+    def test_atomic_replace_clean_publish_failure_preserves_successor_and_quarantine(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 143), b"old-pointer")
+        original_rename = self.api.rename_relative
+
+        def publish_successor_then_fail(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                self.api.add_file(pointer, (7, 144), b"successor-pointer")
+                raise OSError("synthetic clean publish failure")
+            original_rename(handle, parent_handle, destination_name, replace=replace)
+
+        self.api.rename_relative = publish_successor_then_fail  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "clean publish failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(self.api.nodes[self.api.canonical(pointer)]["content"], b"successor-pointer")
+        self.assertEqual(
+            len([name for name in self.api.list_directory(self.root) if name.endswith(".old")]),
+            1,
+        )
+
+    def test_atomic_replace_close_failures_preserve_primary_and_attempt_all_handles(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 145), b"old-pointer")
+        original_rename = self.api.rename_relative
+        cleanup_handles: set[int] = set()
+
+        def fail_publish_and_arm_close_failures(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                cleanup_handles.update(
+                    candidate
+                    for candidate, key in self.api.handles.items()
+                    if str(self.api.nodes[key]["path"]).endswith((".tmp", ".rollback"))
+                )
+                self.api.close_failure_handles.update(cleanup_handles)
+                raise OSError("synthetic primary publish failure")
+            original_rename(handle, parent_handle, destination_name, replace=replace)
+
+        self.api.rename_relative = fail_publish_and_arm_close_failures  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(OSError, "primary publish failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertTrue(cleanup_handles)
+        self.assertTrue(cleanup_handles.issubset(set(self.api.close_calls)))
+        self.assertEqual(self.api.handles, {})
+
+    def test_atomic_replace_unknown_rollback_state_preserves_canonical_and_quarantine(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        pointer_key = self.api.canonical(pointer)
+        self.api.add_file(pointer, (7, 146), b"old-pointer")
+        original_rename = self.api.rename_relative
+        original_identity = self.api.identity
+        rollback_handle: int | None = None
+
+        def fail_publish_and_rollback_after_side_effect(
+            handle: int,
+            parent_handle: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            nonlocal rollback_handle
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                raise OSError("synthetic clean publish failure")
+            if destination_name == "current.json" and source_name.endswith(
+                ".rollback"
+            ):
+                rollback_handle = handle
+                original_rename(
+                    handle,
+                    parent_handle,
+                    destination_name,
+                    replace=replace,
+                )
+                raise OSError("synthetic rollback post-rename failure")
+            original_rename(handle, parent_handle, destination_name, replace=replace)
+
+        def fail_rollback_attestation(handle: int) -> tuple[int, int]:
+            node = self.api.nodes[self.api.handles[handle]]
+            if (
+                rollback_handle == handle
+                and self.api.handles[handle] == pointer_key
+                and node["content"] == b"old-pointer"
+            ):
+                raise OSError("synthetic rollback attestation failure")
+            return original_identity(handle)
+
+        self.api.rename_relative = fail_publish_and_rollback_after_side_effect  # type: ignore[method-assign]
+        self.api.identity = fail_rollback_attestation  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            with self.assertRaisesRegex(
+                WindowsFilesystemError, "rollback state is unknown"
+            ):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertIsNotNone(rollback_handle)
+        self.assertEqual(self.api.nodes[pointer_key]["content"], b"old-pointer")
+        self.assertEqual(
+            len([name for name in self.api.list_directory(self.root) if name.endswith(".old")]),
+            1,
+        )
+        self.assertNotIn(("dispose", rollback_handle), self.api.lifecycle_calls)
+
+    def test_atomic_replace_cleanup_flushes_only_after_deferred_handles_close(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 147), b"old-pointer")
+        self.api.defer_disposition_until_close = True
+        original_rename = self.api.rename_relative
+        cleanup_handles: set[int] = set()
+        parent_handle = -1
+
+        def create_successor_then_fail_publish(
+            handle: int,
+            opened_parent: int,
+            destination_name: str,
+            *,
+            replace: bool,
+        ) -> None:
+            source_name = PureWindowsPath(
+                str(self.api.nodes[self.api.handles[handle]]["path"])
+            ).name
+            if destination_name == "current.json" and source_name.endswith(".tmp"):
+                cleanup_handles.update(
+                    candidate
+                    for candidate, key in self.api.handles.items()
+                    if str(self.api.nodes[key]["path"]).endswith((".tmp", ".rollback"))
+                )
+                self.api.add_file(pointer, (7, 148), b"successor-pointer")
+                raise OSError("synthetic clean publish failure")
+            original_rename(handle, opened_parent, destination_name, replace=replace)
+
+        self.api.rename_relative = create_successor_then_fail_publish  # type: ignore[method-assign]
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            parent_handle = root.handle
+            with self.assertRaisesRegex(OSError, "clean publish failure"):
+                self.fs.replace_file_cas(
+                    root,
+                    "current.json",
+                    expected=b"old-pointer",
+                    payload=b"new-pointer",
+                )
+
+        self.assertEqual(len(cleanup_handles), 2)
+        for handle in cleanup_handles:
+            dispose_index = self.api.lifecycle_calls.index(("dispose", handle))
+            close_index = self.api.lifecycle_calls.index(("close", handle))
+            flush_index = next(
+                index
+                for index, event in enumerate(self.api.lifecycle_calls)
+                if index > close_index and event == ("flush", parent_handle)
+            )
+            self.assertLess(dispose_index, close_index)
+            self.assertLess(close_index, flush_index)
 
     def test_two_sequential_generation_cleanups_leave_only_current(self) -> None:
         generations = self.root + r"\generations"
