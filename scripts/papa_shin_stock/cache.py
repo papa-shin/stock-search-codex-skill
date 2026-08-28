@@ -56,12 +56,35 @@ _CACHE_ROOT_MARKER_KIND = "papa-shin-stock-cache-root"
 _CACHE_ROOT_MARKER_VERSION = 1
 _CACHE_ROOT_MARKER_MAX_BYTES = 512
 _CACHE_ROOT_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
+_WINDOWS_POINTER_MAX_BYTES = 16 * 1024
+_WINDOWS_STATE_MAX_BYTES = 64 * 1024
+_WINDOWS_RUNTIME_MAX_BYTES = 64 * 1024
+_WINDOWS_OWNER_MAX_BYTES = 16 * 1024
+_WINDOWS_MANIFEST_MAX_BYTES = 1024 * 1024
+_WINDOWS_MAX_ROOT_ENTRIES = 4096
+_WINDOWS_MAX_RECOVERY_ARTIFACTS = 64
+_WINDOWS_LOCK_RELEASE_DIRECTORY = re.compile(
+    r"\.refresh\.lock\.release-(?P<token>[0-9a-f]{32})-[0-9a-f]{32}\Z"
+)
+_WINDOWS_LOCK_RECLAIM_DIRECTORY = re.compile(
+    r"\.refresh\.lock\.reclaim-(?P<token>[0-9a-f]{32}|ownerless)-[0-9a-f]{32}\Z"
+)
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
     errno.EINVAL,
     getattr(errno, "ENOTSUP", errno.EINVAL),
     getattr(errno, "EOPNOTSUPP", errno.EINVAL),
 }
+
+
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
+
+def _windows_filesystem() -> Any:
+    from papa_shin_stock._windows_fs import WindowsFilesystem
+
+    return WindowsFilesystem()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +124,22 @@ class GenerationFiles:
                 raise _cache_unavailable() from error
 
 
+@dataclass(frozen=True, slots=True)
+class _WindowsGeneration:
+    files: GenerationFiles
+    identity: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsLockSnapshot:
+    identity: Any
+    token: str | None
+    timestamp: float
+    inventory: dict[str, Any]
+    payloads: dict[str, bytes]
+    write_times: dict[str, float]
+
+
 class CacheRootAttestation:
     """Pinned proof that a cache root is an explicitly owned leaf directory."""
 
@@ -108,13 +147,15 @@ class CacheRootAttestation:
         self,
         root: Path,
         descriptor: int | None,
-        identity: os.stat_result,
+        identity: os.stat_result | None,
         marker_evidence: _PublishedCacheRootMarker,
+        windows_root: Any | None = None,
     ) -> None:
         self.root = root
         self.descriptor = descriptor
         self.identity = identity
         self.marker_evidence = marker_evidence
+        self.windows_root = windows_root
 
     @property
     def ownership_token(self) -> str:
@@ -122,6 +163,21 @@ class CacheRootAttestation:
 
     def assert_current(self) -> None:
         try:
+            if self.windows_root is not None:
+                self.windows_root.assert_current()
+                evidence = self.windows_root.marker_evidence
+                if (
+                    _parse_cache_root_marker_payload(evidence.payload)
+                    != self.ownership_token
+                    or evidence.marker_identity.volume
+                    != self.marker_evidence.device
+                    or evidence.marker_identity.file_id
+                    != self.marker_evidence.inode
+                ):
+                    raise _cache_unavailable()
+                return
+            if self.identity is None:
+                raise _cache_unavailable()
             if self.descriptor is not None:
                 opened = os.fstat(self.descriptor)
                 if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
@@ -153,6 +209,14 @@ class CacheRootAttestation:
             raise _cache_unavailable() from error
 
     def close(self) -> None:
+        windows_root = self.windows_root
+        self.windows_root = None
+        if windows_root is not None:
+            try:
+                windows_root.close()
+            except OSError as error:
+                raise _cache_unavailable() from error
+            return
         descriptor = self.descriptor
         self.descriptor = None
         if descriptor is not None:
@@ -180,6 +244,33 @@ class _PublishedCacheRootMarker:
     inode: int
     file_type: int
     link_count: int
+
+
+def _windows_session(attestation: CacheRootAttestation) -> Any:
+    session = attestation.windows_root
+    if session is None:
+        raise _cache_unavailable()
+    return session
+
+
+def _json_payload(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _parse_windows_json(payload: bytes) -> object:
+    try:
+        return _parse_json(payload.decode("utf-8"))
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+    ) as error:
+        raise _cache_unavailable() from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,10 +362,119 @@ class CacheState:
     ) -> "CacheState | None":
         if _lstat_optional(cache_dir) is None:
             return None
+        if _is_native_windows():
+            return cls._load_windows(cache_dir, progress)
         with _attest_cache_root(cache_dir, create=False) as attestation:
             state = cls._load_attested(cache_dir, progress, attestation)
             attestation.assert_current()
             return state
+
+    @classmethod
+    def _load_windows(
+        cls,
+        cache_dir: Path,
+        progress: Callable[[], None] | None = None,
+    ) -> "CacheState | None":
+        try:
+            with _attest_cache_root(cache_dir, create=False) as attestation:
+                session = _windows_session(attestation)
+                pointer_payload = session.read_optional_file(
+                    (), "current.json", _WINDOWS_POINTER_MAX_BYTES
+                )
+                if pointer_payload is None:
+                    return None
+                pointer = CurrentPointer.from_value(
+                    _parse_windows_json(pointer_payload)
+                )
+                generation_parts = ("generations", pointer.directory_name)
+                manifest_payload = session.read_file(
+                    generation_parts,
+                    "manifest.json",
+                    _WINDOWS_MANIFEST_MAX_BYTES,
+                )
+                manifest = Manifest.parse(manifest_payload)
+                if manifest.generation_id != pointer.generation_id:
+                    raise _cache_unavailable()
+                session.verify_file(
+                    generation_parts,
+                    "products.jsonl",
+                    expected_bytes=manifest.products.bytes,
+                    expected_sha256=manifest.products.sha256,
+                    progress=progress,
+                )
+                session.verify_file(
+                    generation_parts,
+                    "offers.jsonl",
+                    expected_bytes=manifest.offers.bytes,
+                    expected_sha256=manifest.offers.sha256,
+                    progress=progress,
+                )
+                value = _parse_windows_json(
+                    session.read_file(
+                        generation_parts,
+                        "state.json",
+                        _WINDOWS_STATE_MAX_BYTES,
+                    )
+                )
+                if not isinstance(value, dict):
+                    raise _cache_unavailable()
+                generation_id = value.get("generation_id")
+                generated_at = value.get("generated_at")
+                checked_at = value.get("checked_at")
+                manifest_etag = value.get("manifest_etag")
+                manifest_last_modified = value.get("manifest_last_modified")
+                if generation_id != pointer.generation_id:
+                    raise _cache_unavailable()
+                if not isinstance(generated_at, str) or not generated_at:
+                    raise _cache_unavailable()
+                if not isinstance(checked_at, str) or not checked_at:
+                    raise _cache_unavailable()
+                if manifest_etag is not None and not isinstance(
+                    manifest_etag, str
+                ):
+                    raise _cache_unavailable()
+                if manifest_last_modified is not None and not isinstance(
+                    manifest_last_modified, str
+                ):
+                    raise _cache_unavailable()
+                runtime_path = _runtime_status_path(
+                    cache_dir, pointer.directory_name
+                )
+                runtime_payload = session.read_optional_file(
+                    (), runtime_path.name, _WINDOWS_RUNTIME_MAX_BYTES
+                )
+                if runtime_payload is None:
+                    runtime = validate_runtime_status(
+                        value, pointer.generation_id
+                    )
+                    runtime_file = None
+                else:
+                    runtime = validate_runtime_status(
+                        _parse_windows_json(runtime_payload),
+                        pointer.generation_id,
+                    )
+                    runtime_file = runtime_path
+                attestation.assert_current()
+                return cls(
+                    generation_id=generation_id,
+                    generated_at=generated_at,
+                    checked_at=runtime.checked_at,
+                    manifest_etag=manifest_etag,
+                    manifest_last_modified=manifest_last_modified,
+                    directory_name=pointer.directory_name,
+                    files=GenerationFiles.from_directory(
+                        pointer.generation_id,
+                        cache_dir / "generations" / pointer.directory_name,
+                        runtime_file,
+                    ),
+                    runtime_revision=runtime.revision,
+                    stale=runtime.stale,
+                    warning_code=runtime.warning_code,
+                )
+        except StockError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise _cache_unavailable() from error
 
     @classmethod
     def _load_attested(
@@ -1709,12 +1909,452 @@ class CacheLock:
         self.release()
 
 
+class _WindowsCacheLock:
+    def __init__(
+        self,
+        path: Path,
+        token: str,
+        identity: Any,
+        root_attestation: CacheRootAttestation,
+        owner_payload: bytes,
+        inventory: dict[str, Any],
+        recovery_warning: str | None = None,
+    ) -> None:
+        self.path = path
+        self.token = token
+        self.identity = identity
+        self.root_attestation = root_attestation
+        self.owner_payload = owner_payload
+        self.inventory = inventory
+        self.recovery_warning = recovery_warning
+        self.closed = False
+
+    @property
+    def session(self) -> Any:
+        return _windows_session(self.root_attestation)
+
+    @staticmethod
+    def _owner_value(payload: bytes) -> tuple[str, float]:
+        value = _parse_windows_json(payload)
+        if not isinstance(value, dict) or set(value) != {"token", "created_at"}:
+            raise _cache_unavailable()
+        token = value.get("token")
+        created_at = value.get("created_at")
+        if (
+            not isinstance(token, str)
+            or not _RUNTIME_REVISION.fullmatch(token)
+            or not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+        ):
+            raise _cache_unavailable()
+        timestamp = float(created_at)
+        if (
+            not math.isfinite(timestamp)
+            or timestamp > time.time() + _LOCK_FUTURE_SKEW_SECONDS
+        ):
+            raise _cache_unavailable()
+        return token, timestamp
+
+    @classmethod
+    def _snapshot(
+        cls, session: Any, name: str
+    ) -> _WindowsLockSnapshot:
+        identity = session.directory_identity((name,))
+        inventory = session.snapshot_flat_directory((name,))
+        if not inventory:
+            timestamp = session.last_write_time(
+                (), name, directory=True, expected=identity
+            )
+            if (
+                not math.isfinite(timestamp)
+                or timestamp > time.time() + _LOCK_FUTURE_SKEW_SECONDS
+            ):
+                raise _cache_unavailable()
+            return _WindowsLockSnapshot(
+                identity=identity,
+                token=None,
+                timestamp=timestamp,
+                inventory=inventory,
+                payloads={},
+                write_times={},
+            )
+        owner_payload = session.read_file(
+            (name,), "owner.json", _WINDOWS_OWNER_MAX_BYTES
+        )
+        token, created_at = cls._owner_value(owner_payload)
+        heartbeat_name = f"heartbeat-{token}"
+        if set(inventory) != {"owner.json", heartbeat_name}:
+            raise _cache_unavailable()
+        heartbeat_payload = session.read_file((name,), heartbeat_name, 0)
+        heartbeat_time = session.last_write_time(
+            (name,),
+            heartbeat_name,
+            directory=False,
+            expected=inventory[heartbeat_name],
+        )
+        if (
+            not math.isfinite(heartbeat_time)
+            or heartbeat_time > time.time() + _LOCK_FUTURE_SKEW_SECONDS
+        ):
+            raise _cache_unavailable()
+        if (
+            session.read_file((name,), "owner.json", _WINDOWS_OWNER_MAX_BYTES)
+            != owner_payload
+            or session.directory_identity((name,)) != identity
+        ):
+            raise _cache_unavailable()
+        return _WindowsLockSnapshot(
+            identity=identity,
+            token=token,
+            timestamp=max(created_at, heartbeat_time),
+            inventory=inventory,
+            payloads={"owner.json": owner_payload, heartbeat_name: heartbeat_payload},
+            write_times={heartbeat_name: heartbeat_time},
+        )
+
+    @staticmethod
+    def _root_names(session: Any) -> list[str]:
+        names = session.list_directory(())
+        if len(names) > _WINDOWS_MAX_ROOT_ENTRIES:
+            raise _cache_unavailable()
+        return names
+
+    @classmethod
+    def _recover_owned_artifacts(
+        cls,
+        session: Any,
+        *,
+        token: str | None = None,
+        attempts: int = 3,
+    ) -> str | None:
+        cleanup_incomplete = False
+        for _ in range(attempts):
+            candidates: list[tuple[str, str | None, str]] = []
+            for name in cls._root_names(session):
+                release = _WINDOWS_LOCK_RELEASE_DIRECTORY.fullmatch(name)
+                reclaim = _WINDOWS_LOCK_RECLAIM_DIRECTORY.fullmatch(name)
+                if release is not None:
+                    candidate_token = release.group("token")
+                    kind = "release"
+                elif reclaim is not None:
+                    candidate_token = reclaim.group("token")
+                    kind = "reclaim"
+                else:
+                    continue
+                if token is not None and candidate_token != token:
+                    continue
+                candidates.append((name, candidate_token, kind))
+            if not candidates:
+                return "cache_cleanup_incomplete" if cleanup_incomplete else None
+            if len(candidates) > _WINDOWS_MAX_RECOVERY_ARTIFACTS:
+                return "cache_cleanup_incomplete"
+            cleanup_incomplete = False
+            for name, candidate_token, kind in candidates:
+                try:
+                    snapshot = cls._snapshot(session, name)
+                    if candidate_token == "ownerless":
+                        owned = snapshot.token is None and not snapshot.inventory
+                    else:
+                        owned = snapshot.token == candidate_token
+                    if not owned:
+                        cleanup_incomplete = True
+                        continue
+                    suffix_token = candidate_token or "ownerless"
+                    quarantine_name = (
+                        f".refresh.lock.{kind}-{suffix_token}-{uuid.uuid4().hex}"
+                    )
+                    removed = session.delete_flat_directory(
+                        (),
+                        name,
+                        snapshot.identity,
+                        quarantine_name=quarantine_name,
+                        expected_inventory=snapshot.inventory,
+                        expected_payloads=snapshot.payloads,
+                        expected_write_times=snapshot.write_times,
+                    )
+                    if not removed:
+                        cleanup_incomplete = True
+                except (OSError, StockError, ValueError, TypeError):
+                    cleanup_incomplete = True
+        remaining = [
+            name
+            for name in cls._root_names(session)
+            if (
+                (match := _WINDOWS_LOCK_RELEASE_DIRECTORY.fullmatch(name))
+                is not None
+                and (token is None or match.group("token") == token)
+            )
+            or (
+                (match := _WINDOWS_LOCK_RECLAIM_DIRECTORY.fullmatch(name))
+                is not None
+                and (token is None or match.group("token") == token)
+            )
+        ]
+        return "cache_cleanup_incomplete" if remaining or cleanup_incomplete else None
+
+    @classmethod
+    def _cleanup_stale_init_directories(
+        cls, session: Any, current_candidate: str
+    ) -> str | None:
+        cleanup_incomplete = False
+        candidates = [
+            name
+            for name in cls._root_names(session)
+            if name != current_candidate and _LOCK_INIT_DIRECTORY.fullmatch(name)
+        ]
+        if len(candidates) > _WINDOWS_MAX_RECOVERY_ARTIFACTS:
+            return "cache_cleanup_incomplete"
+        for name in candidates:
+            try:
+                snapshot = cls._snapshot(session, name)
+                if time.time() - snapshot.timestamp <= _LOCK_TTL_SECONDS:
+                    continue
+                suffix_token = snapshot.token or "ownerless"
+                removed = session.delete_flat_directory(
+                    (),
+                    name,
+                    snapshot.identity,
+                    quarantine_name=(
+                        f".refresh.lock.reclaim-{suffix_token}-{uuid.uuid4().hex}"
+                    ),
+                    expected_inventory=snapshot.inventory,
+                    expected_payloads=snapshot.payloads,
+                    expected_write_times=snapshot.write_times,
+                )
+                if not removed:
+                    cleanup_incomplete = True
+            except (OSError, StockError, ValueError, TypeError):
+                cleanup_incomplete = True
+        return "cache_cleanup_incomplete" if cleanup_incomplete else None
+
+    @classmethod
+    def _reclaim_stale(cls, session: Any) -> tuple[bool, str | None]:
+        try:
+            snapshot = cls._snapshot(session, ".refresh.lock")
+        except FileNotFoundError:
+            return True, None
+        except (OSError, StockError, ValueError, TypeError):
+            return False, None
+        if time.time() - snapshot.timestamp <= _LOCK_TTL_SECONDS:
+            return False, None
+        suffix_token = snapshot.token or "ownerless"
+        warning: str | None = None
+        try:
+            removed = session.delete_flat_directory(
+                (),
+                ".refresh.lock",
+                snapshot.identity,
+                quarantine_name=(
+                    f".refresh.lock.reclaim-{suffix_token}-{uuid.uuid4().hex}"
+                ),
+                expected_inventory=snapshot.inventory,
+                expected_payloads=snapshot.payloads,
+                expected_write_times=snapshot.write_times,
+            )
+            if not removed:
+                warning = "cache_cleanup_incomplete"
+        except (OSError, StockError, ValueError, TypeError):
+            warning = "cache_cleanup_incomplete"
+        if ".refresh.lock" in cls._root_names(session):
+            return False, warning
+        recovery = cls._recover_owned_artifacts(session)
+        return True, recovery or warning
+
+    @classmethod
+    def acquire(cls, root: Path) -> "_WindowsCacheLock":
+        attestation: CacheRootAttestation | None = _attest_cache_root(
+            root, create=True
+        )
+        session = _windows_session(attestation)
+        token = uuid.uuid4().hex
+        candidate_name = f".refresh.lock.init-{token}"
+        canonical_name = ".refresh.lock"
+        candidate_identity: Any | None = None
+        owner_payload = _json_payload({"token": token, "created_at": time.time()})
+        heartbeat_name = f"heartbeat-{token}"
+        inventory: dict[str, Any] = {}
+        published = False
+        recovery_warning: str | None = None
+        try:
+            recovery_warning = cls._recover_owned_artifacts(session)
+            candidate_identity = session.create_directory((), candidate_name)
+            owner_identity = session.write_new_file(
+                (candidate_name,), "owner.json", owner_payload
+            )
+            inventory["owner.json"] = owner_identity
+            heartbeat_identity = session.write_new_file(
+                (candidate_name,), heartbeat_name, b""
+            )
+            inventory[heartbeat_name] = heartbeat_identity
+            init_warning = cls._cleanup_stale_init_directories(
+                session, candidate_name
+            )
+            recovery_warning = recovery_warning or init_warning
+            if canonical_name in cls._root_names(session):
+                reclaimed, reclaim_warning = cls._reclaim_stale(session)
+                recovery_warning = recovery_warning or reclaim_warning
+                if not reclaimed:
+                    raise StockError(
+                        "cache_locked", "Обновление кэша уже выполняется", 6
+                    )
+            try:
+                session.rename_directory(
+                    (), candidate_name, candidate_identity, canonical_name
+                )
+                published = True
+            except OSError as error:
+                if canonical_name in cls._root_names(session):
+                    try:
+                        canonical_is_candidate = (
+                            session.directory_identity((canonical_name,))
+                            == candidate_identity
+                        )
+                    except (OSError, StockError, ValueError, TypeError):
+                        canonical_is_candidate = False
+                    if canonical_is_candidate:
+                        published = True
+                        raise
+                    raise StockError(
+                        "cache_locked", "Обновление кэша уже выполняется", 6
+                    ) from error
+                raise
+            result = cls(
+                root / canonical_name,
+                token,
+                candidate_identity,
+                attestation,
+                owner_payload,
+                inventory,
+                recovery_warning,
+            )
+            result.assert_owned()
+            attestation = None  # type: ignore[assignment]
+            return result
+        except StockError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise StockError(
+                "cache_locked", "Не удалось установить блокировку кэша", 6
+            ) from error
+        finally:
+            if attestation is not None and candidate_identity is not None:
+                try:
+                    cleanup_name = canonical_name if published else candidate_name
+                    if cleanup_name in cls._root_names(session):
+                        session.delete_flat_directory(
+                            (),
+                            cleanup_name,
+                            candidate_identity,
+                            quarantine_name=(
+                                f".refresh.lock.release-{token}-{uuid.uuid4().hex}"
+                            ),
+                            expected_inventory=inventory,
+                            expected_payloads={
+                                name: owner_payload if name == "owner.json" else b""
+                                for name in inventory
+                            },
+                        )
+                    cls._recover_owned_artifacts(session, token=token)
+                except (OSError, StockError, ValueError, TypeError):
+                    pass
+            if attestation is not None:
+                attestation.close()
+
+    def assert_owned(self) -> None:
+        try:
+            self.root_attestation.assert_current()
+            snapshot = self._snapshot(self.session, ".refresh.lock")
+        except (OSError, StockError, ValueError, TypeError) as error:
+            raise StockError(
+                "cache_locked", "Право на обновление кэша было утрачено", 6
+            ) from error
+        if (
+            snapshot.identity != self.identity
+            or snapshot.token != self.token
+            or snapshot.payloads.get("owner.json") != self.owner_payload
+            or snapshot.inventory != self.inventory
+        ):
+            raise StockError(
+                "cache_locked", "Право на обновление кэша было утрачено", 6
+            )
+
+    def heartbeat(self) -> None:
+        self.assert_owned()
+        heartbeat_name = f"heartbeat-{self.token}"
+        try:
+            self.session.touch_file(
+                (".refresh.lock",),
+                heartbeat_name,
+                self.inventory[heartbeat_name],
+            )
+        except (OSError, StockError, ValueError, TypeError) as error:
+            raise StockError(
+                "cache_locked", "Право на обновление кэша было утрачено", 6
+            ) from error
+        self.assert_owned()
+
+    def release(self) -> str | None:
+        if self.closed:
+            return self.recovery_warning
+        self.closed = True
+        warning = self.recovery_warning
+        heartbeat_name = f"heartbeat-{self.token}"
+        try:
+            self.assert_owned()
+            self.session.delete_flat_directory(
+                (),
+                ".refresh.lock",
+                self.identity,
+                quarantine_name=(
+                    f".refresh.lock.release-{self.token}-{uuid.uuid4().hex}"
+                ),
+                expected_inventory=self.inventory,
+                expected_payloads={
+                    "owner.json": self.owner_payload,
+                    heartbeat_name: b"",
+                },
+            )
+        except (OSError, StockError, ValueError, TypeError):
+            # The namespace is re-inventoried below; only exact owned artifacts
+            # are eligible for bounded recovery.
+            pass
+        try:
+            recovered = self._recover_owned_artifacts(
+                self.session, token=self.token
+            )
+            warning = warning or recovered
+            if ".refresh.lock" in self._root_names(self.session):
+                warning = "cache_cleanup_incomplete"
+        except (OSError, StockError, ValueError, TypeError):
+            warning = "cache_cleanup_incomplete"
+        finally:
+            try:
+                self.root_attestation.close()
+            except StockError:
+                warning = "cache_cleanup_incomplete"
+        self.recovery_warning = warning
+        return warning
+
+    def __enter__(self) -> "_WindowsCacheLock":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
 class StockCache:
     def __init__(self, root: Path, client: SafeHttpClient) -> None:
         self.root = root
         self.client = client
 
     def refresh(self, config: StockConfig) -> RefreshResult:
+        if _is_native_windows():
+            return self._refresh_windows(config)
         previous: CacheState | None = None
         try:
             with CacheLock.acquire(self.root) as lock:
@@ -1785,6 +2425,484 @@ class StockCache:
             if fallback is not None:
                 return self._stale_fallback(fallback, failure.code)
             raise failure from error
+
+    def _refresh_windows(self, config: StockConfig) -> RefreshResult:
+        previous: CacheState | None = None
+        lock: _WindowsCacheLock | None = None
+        try:
+            lock = _WindowsCacheLock.acquire(self.root)
+            previous = self._load_if_readable(lock.heartbeat)
+            result = self._refresh_windows_locked(config, lock, previous)
+        except StockError as error:
+            if lock is not None:
+                lock.release()
+            fallback = self._load_if_readable()
+            if fallback is not None:
+                return self._stale_fallback_windows(fallback, error.code)
+            raise
+        except OSError as error:
+            if lock is not None:
+                lock.release()
+            failure = _cache_unavailable()
+            fallback = self._load_if_readable()
+            if fallback is not None:
+                return self._stale_fallback_windows(fallback, failure.code)
+            raise failure from error
+        except BaseException:
+            if lock is not None:
+                lock.release()
+            raise
+        release_warning = lock.release()
+        if release_warning is not None and result.warning_code is None:
+            result = replace(result, warning_code=release_warning)
+        return result
+
+    def _refresh_windows_locked(
+        self,
+        config: StockConfig,
+        lock: "_WindowsCacheLock",
+        previous: CacheState | None,
+    ) -> RefreshResult:
+        response = self.client.get_manifest(
+            previous.manifest_etag if previous else None,
+            previous.manifest_last_modified if previous else None,
+        )
+        if response.status == 304:
+            if previous is None:
+                raise _cache_unavailable()
+            current = CacheState.load(self.root, lock.heartbeat)
+            if current is None or not _same_generation(current, previous):
+                raise StockError(
+                    "cache_locked", "Активное поколение кэша изменилось", 6
+                )
+            return RefreshResult.from_state(
+                "not_modified",
+                self._record_runtime_status_windows(current, False, None, lock),
+            )
+        if response.status != 200:
+            raise StockError("network_error", "Не удалось получить manifest", 3)
+        manifest = Manifest.parse(response.body)
+        cleanup_warning = self._cleanup_inactive_generations_windows(lock)
+        if cleanup_warning is not None:
+            if previous is None:
+                raise _cache_unavailable()
+            current = CacheState.load(self.root, lock.heartbeat)
+            if current is None:
+                raise _cache_unavailable()
+            current = self._record_runtime_status_windows(
+                current, True, cleanup_warning, lock
+            )
+            return RefreshResult.from_state(
+                "stale_cache",
+                current,
+                stale=True,
+                warning_code=cleanup_warning,
+            )
+        staged = self._download_generation_windows(manifest, config, lock)
+        try:
+            self._verify_generation_windows(staged, manifest, lock)
+            state = self._activate_windows(staged, manifest, response, lock)
+        except BaseException:
+            self._remove_generation_windows_if_inactive(staged, lock)
+            raise
+        cleanup_warning = self._cleanup_inactive_generations_windows(lock)
+        return RefreshResult.from_state(
+            "updated", state, warning_code=cleanup_warning
+        )
+
+    def _record_runtime_status_windows(
+        self,
+        state: CacheState,
+        stale: bool,
+        warning_code: str | None,
+        lock: "_WindowsCacheLock",
+    ) -> CacheState:
+        lock.assert_owned()
+        current = CacheState.load(self.root, lock.heartbeat)
+        if current is None or not _same_runtime_revision(current, state):
+            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
+        value = {
+            "generation_id": state.generation_id,
+            "checked_at": (
+                datetime.now(timezone.utc).isoformat() if not stale else state.checked_at
+            ),
+            "stale": stale,
+            "warning_code": warning_code,
+            "revision": uuid.uuid4().hex,
+        }
+        expected_status = validate_runtime_status(value, state.generation_id)
+        lock.assert_owned()
+        path = _runtime_status_path(self.root, state.directory_name)
+        session = lock.session
+        previous_payload = session.read_optional_file(
+            (), path.name, _WINDOWS_RUNTIME_MAX_BYTES
+        )
+        payload = _json_payload(value)
+        session.replace_file_cas(
+            (),
+            path.name,
+            expected=previous_payload,
+            payload=payload,
+        )
+        lock.assert_owned()
+        if session.read_file((), path.name, _WINDOWS_RUNTIME_MAX_BYTES) != payload:
+            raise _cache_unavailable()
+        return replace(
+            state,
+            checked_at=expected_status.checked_at,
+            files=replace(state.files, runtime_status=path),
+            runtime_revision=expected_status.revision,
+            stale=expected_status.stale,
+            warning_code=expected_status.warning_code,
+        )
+
+    def _stale_fallback_windows(
+        self, state: CacheState, warning_code: str
+    ) -> RefreshResult:
+        persisted = state
+        if warning_code != "cache_locked":
+            try:
+                with _WindowsCacheLock.acquire(self.root) as lock:
+                    persisted = self._record_runtime_status_windows(
+                        state, True, warning_code, lock
+                    )
+            except StockError as error:
+                if error.code != "cache_locked":
+                    raise
+        return RefreshResult.from_state(
+            "stale_cache", persisted, stale=True, warning_code=warning_code
+        )
+
+    def _download_generation_windows(
+        self, manifest: Manifest, config: StockConfig, lock: "_WindowsCacheLock"
+    ) -> _WindowsGeneration:
+        session = lock.session
+        lock.assert_owned()
+        session.ensure_directory(("generations",))
+        directory_name = f".staging-{uuid.uuid4().hex}"
+        identity = session.create_directory(("generations",), directory_name)
+        directory = self.root / "generations" / directory_name
+        staged = _WindowsGeneration(
+            files=GenerationFiles.from_directory(manifest.generation_id, directory),
+            identity=identity,
+        )
+        try:
+            session.write_new_file(
+                ("generations", directory_name), "manifest.json", manifest.body
+            )
+            self._download_private_file_windows(
+                _resolve_download_url(config.manifest_url, manifest.products.url),
+                staged.files.products,
+                manifest.products,
+                lock,
+            )
+            self._download_private_file_windows(
+                _resolve_download_url(config.manifest_url, manifest.offers.url),
+                staged.files.offers,
+                manifest.offers,
+                lock,
+            )
+            return staged
+        except BaseException:
+            self._remove_generation_windows_if_inactive(staged, lock)
+            raise
+
+    def _download_private_file_windows(
+        self,
+        url: str,
+        path: Path,
+        expected: ManifestFile,
+        lock: "_WindowsCacheLock",
+    ) -> None:
+        destination = lock.session.create_download_destination(
+            ("generations", path.parent.name), path.name
+        )
+        try:
+            self.client.download(
+                url,
+                destination,
+                expected.bytes,
+                expected.sha256,
+                progress=lock.heartbeat,
+            )
+            destination.fsync()
+        finally:
+            destination.close()
+
+    def _verify_generation_windows(
+        self,
+        staged: _WindowsGeneration,
+        manifest: Manifest,
+        lock: "_WindowsCacheLock",
+    ) -> None:
+        lock.assert_owned()
+        parts = ("generations", staged.files.manifest.parent.name)
+        lock.session.verify_file(
+            parts,
+            "products.jsonl",
+            expected_bytes=manifest.products.bytes,
+            expected_sha256=manifest.products.sha256,
+            progress=lock.heartbeat,
+        )
+        lock.session.verify_file(
+            parts,
+            "offers.jsonl",
+            expected_bytes=manifest.offers.bytes,
+            expected_sha256=manifest.offers.sha256,
+            progress=lock.heartbeat,
+        )
+
+    def _activate_windows(
+        self,
+        staged: _WindowsGeneration,
+        manifest: Manifest,
+        response: HttpResponse,
+        lock: "_WindowsCacheLock",
+    ) -> CacheState:
+        checked_at = datetime.now(timezone.utc).isoformat()
+        final_name = f"generation-{uuid.uuid4().hex}"
+        final_directory = self.root / "generations" / final_name
+        state_value = {
+            "generation_id": manifest.generation_id,
+            "generated_at": manifest.generated_at,
+            "checked_at": checked_at,
+            "manifest_etag": _header(response.headers, "etag"),
+            "manifest_last_modified": _header(response.headers, "last-modified"),
+            "stale": False,
+            "warning_code": None,
+        }
+        runtime_value = {
+            "generation_id": manifest.generation_id,
+            "checked_at": checked_at,
+            "stale": False,
+            "warning_code": None,
+            "revision": uuid.uuid4().hex,
+        }
+        lock.assert_owned()
+        session = lock.session
+        previous_pointer = session.read_optional_file(
+            (), "current.json", _WINDOWS_POINTER_MAX_BYTES
+        )
+        staging_name = staged.files.manifest.parent.name
+        session.write_new_file(
+            ("generations", staging_name),
+            "state.json",
+            _json_payload(state_value),
+        )
+        final_generation = _WindowsGeneration(
+            files=GenerationFiles.from_directory(
+                manifest.generation_id, final_directory
+            ),
+            identity=staged.identity,
+        )
+        try:
+            session.rename_directory(
+                ("generations",),
+                staging_name,
+                staged.identity,
+                final_name,
+            )
+        except BaseException:
+            self._remove_generation_windows_if_inactive(final_generation, lock)
+            raise
+        pointer = CurrentPointer(manifest.generation_id, final_name, lock.token)
+        pointer_payload = _json_payload(pointer.to_dict())
+        runtime_name = _runtime_status_path(self.root, final_name).name
+        runtime_payload = _json_payload(runtime_value)
+        try:
+            lock.assert_owned()
+            session.replace_file_cas(
+                (), runtime_name, expected=None, payload=runtime_payload
+            )
+            lock.assert_owned()
+            session.replace_file_cas(
+                (),
+                "current.json",
+                expected=previous_pointer,
+                payload=pointer_payload,
+            )
+            lock.assert_owned()
+            if (
+                session.read_file((), "current.json", _WINDOWS_POINTER_MAX_BYTES)
+                != pointer_payload
+                or session.read_file((), runtime_name, _WINDOWS_RUNTIME_MAX_BYTES)
+                != runtime_payload
+            ):
+                raise _cache_unavailable()
+            loaded = CacheState.load(self.root, lock.heartbeat)
+            if (
+                loaded is None
+                or loaded.generation_id != manifest.generation_id
+                or loaded.directory_name != final_name
+                or loaded.runtime_revision != runtime_value["revision"]
+            ):
+                raise _cache_unavailable()
+            return loaded
+        except BaseException:
+            self._rollback_pointer_windows(
+                lock,
+                expected_pointer=pointer_payload,
+                previous_pointer=previous_pointer,
+            )
+            self._remove_generation_windows_if_inactive(final_generation, lock)
+            raise
+
+    def _rollback_pointer_windows(
+        self,
+        lock: "_WindowsCacheLock",
+        *,
+        expected_pointer: bytes,
+        previous_pointer: bytes | None,
+    ) -> bool:
+        try:
+            session = lock.session
+            lock.root_attestation.assert_current()
+            current = session.read_optional_file(
+                (), "current.json", _WINDOWS_POINTER_MAX_BYTES
+            )
+            if current != expected_pointer:
+                return False
+            if previous_pointer is None:
+                session.delete_file_cas((), "current.json", expected_pointer)
+            else:
+                session.replace_file_cas(
+                    (),
+                    "current.json",
+                    expected=expected_pointer,
+                    payload=previous_pointer,
+                )
+            return (
+                session.read_optional_file(
+                    (), "current.json", _WINDOWS_POINTER_MAX_BYTES
+                )
+                == previous_pointer
+            )
+        except (OSError, StockError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _load_current_pointer_windows_session(session: Any) -> CurrentPointer | None:
+        payload = session.read_optional_file(
+            (), "current.json", _WINDOWS_POINTER_MAX_BYTES
+        )
+        if payload is None:
+            return None
+        return CurrentPointer.from_value(_parse_windows_json(payload))
+
+    def _remove_generation_windows_if_inactive(
+        self,
+        generation: _WindowsGeneration,
+        lock: "_WindowsCacheLock",
+    ) -> None:
+        try:
+            lock.assert_owned()
+            session = lock.session
+            directory_name = generation.files.manifest.parent.name
+            pointer = self._load_current_pointer_windows_session(session)
+            if pointer is not None and pointer.directory_name == directory_name:
+                return
+            if "generations" not in session.list_directory(()) or (
+                directory_name not in session.list_directory(("generations",))
+            ):
+                return
+            observed = session.directory_identity(("generations", directory_name))
+            if observed != generation.identity:
+                return
+            inventory = session.snapshot_flat_directory(
+                ("generations", directory_name)
+            )
+            lock.assert_owned()
+            pointer = self._load_current_pointer_windows_session(session)
+            if pointer is not None and pointer.directory_name == directory_name:
+                return
+            removed = session.delete_flat_directory(
+                ("generations",),
+                directory_name,
+                generation.identity,
+                quarantine_name=f".{directory_name}.delete-{uuid.uuid4().hex}",
+                expected_inventory=inventory,
+            )
+            if not removed:
+                return
+            runtime_name = _runtime_status_path(self.root, directory_name).name
+            if runtime_name not in session.list_directory(()) or (
+                (pointer := self._load_current_pointer_windows_session(session))
+                is not None
+                and pointer.directory_name == directory_name
+            ):
+                return
+            runtime_identity = session.file_identity((), runtime_name)
+            session.delete_file_identity((), runtime_name, runtime_identity)
+        except (OSError, StockError, ValueError, TypeError):
+            return
+
+    def _cleanup_inactive_generations_windows(
+        self, lock: "_WindowsCacheLock"
+    ) -> str | None:
+        try:
+            lock.assert_owned()
+            session = lock.session
+            pointer = self._load_current_pointer_windows_session(session)
+            root_names = session.list_directory(())
+            cleanup_incomplete = False
+            if "generations" in root_names:
+                for name in session.list_directory(("generations",)):
+                    lock.assert_owned()
+                    pointer = self._load_current_pointer_windows_session(session)
+                    if pointer is not None and name == pointer.directory_name:
+                        continue
+                    if not name.startswith(("generation-", ".staging-")):
+                        continue
+                    try:
+                        observed = session.directory_identity(
+                            ("generations", name)
+                        )
+                        inventory = session.snapshot_flat_directory(
+                            ("generations", name)
+                        )
+                        lock.assert_owned()
+                        pointer = self._load_current_pointer_windows_session(session)
+                        if pointer is not None and name == pointer.directory_name:
+                            continue
+                        if not session.delete_flat_directory(
+                            ("generations",),
+                            name,
+                            observed,
+                            quarantine_name=f".{name}.delete-{uuid.uuid4().hex}",
+                            expected_inventory=inventory,
+                        ):
+                            cleanup_incomplete = True
+                    except (OSError, StockError, ValueError, TypeError):
+                        cleanup_incomplete = True
+            for name in session.list_directory(()):
+                parsed = _parse_runtime_cleanup_name(name)
+                if parsed is None:
+                    continue
+                directory_name, temporary = parsed
+                lock.assert_owned()
+                pointer = self._load_current_pointer_windows_session(session)
+                if (
+                    not temporary
+                    and pointer is not None
+                    and pointer.directory_name == directory_name
+                ):
+                    continue
+                try:
+                    observed = session.file_identity((), name)
+                    lock.assert_owned()
+                    pointer = self._load_current_pointer_windows_session(session)
+                    if (
+                        not temporary
+                        and pointer is not None
+                        and pointer.directory_name == directory_name
+                    ):
+                        continue
+                    session.delete_file_identity((), name, observed)
+                except (OSError, StockError, ValueError, TypeError):
+                    cleanup_incomplete = True
+            return "cache_cleanup_incomplete" if cleanup_incomplete else None
+        except (OSError, StockError, ValueError, TypeError):
+            return "cache_cleanup_incomplete"
 
     def current_generation(self) -> GenerationFiles:
         state = CacheState.load(self.root)
@@ -2760,6 +3878,8 @@ def _assert_runtime_commit_expected(
 
 def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
     """Initialize an empty cache leaf or validate its strict ownership marker."""
+    if _is_native_windows():
+        return _attest_cache_root_windows(root, create=create)
     descriptor: int | None = None
     initialization_locked = False
     initialized_now = False
@@ -2858,6 +3978,54 @@ def _attest_cache_root(root: Path, *, create: bool) -> CacheRootAttestation:
             except OSError:
                 pass
         _close_optional_descriptor(descriptor)
+
+
+def _attest_cache_root_windows(
+    root: Path, *, create: bool
+) -> CacheRootAttestation:
+    session: Any | None = None
+    try:
+        payload = (
+            _cache_root_marker_payload(secrets.token_hex(16)) if create else None
+        )
+        session = _windows_filesystem().open_cache_root(
+            os.fspath(root),
+            _CACHE_ROOT_MARKER_NAME,
+            payload=payload,
+            maximum=_CACHE_ROOT_MARKER_MAX_BYTES,
+            create=create,
+        )
+        evidence = session.marker_evidence
+        ownership_token = _parse_cache_root_marker_payload(evidence.payload)
+        marker_evidence = _PublishedCacheRootMarker(
+            ownership_token=ownership_token,
+            device=evidence.marker_identity.volume,
+            inode=evidence.marker_identity.file_id,
+            file_type=stat.S_IFREG,
+            link_count=1,
+        )
+        if evidence.root_identity.volume != evidence.marker_identity.volume:
+            raise _cache_unavailable()
+        attestation = CacheRootAttestation(
+            root,
+            None,
+            None,
+            marker_evidence,
+            windows_root=session,
+        )
+        attestation.assert_current()
+        session = None
+        return attestation
+    except StockError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise _cache_unavailable() from error
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except OSError:
+                pass
 
 
 def _list_cache_root_names(root: Path, descriptor: int | None) -> list[str]:
@@ -4100,6 +5268,14 @@ def _read_private_bytes(path: Path) -> bytes:
                 raise _cache_unavailable() from error
 
 
+def _open_and_close_private_regular_file(path: Path) -> None:
+    descriptor = _open_private_regular_file(path)
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        raise _cache_unavailable() from error
+
+
 def _read_private_child_bytes(parent_descriptor: int, name: str) -> bytes:
     descriptor = _open_private_child_regular_file(parent_descriptor, name)
     try:
@@ -4215,8 +5391,8 @@ def _touch_private_regular_file(path: Path) -> None:
         opened = os.fstat(descriptor)
         if os.name == "posix":
             os.utime(descriptor, None)
-        else:  # Windows stdlib does not provide POSIX mode/dir-fd guarantees.
-            os.utime(path, None, follow_symlinks=False)
+        else:
+            raise _cache_unavailable()
         confirmed = path.lstat()
         if not stat.S_ISREG(confirmed.st_mode) or not _same_file_identity(
             opened, confirmed
@@ -4234,6 +5410,8 @@ def _touch_private_regular_file(path: Path) -> None:
 
 
 def _remove_private_directory(path: Path) -> None:
+    if _is_native_windows():
+        return
     parent_descriptor: int | None = None
     try:
         if os.name == "posix":
