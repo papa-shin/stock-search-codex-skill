@@ -876,6 +876,17 @@ class StockCacheTest(unittest.TestCase):
             ):
                 parent_descriptor = kwargs["dir_fd"]
                 try:
+                    # The pre-hardening snapshot above must stay mode 0000, but
+                    # macOS will not let the synthetic harness rename that
+                    # directory. Grant only the owned test entry enough access
+                    # to complete the swap; production still validates against
+                    # the original observed identity and mode.
+                    os.chmod(
+                        target.name,
+                        0o700,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
                     os.rename(
                         target.name,
                         parked.name,
