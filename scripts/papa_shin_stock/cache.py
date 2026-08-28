@@ -60,14 +60,22 @@ _WINDOWS_POINTER_MAX_BYTES = 16 * 1024
 _WINDOWS_STATE_MAX_BYTES = 64 * 1024
 _WINDOWS_RUNTIME_MAX_BYTES = 64 * 1024
 _WINDOWS_OWNER_MAX_BYTES = 16 * 1024
+_WINDOWS_GENERATION_OWNER_MAX_BYTES = 16 * 1024
 _WINDOWS_MANIFEST_MAX_BYTES = 1024 * 1024
 _WINDOWS_MAX_ROOT_ENTRIES = 4096
 _WINDOWS_MAX_RECOVERY_ARTIFACTS = 64
+_WINDOWS_GENERATION_OWNER_NAME = ".papa-shin-stock-generation.json"
+_WINDOWS_GENERATION_OWNER_KIND = "papa-shin-stock-generation"
+_WINDOWS_RUNTIME_OWNER_KIND = "papa-shin-stock-runtime-status"
+_WINDOWS_OWNER_SCHEMA_VERSION = 1
 _WINDOWS_LOCK_RELEASE_DIRECTORY = re.compile(
     r"\.refresh\.lock\.release-(?P<token>[0-9a-f]{32})-[0-9a-f]{32}\Z"
 )
 _WINDOWS_LOCK_RECLAIM_DIRECTORY = re.compile(
     r"\.refresh\.lock\.reclaim-(?P<token>[0-9a-f]{32}|ownerless)-[0-9a-f]{32}\Z"
+)
+_WINDOWS_LOCK_REJECTED_DIRECTORY = re.compile(
+    r"\.refresh\.lock\.rejected-(?:release|reclaim)-[0-9a-f]{32}\Z"
 )
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EBADF,
@@ -128,6 +136,17 @@ class GenerationFiles:
 class _WindowsGeneration:
     files: GenerationFiles
     identity: Any
+    ownership_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsGenerationOwnership:
+    generation_id: str
+    ownership_token: str
+
+
+class _WindowsRollbackUnconfirmed(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +292,99 @@ def _parse_windows_json(payload: bytes) -> object:
         raise _cache_unavailable() from error
 
 
+def _parse_windows_generation_ownership(
+    payload: bytes, expected_root_token: str
+) -> _WindowsGenerationOwnership:
+    value = _parse_windows_json(payload)
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "schema_version",
+        "root_ownership_token",
+        "generation_id",
+        "ownership_token",
+    }:
+        raise _cache_unavailable()
+    generation_id = value.get("generation_id")
+    ownership_token = value.get("ownership_token")
+    if (
+        value.get("kind") != _WINDOWS_GENERATION_OWNER_KIND
+        or value.get("schema_version") != _WINDOWS_OWNER_SCHEMA_VERSION
+        or value.get("root_ownership_token") != expected_root_token
+        or not isinstance(generation_id, str)
+        or not generation_id
+        or not isinstance(ownership_token, str)
+        or not _RUNTIME_REVISION.fullmatch(ownership_token)
+    ):
+        raise _cache_unavailable()
+    return _WindowsGenerationOwnership(generation_id, ownership_token)
+
+
+def _windows_runtime_value(
+    value: dict[str, object],
+    *,
+    root_ownership_token: str,
+    generation_ownership_token: str,
+    directory_name: str,
+) -> dict[str, object]:
+    return {
+        **value,
+        "ownership": {
+            "kind": _WINDOWS_RUNTIME_OWNER_KIND,
+            "schema_version": _WINDOWS_OWNER_SCHEMA_VERSION,
+            "root_ownership_token": root_ownership_token,
+            "generation_ownership_token": generation_ownership_token,
+            "directory_name": directory_name,
+        },
+    }
+
+
+def _validate_windows_runtime_payload(
+    payload: bytes,
+    *,
+    expected_generation_id: str,
+    expected_directory_name: str,
+    expected_root_token: str,
+    expected_generation_ownership_token: str | None = None,
+) -> RuntimeStatus:
+    if not expected_generation_id:
+        raise _cache_unavailable()
+    value = _parse_windows_json(payload)
+    if not isinstance(value, dict) or set(value) != {
+        "generation_id",
+        "checked_at",
+        "stale",
+        "warning_code",
+        "revision",
+        "ownership",
+    }:
+        raise _cache_unavailable()
+    ownership = value.get("ownership")
+    if not isinstance(ownership, dict) or set(ownership) != {
+        "kind",
+        "schema_version",
+        "root_ownership_token",
+        "generation_ownership_token",
+        "directory_name",
+    }:
+        raise _cache_unavailable()
+    generation_ownership_token = ownership.get("generation_ownership_token")
+    if (
+        ownership.get("kind") != _WINDOWS_RUNTIME_OWNER_KIND
+        or ownership.get("schema_version") != _WINDOWS_OWNER_SCHEMA_VERSION
+        or ownership.get("root_ownership_token") != expected_root_token
+        or ownership.get("directory_name") != expected_directory_name
+        or not isinstance(generation_ownership_token, str)
+        or not _RUNTIME_REVISION.fullmatch(generation_ownership_token)
+        or (
+            expected_generation_ownership_token is not None
+            and generation_ownership_token
+            != expected_generation_ownership_token
+        )
+    ):
+        raise _cache_unavailable()
+    return validate_runtime_status(value, expected_generation_id)
+
+
 @dataclass(frozen=True, slots=True)
 class CurrentPointer:
     generation_id: str
@@ -387,6 +499,16 @@ class CacheState:
                     _parse_windows_json(pointer_payload)
                 )
                 generation_parts = ("generations", pointer.directory_name)
+                generation_ownership = _parse_windows_generation_ownership(
+                    session.read_file(
+                        generation_parts,
+                        _WINDOWS_GENERATION_OWNER_NAME,
+                        _WINDOWS_GENERATION_OWNER_MAX_BYTES,
+                    ),
+                    attestation.ownership_token,
+                )
+                if generation_ownership.generation_id != pointer.generation_id:
+                    raise _cache_unavailable()
                 manifest_payload = session.read_file(
                     generation_parts,
                     "manifest.json",
@@ -449,9 +571,14 @@ class CacheState:
                     )
                     runtime_file = None
                 else:
-                    runtime = validate_runtime_status(
-                        _parse_windows_json(runtime_payload),
-                        pointer.generation_id,
+                    runtime = _validate_windows_runtime_payload(
+                        runtime_payload,
+                        expected_generation_id=pointer.generation_id,
+                        expected_directory_name=pointer.directory_name,
+                        expected_root_token=attestation.ownership_token,
+                        expected_generation_ownership_token=(
+                            generation_ownership.ownership_token
+                        ),
                     )
                     runtime_file = runtime_path
                 attestation.assert_current()
@@ -2030,7 +2157,15 @@ class _WindowsCacheLock:
         cleanup_incomplete = False
         for _ in range(attempts):
             candidates: list[tuple[str, str | None, str]] = []
-            for name in cls._root_names(session):
+            names = cls._root_names(session)
+            rejected = [
+                name
+                for name in names
+                if _WINDOWS_LOCK_REJECTED_DIRECTORY.fullmatch(name)
+            ]
+            if rejected:
+                cleanup_incomplete = True
+            for name in names:
                 release = _WINDOWS_LOCK_RELEASE_DIRECTORY.fullmatch(name)
                 reclaim = _WINDOWS_LOCK_RECLAIM_DIRECTORY.fullmatch(name)
                 if release is not None:
@@ -2046,9 +2181,11 @@ class _WindowsCacheLock:
                 candidates.append((name, candidate_token, kind))
             if not candidates:
                 return "cache_cleanup_incomplete" if cleanup_incomplete else None
-            if len(candidates) > _WINDOWS_MAX_RECOVERY_ARTIFACTS:
+            if (
+                len(candidates) + len(rejected)
+                > _WINDOWS_MAX_RECOVERY_ARTIFACTS
+            ):
                 return "cache_cleanup_incomplete"
-            cleanup_incomplete = False
             for name, candidate_token, kind in candidates:
                 try:
                     snapshot = cls._snapshot(session, name)
@@ -2059,9 +2196,8 @@ class _WindowsCacheLock:
                     if not owned:
                         cleanup_incomplete = True
                         continue
-                    suffix_token = candidate_token or "ownerless"
                     quarantine_name = (
-                        f".refresh.lock.{kind}-{suffix_token}-{uuid.uuid4().hex}"
+                        f".refresh.lock.rejected-{kind}-{uuid.uuid4().hex}"
                     )
                     removed = session.delete_flat_directory(
                         (),
@@ -2079,7 +2215,8 @@ class _WindowsCacheLock:
         remaining = [
             name
             for name in cls._root_names(session)
-            if (
+            if _WINDOWS_LOCK_REJECTED_DIRECTORY.fullmatch(name) is not None
+            or (
                 (match := _WINDOWS_LOCK_RELEASE_DIRECTORY.fullmatch(name))
                 is not None
                 and (token is None or match.group("token") == token)
@@ -2433,29 +2570,81 @@ class StockCache:
             lock = _WindowsCacheLock.acquire(self.root)
             previous = self._load_if_readable(lock.heartbeat)
             result = self._refresh_windows_locked(config, lock, previous)
-        except StockError as error:
+        except _WindowsRollbackUnconfirmed as error:
             if lock is not None:
                 lock.release()
-            fallback = self._load_if_readable()
+            raise _cache_unavailable() from error
+        except StockError as error:
+            fallback = self._finalize_windows_failure(
+                lock, previous, error.code
+            )
             if fallback is not None:
-                return self._stale_fallback_windows(fallback, error.code)
+                return fallback
             raise
         except OSError as error:
-            if lock is not None:
-                lock.release()
             failure = _cache_unavailable()
-            fallback = self._load_if_readable()
+            fallback = self._finalize_windows_failure(
+                lock, previous, failure.code
+            )
             if fallback is not None:
-                return self._stale_fallback_windows(fallback, failure.code)
+                return fallback
             raise failure from error
         except BaseException:
             if lock is not None:
                 lock.release()
             raise
         release_warning = lock.release()
-        if release_warning is not None and result.warning_code is None:
+        if release_warning is not None:
             result = replace(result, warning_code=release_warning)
         return result
+
+    def _finalize_windows_failure(
+        self,
+        lock: _WindowsCacheLock | None,
+        previous: CacheState | None,
+        warning_code: str,
+    ) -> RefreshResult | None:
+        persisted = previous
+        persistence_error: StockError | None = None
+        release_warning: str | None = None
+        try:
+            if (
+                lock is not None
+                and persisted is not None
+                and warning_code != "cache_locked"
+            ):
+                try:
+                    persisted = self._record_runtime_status_windows(
+                        persisted, True, warning_code, lock
+                    )
+                except StockError as error:
+                    persistence_error = error
+                except OSError:
+                    persistence_error = _cache_unavailable()
+        finally:
+            if lock is not None:
+                release_warning = lock.release()
+        if (
+            persisted is None
+            or warning_code == "cache_locked"
+            or (
+                persistence_error is not None
+                and persistence_error.code == "cache_locked"
+            )
+        ):
+            persisted = self._load_if_readable()
+        if release_warning is not None and persisted is not None:
+            return self._stale_fallback_windows(
+                persisted, release_warning
+            )
+        if (
+            persistence_error is not None
+            and persistence_error.code != "cache_locked"
+        ):
+            raise persistence_error
+        if persisted is None:
+            return None
+        return self._stale_fallback_windows(persisted, warning_code)
 
     def _refresh_windows_locked(
         self,
@@ -2521,19 +2710,36 @@ class StockCache:
         current = CacheState.load(self.root, lock.heartbeat)
         if current is None or not _same_runtime_revision(current, state):
             raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
-        value = {
-            "generation_id": state.generation_id,
-            "checked_at": (
-                datetime.now(timezone.utc).isoformat() if not stale else state.checked_at
+        session = lock.session
+        generation_ownership = _parse_windows_generation_ownership(
+            session.read_file(
+                ("generations", state.directory_name),
+                _WINDOWS_GENERATION_OWNER_NAME,
+                _WINDOWS_GENERATION_OWNER_MAX_BYTES,
             ),
-            "stale": stale,
-            "warning_code": warning_code,
-            "revision": uuid.uuid4().hex,
-        }
+            lock.root_attestation.ownership_token,
+        )
+        if generation_ownership.generation_id != state.generation_id:
+            raise _cache_unavailable()
+        value = _windows_runtime_value(
+            {
+                "generation_id": state.generation_id,
+                "checked_at": (
+                    datetime.now(timezone.utc).isoformat()
+                    if not stale
+                    else state.checked_at
+                ),
+                "stale": stale,
+                "warning_code": warning_code,
+                "revision": uuid.uuid4().hex,
+            },
+            root_ownership_token=lock.root_attestation.ownership_token,
+            generation_ownership_token=generation_ownership.ownership_token,
+            directory_name=state.directory_name,
+        )
         expected_status = validate_runtime_status(value, state.generation_id)
         lock.assert_owned()
         path = _runtime_status_path(self.root, state.directory_name)
-        session = lock.session
         previous_payload = session.read_optional_file(
             (), path.name, _WINDOWS_RUNTIME_MAX_BYTES
         )
@@ -2559,18 +2765,8 @@ class StockCache:
     def _stale_fallback_windows(
         self, state: CacheState, warning_code: str
     ) -> RefreshResult:
-        persisted = state
-        if warning_code != "cache_locked":
-            try:
-                with _WindowsCacheLock.acquire(self.root) as lock:
-                    persisted = self._record_runtime_status_windows(
-                        state, True, warning_code, lock
-                    )
-            except StockError as error:
-                if error.code != "cache_locked":
-                    raise
         return RefreshResult.from_state(
-            "stale_cache", persisted, stale=True, warning_code=warning_code
+            "stale_cache", state, stale=True, warning_code=warning_code
         )
 
     def _download_generation_windows(
@@ -2582,11 +2778,27 @@ class StockCache:
         directory_name = f".staging-{uuid.uuid4().hex}"
         identity = session.create_directory(("generations",), directory_name)
         directory = self.root / "generations" / directory_name
+        ownership_token = uuid.uuid4().hex
+        ownership_payload = _json_payload(
+            {
+                "kind": _WINDOWS_GENERATION_OWNER_KIND,
+                "schema_version": _WINDOWS_OWNER_SCHEMA_VERSION,
+                "root_ownership_token": lock.root_attestation.ownership_token,
+                "generation_id": manifest.generation_id,
+                "ownership_token": ownership_token,
+            }
+        )
         staged = _WindowsGeneration(
             files=GenerationFiles.from_directory(manifest.generation_id, directory),
             identity=identity,
+            ownership_token=ownership_token,
         )
         try:
+            session.write_new_file(
+                ("generations", directory_name),
+                _WINDOWS_GENERATION_OWNER_NAME,
+                ownership_payload,
+            )
             session.write_new_file(
                 ("generations", directory_name), "manifest.json", manifest.body
             )
@@ -2671,13 +2883,18 @@ class StockCache:
             "stale": False,
             "warning_code": None,
         }
-        runtime_value = {
-            "generation_id": manifest.generation_id,
-            "checked_at": checked_at,
-            "stale": False,
-            "warning_code": None,
-            "revision": uuid.uuid4().hex,
-        }
+        runtime_value = _windows_runtime_value(
+            {
+                "generation_id": manifest.generation_id,
+                "checked_at": checked_at,
+                "stale": False,
+                "warning_code": None,
+                "revision": uuid.uuid4().hex,
+            },
+            root_ownership_token=lock.root_attestation.ownership_token,
+            generation_ownership_token=staged.ownership_token,
+            directory_name=final_name,
+        )
         lock.assert_owned()
         session = lock.session
         previous_pointer = session.read_optional_file(
@@ -2694,6 +2911,7 @@ class StockCache:
                 manifest.generation_id, final_directory
             ),
             identity=staged.identity,
+            ownership_token=staged.ownership_token,
         )
         try:
             session.rename_directory(
@@ -2738,12 +2956,14 @@ class StockCache:
             ):
                 raise _cache_unavailable()
             return loaded
-        except BaseException:
-            self._rollback_pointer_windows(
+        except BaseException as activation_error:
+            rollback_confirmed = self._rollback_pointer_windows(
                 lock,
                 expected_pointer=pointer_payload,
                 previous_pointer=previous_pointer,
             )
+            if not rollback_confirmed:
+                raise _WindowsRollbackUnconfirmed() from activation_error
             self._remove_generation_windows_if_inactive(final_generation, lock)
             raise
 
@@ -2760,6 +2980,8 @@ class StockCache:
             current = session.read_optional_file(
                 (), "current.json", _WINDOWS_POINTER_MAX_BYTES
             )
+            if current == previous_pointer:
+                return True
             if current != expected_pointer:
                 return False
             if previous_pointer is None:
@@ -2860,6 +3082,50 @@ class StockCache:
                         inventory = session.snapshot_flat_directory(
                             ("generations", name)
                         )
+                        if _WINDOWS_GENERATION_OWNER_NAME not in inventory:
+                            raise _cache_unavailable()
+                        ownership_payload = session.read_file(
+                            ("generations", name),
+                            _WINDOWS_GENERATION_OWNER_NAME,
+                            _WINDOWS_GENERATION_OWNER_MAX_BYTES,
+                        )
+                        ownership = _parse_windows_generation_ownership(
+                            ownership_payload,
+                            lock.root_attestation.ownership_token,
+                        )
+                        allowed_inventory = {
+                            _WINDOWS_GENERATION_OWNER_NAME,
+                            "manifest.json",
+                            "products.jsonl",
+                            "offers.jsonl",
+                            "state.json",
+                        }
+                        if not set(inventory).issubset(allowed_inventory):
+                            raise _cache_unavailable()
+                        if name.startswith("generation-"):
+                            if set(inventory) != allowed_inventory:
+                                raise _cache_unavailable()
+                            manifest = Manifest.parse(
+                                session.read_file(
+                                    ("generations", name),
+                                    "manifest.json",
+                                    _WINDOWS_MANIFEST_MAX_BYTES,
+                                )
+                            )
+                            state_value = _parse_windows_json(
+                                session.read_file(
+                                    ("generations", name),
+                                    "state.json",
+                                    _WINDOWS_STATE_MAX_BYTES,
+                                )
+                            )
+                            if (
+                                manifest.generation_id != ownership.generation_id
+                                or not isinstance(state_value, dict)
+                                or state_value.get("generation_id")
+                                != ownership.generation_id
+                            ):
+                                raise _cache_unavailable()
                         lock.assert_owned()
                         pointer = self._load_current_pointer_windows_session(session)
                         if pointer is not None and name == pointer.directory_name:
@@ -2870,6 +3136,9 @@ class StockCache:
                             observed,
                             quarantine_name=f".{name}.delete-{uuid.uuid4().hex}",
                             expected_inventory=inventory,
+                            expected_payloads={
+                                _WINDOWS_GENERATION_OWNER_NAME: ownership_payload
+                            },
                         ):
                             cleanup_incomplete = True
                     except (OSError, StockError, ValueError, TypeError):
@@ -2889,6 +3158,20 @@ class StockCache:
                     continue
                 try:
                     observed = session.file_identity((), name)
+                    payload = session.read_file(
+                        (), name, _WINDOWS_RUNTIME_MAX_BYTES
+                    )
+                    runtime_value = _parse_windows_json(payload)
+                    if not isinstance(runtime_value, dict) or not isinstance(
+                        runtime_value.get("generation_id"), str
+                    ):
+                        raise _cache_unavailable()
+                    _validate_windows_runtime_payload(
+                        payload,
+                        expected_generation_id=runtime_value["generation_id"],
+                        expected_directory_name=directory_name,
+                        expected_root_token=lock.root_attestation.ownership_token,
+                    )
                     lock.assert_owned()
                     pointer = self._load_current_pointer_windows_session(session)
                     if (

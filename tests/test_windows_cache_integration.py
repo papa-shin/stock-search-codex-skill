@@ -375,6 +375,15 @@ class LocalWindowsRoot:
             if self.filesystem.flat_delete_failures_remaining > 0:
                 self.filesystem.flat_delete_failures_remaining -= 1
                 raise OSError("synthetic post-rename cleanup failure")
+            if (
+                name.startswith(".refresh.lock.release-")
+                and self.filesystem.mutate_recovery_quarantine_payload_once
+            ):
+                self.filesystem.mutate_recovery_quarantine_payload_once = False
+                owner_path = quarantine / "owner.json"
+                owner_value = json.loads(owner_path.read_text(encoding="utf-8"))
+                owner_value["created_at"] = 1.0
+                owner_path.write_text(json.dumps(owner_value), encoding="utf-8")
             if self._identity(quarantine, directory=True) != expected:
                 raise OSError("identity changed")
             if set(path.name for path in quarantine.iterdir()) != set(inventory):
@@ -481,6 +490,7 @@ class LocalWindowsFilesystem:
         self.generation_publish_failures_remaining = 0
         self.replace_canonical_lock_before_delete = False
         self.root_list_failures_remaining = 0
+        self.mutate_recovery_quarantine_payload_once = False
 
     def open_cache_root(
         self,
@@ -679,9 +689,44 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         self.assertEqual(result.status, "updated")
         self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
         self.assertFalse((self.root / ".refresh.lock").exists())
-        retained = self._release_artifacts()
+        retained = [
+            path
+            for path in self.root.glob(".refresh.lock.*")
+            if path.is_dir() and (path / "owner.json").is_file()
+        ]
         self.assertEqual(len(retained), 1)
         self.assertTrue((retained[0] / "owner.json").is_file())
+
+    def test_recovery_never_re_attests_payload_rejected_after_quarantine_move(
+        self,
+    ) -> None:
+        self.windows.flat_delete_failures_remaining = 1
+        self.windows.mutate_recovery_quarantine_payload_once = True
+
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            retained = [
+                path
+                for path in self.root.glob(".refresh.lock.*")
+                if path.is_dir() and (path / "owner.json").is_file()
+            ]
+            self.assertEqual(len(retained), 1)
+            retained_path = retained[0]
+            retained_identity = retained_path.stat().st_ino
+            retained_payload = (retained_path / "owner.json").read_bytes()
+
+            second = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+
+        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertTrue(retained_path.is_dir())
+        self.assertEqual(retained_path.stat().st_ino, retained_identity)
+        self.assertEqual((retained_path / "owner.json").read_bytes(), retained_payload)
+        self.assertEqual(json.loads(retained_payload)["created_at"], 1.0)
 
     def test_foreign_canonical_lock_at_release_is_preserved_and_reported(self) -> None:
         self.windows.replace_canonical_lock_before_delete = True
@@ -747,6 +792,79 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             [pointer["directory_name"]],
         )
 
+    def test_failed_refresh_prioritizes_persistent_lock_release_warning(self) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = self._pointer_payload()
+            self.windows.flat_delete_failures_remaining = 20
+
+            result = StockCache(
+                self.root,
+                self._generation_c_client(interrupt_offers=True),
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+        self.assertTrue(
+            any(path.is_dir() for path in self.root.glob(".refresh.lock.*"))
+        )
+
+    def test_failure_fallback_reloads_current_after_runtime_status_race(self) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous = cache_module.CacheState.load(self.root)
+            second = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+            lock = cache_module._WindowsCacheLock.acquire(self.root)
+            cache = StockCache(self.root, self._generation_c_client())
+            with patch.object(
+                cache,
+                "_record_runtime_status_windows",
+                side_effect=StockError(
+                    "cache_locked", "Активное поколение кэша изменилось", 6
+                ),
+            ):
+                result = cache._finalize_windows_failure(
+                    lock, previous, "network_error"
+                )
+
+        self.assertIsNotNone(previous)
+        self.assertIsNotNone(result)
+        self.assertNotEqual(first.generation_id, second.generation_id)
+        self.assertEqual(result.generation_id, second.generation_id)
+
+    def test_failure_finalizer_releases_lock_on_unexpected_persistence_error(
+        self,
+    ) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous = cache_module.CacheState.load(self.root)
+            lock = cache_module._WindowsCacheLock.acquire(self.root)
+            cache = StockCache(self.root, self._generation_c_client())
+            with patch.object(
+                cache,
+                "_record_runtime_status_windows",
+                side_effect=RuntimeError("synthetic persistence failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "synthetic persistence failure"
+                ):
+                    cache._finalize_windows_failure(
+                        lock, previous, "network_error"
+                    )
+
+        self.assertFalse((self.root / ".refresh.lock").exists())
+        self.assertEqual(self._release_artifacts(), [])
+
     def test_checksum_failure_preserves_previous_pointer_and_generation(self) -> None:
         with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
             cache_module, "_windows_filesystem", return_value=self.windows
@@ -796,6 +914,49 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
                     self.root, self._generation_c_client()
                 ).refresh(self.config)
 
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+
+    def test_pre_pointer_activation_failure_confirms_previous_pointer(self) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = self._pointer_payload()
+            original_replace = LocalWindowsRoot.replace_file_cas
+            injected = False
+
+            def fail_runtime_publish(
+                session: LocalWindowsRoot,
+                parent_parts: tuple[str, ...],
+                name: str,
+                *,
+                expected: bytes | None,
+                payload: bytes,
+            ) -> WindowsIdentity:
+                nonlocal injected
+                if name.startswith(".runtime-status-") and not injected:
+                    injected = True
+                    raise OSError("synthetic runtime publication failure")
+                return original_replace(
+                    session,
+                    parent_parts,
+                    name,
+                    expected=expected,
+                    payload=payload,
+                )
+
+            with patch.object(
+                LocalWindowsRoot,
+                "replace_file_cas",
+                new=fail_runtime_publish,
+            ):
+                result = StockCache(
+                    self.root, self._generation_c_client()
+                ).refresh(self.config)
+
+        self.assertTrue(injected)
         self.assertEqual(result.status, "stale_cache")
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
@@ -871,6 +1032,68 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             [pointer["directory_name"]],
         )
 
+    def test_unconfirmed_pointer_rollback_fails_closed_without_loading_new_pointer(
+        self,
+    ) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = json.loads(self._pointer_payload())
+            previous_directory = (
+                self.root / "generations" / previous_pointer["directory_name"]
+            )
+            original_replace = LocalWindowsRoot.replace_file_cas
+            pointer_attempts = 0
+
+            def fail_publish_then_rollback(
+                session: LocalWindowsRoot,
+                parent_parts: tuple[str, ...],
+                name: str,
+                *,
+                expected: bytes | None,
+                payload: bytes,
+            ) -> WindowsIdentity:
+                nonlocal pointer_attempts
+                if name != "current.json":
+                    return original_replace(
+                        session,
+                        parent_parts,
+                        name,
+                        expected=expected,
+                        payload=payload,
+                    )
+                pointer_attempts += 1
+                if pointer_attempts == 1:
+                    identity = original_replace(
+                        session,
+                        parent_parts,
+                        name,
+                        expected=expected,
+                        payload=payload,
+                    )
+                    raise OSError("synthetic post-publication failure")
+                raise OSError("synthetic rollback failure")
+
+            with patch.object(
+                LocalWindowsRoot,
+                "replace_file_cas",
+                new=fail_publish_then_rollback,
+            ):
+                with self.assertRaises(StockError) as captured:
+                    StockCache(
+                        self.root, self._generation_c_client()
+                    ).refresh(self.config)
+
+        self.assertEqual(pointer_attempts, 2)
+        self.assertEqual(captured.exception.code, "cache_unavailable")
+        self.assertTrue(previous_directory.is_dir())
+        self.assertEqual(first.generation_id, previous_pointer["generation_id"])
+        self.assertEqual(
+            json.loads(self._pointer_payload())["generation_id"],
+            "generation-c",
+        )
+
     def test_expired_windows_lock_is_reclaimed(self) -> None:
         with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
             cache_module, "_windows_filesystem", return_value=self.windows
@@ -916,6 +1139,67 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
         self.assertEqual(marker.read_bytes(), b"foreign-safe")
+
+    def test_cleanup_preserves_flat_foreign_generation_without_ownership_receipt(
+        self,
+    ) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = self._pointer_payload()
+            foreign = self.root / "generations" / "generation-foreign"
+            foreign.mkdir()
+            marker = foreign / "keep.txt"
+            marker.write_bytes(b"foreign-safe")
+
+            result = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+        self.assertEqual(marker.read_bytes(), b"foreign-safe")
+
+    def test_cleanup_preserves_foreign_runtime_like_file_without_ownership_receipt(
+        self,
+    ) -> None:
+        with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = self._pointer_payload()
+            foreign = self.root / ".runtime-status-generation-foreign.json"
+            foreign_payload = json.dumps(
+                {
+                    "generation_id": "generation-foreign",
+                    "checked_at": "2026-08-28T00:00:00+00:00",
+                    "stale": False,
+                    "warning_code": None,
+                    "revision": "1" * 32,
+                    "ownership": {
+                        "kind": "papa-shin-stock-runtime-status",
+                        "schema_version": 1,
+                        "root_ownership_token": "0" * 32,
+                        "generation_ownership_token": "2" * 32,
+                        "directory_name": "generation-foreign",
+                    },
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            foreign.write_bytes(foreign_payload)
+
+            result = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+        self.assertEqual(foreign.read_bytes(), foreign_payload)
 
     def test_cleanup_rejects_unexpected_hardlink_without_deleting_it(self) -> None:
         with patch.object(cache_module, "_is_native_windows", return_value=True), patch.object(
