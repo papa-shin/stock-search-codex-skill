@@ -1070,15 +1070,25 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             encoding="utf-8",
         )
         original = runtime.with_suffix(".original")
-        real_write = cache_module._write_json_atomic
+        real_write = cache_module._write_runtime_status_atomic_attested
 
-        def swap_before_write(path: Path, value: object) -> None:
-            if path == runtime:
+        def swap_before_write(
+            attestation: cache_module.CacheRootAttestation,
+            directory_name: str,
+            value: object,
+        ) -> None:
+            if cache_module._runtime_status_path(
+                self.cache_root, directory_name
+            ) == runtime:
                 runtime.rename(original)
                 runtime.symlink_to(outside)
-            real_write(path, value)
+            real_write(attestation, directory_name, value)
 
-        with patch.object(cache_module, "_write_json_atomic", swap_before_write):
+        with patch.object(
+            cache_module,
+            "_write_runtime_status_atomic_attested",
+            swap_before_write,
+        ):
             with cache_module.CacheLock.acquire(self.cache_root) as lock:
                 with self.assertRaisesRegex(StockError, "cache_unavailable"):
                     StockCache(self.cache_root, object())._record_runtime_status(
@@ -1093,7 +1103,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         state = CacheState.load(self.cache_root)
         self.assertIsNotNone(state)
         cache = StockCache(self.cache_root, object())
-        real_write = cache_module._write_runtime_status_atomic
+        real_write = cache_module._write_runtime_status_atomic_attested
 
         with cache_module.CacheLock.acquire(self.cache_root) as lock:
             owner = lock.path / "owner.json"
@@ -1117,16 +1127,18 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
             cache_module.os.utime(heartbeat, (expired, expired))
 
             def assert_fresh_lease_then_write(
-                root: Path, directory_name: str, value: object
+                root_attestation: cache_module.CacheRootAttestation,
+                directory_name: str,
+                value: object,
             ) -> None:
                 owner_state = cache_module.CacheLock._read_owner(lock.path)
                 self.assertIsNotNone(owner_state)
                 self.assertLess(cache_module.time.time() - owner_state[1], 5)
-                real_write(root, directory_name, value)
+                real_write(root_attestation, directory_name, value)
 
             with patch.object(
                 cache_module,
-                "_write_runtime_status_atomic",
+                "_write_runtime_status_atomic_attested",
                 side_effect=assert_fresh_lease_then_write,
             ):
                 updated = cache._record_runtime_status(
@@ -1148,12 +1160,15 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         delayed_errors: list[StockError] = []
         real_commit_acquire = cache_module.RuntimeCommitLock.acquire
 
-        def pause_delayed_commit(root: Path) -> object:
+        def pause_delayed_commit(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             if threading.current_thread().name == "delayed-runtime-writer":
                 delayed_at_commit.set()
                 if not allow_delayed_commit.wait(timeout=5):
                     raise AssertionError("delayed commit timeout")
-            return real_commit_acquire(root)
+            return real_commit_acquire(root, root_attestation)
 
         def run_delayed() -> None:
             try:
@@ -1216,22 +1231,27 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         first_errors: list[BaseException] = []
         second_errors: list[BaseException] = []
         second_results: list[CacheState] = []
-        real_write = cache_module._write_runtime_status_atomic
+        real_write = cache_module._write_runtime_status_atomic_attested
         real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
         def pause_first_write(
-            root: Path, directory_name: str, value: object
+            root_attestation: cache_module.CacheRootAttestation,
+            directory_name: str,
+            value: object,
         ) -> None:
             if threading.current_thread().name == "first-runtime-writer":
                 first_in_replace.set()
                 if not allow_first_replace.wait(timeout=5):
                     raise AssertionError("first replace timeout")
-            real_write(root, directory_name, value)
+            real_write(root_attestation, directory_name, value)
 
-        def observe_second_wait(root: Path) -> object:
+        def observe_second_wait(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             if threading.current_thread().name == "second-runtime-writer":
                 second_waiting.set()
-            return real_publish_acquire(root)
+            return real_publish_acquire(root, root_attestation)
 
         def run_first() -> None:
             try:
@@ -1258,7 +1278,9 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
                 second_errors.append(error)
 
         with patch.object(
-            cache_module, "_write_runtime_status_atomic", side_effect=pause_first_write
+            cache_module,
+            "_write_runtime_status_atomic_attested",
+            side_effect=pause_first_write,
         ):
             with patch.object(
                 cache_module._RefreshLockPublishLock,
@@ -1312,7 +1334,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         with cache_module.CacheLock.acquire(self.cache_root) as lock:
             with patch.object(
                 cache_module,
-                "_write_runtime_status_atomic",
+                "_write_runtime_status_atomic_attested",
                 side_effect=PermissionError("/private/cache/runtime-status"),
             ):
                 with self.assertRaisesRegex(StockError, "cache_unavailable"):
@@ -1404,14 +1426,24 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
     def test_runtime_lstat_failure_is_safe_cache_error(self) -> None:
         runtime = self.runtime_status_path()
-        real_lstat = Path.lstat
+        real_lstat = cache_module._lstat_private_child
 
-        def fail_runtime_lstat(path: Path) -> object:
-            if path == runtime:
+        def fail_runtime_lstat(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            *,
+            missing_ok: bool = False,
+        ) -> object:
+            if name == runtime.name:
                 raise PermissionError("/private/cache/runtime")
-            return real_lstat(path)
+            return real_lstat(
+                parent_descriptor, parent, name, missing_ok=missing_ok
+            )
 
-        with patch.object(Path, "lstat", fail_runtime_lstat):
+        with patch.object(
+            cache_module, "_lstat_private_child", fail_runtime_lstat
+        ):
             with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:
                 CacheState.load(self.cache_root)
 
@@ -1456,7 +1488,7 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
 
         with patch.object(
             cache_module,
-            "_write_runtime_status_atomic",
+            "_write_runtime_status_atomic_attested",
             side_effect=PermissionError("/private/cache/runtime/status.json"),
         ):
             with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:

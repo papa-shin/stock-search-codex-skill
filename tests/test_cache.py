@@ -223,6 +223,7 @@ class StockCacheTest(unittest.TestCase):
             "duplicate": b'{"kind":"papa-shin-stock-cache-root","kind":"x","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef"}',
             "extra": b'{"kind":"papa-shin-stock-cache-root","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef","extra":true}',
             "trailing": b'{"kind":"papa-shin-stock-cache-root","schema_version":1,"ownership_token":"0123456789abcdef0123456789abcdef"}\n',
+            "bool-version": b'{"kind":"papa-shin-stock-cache-root","schema_version":true,"ownership_token":"0123456789abcdef0123456789abcdef"}',
         }
         for label, payload in invalid_payloads.items():
             with self.subTest(label=label):
@@ -259,6 +260,140 @@ class StockCacheTest(unittest.TestCase):
             cache_module._attest_cache_root(root, create=False)
         self.assertTrue(marker.is_dir())
         self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(os.name == "posix", "Hard-link identity проверяется на POSIX")
+    def test_hardlinked_cache_root_marker_is_rejected(self) -> None:
+        root = Path(self.temp_dir.name) / "hardlink-marker"
+        root.mkdir()
+        source = Path(self.temp_dir.name) / "marker-source"
+        source.write_bytes(cache_module._cache_root_marker_payload("a" * 32))
+        os.chmod(source, 0o600)
+        os.link(source, root / ".papa-shin-stock-cache-root.json")
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=False)
+
+    def test_preexisting_initializer_temp_is_foreign_and_not_removed(self) -> None:
+        root = Path(self.temp_dir.name) / "foreign-init"
+        root.mkdir(mode=0o755)
+        candidate = root / (".papa-shin-stock-cache-root.init-" + "a" * 32 + ".tmp")
+        candidate.write_text("foreign", encoding="utf-8")
+        before_mode = stat.S_IMODE(root.stat().st_mode)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "foreign")
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
+
+    def test_unrelated_insertion_before_marker_publication_blocks_hardening(self) -> None:
+        root = Path(self.temp_dir.name) / "late-insertion"
+        root.mkdir(mode=0o755)
+        before_mode = stat.S_IMODE(root.stat().st_mode)
+        real_publish = cache_module._publish_cache_root_marker
+
+        def inject_then_publish(path: Path, descriptor: int | None) -> None:
+            (root / "unrelated.txt").write_text("keep", encoding="utf-8")
+            real_publish(path, descriptor)
+
+        with patch.object(
+            cache_module,
+            "_publish_cache_root_marker",
+            side_effect=inject_then_publish,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+        self.assertEqual((root / "unrelated.txt").read_text(), "keep")
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), before_mode)
+
+    def test_matching_foreign_initializer_temp_does_not_make_root_adoptable(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name) / "foreign-init-race"
+        root.mkdir(mode=0o755)
+        foreign = root / (
+            ".papa-shin-stock-cache-root.init-" + "b" * 32 + ".tmp"
+        )
+        real_publish = cache_module._publish_cache_root_marker
+
+        def inject_then_publish(path: Path, descriptor: int | None) -> str:
+            foreign.write_text("foreign", encoding="utf-8")
+            os.chmod(foreign, 0o600)
+            return real_publish(path, descriptor)
+
+        with patch.object(
+            cache_module,
+            "_publish_cache_root_marker",
+            side_effect=inject_then_publish,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign")
+        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+
+    def test_marker_inserted_during_initialization_is_quarantined_fail_closed(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name) / "foreign-marker-race"
+        root.mkdir(mode=0o755)
+        marker = root / ".papa-shin-stock-cache-root.json"
+        foreign_payload = cache_module._cache_root_marker_payload("c" * 32)
+
+        def insert_conflicting_marker(*args: object, **kwargs: object) -> None:
+            marker.write_bytes(foreign_payload)
+            os.chmod(marker, 0o600)
+            raise FileExistsError("synthetic marker race")
+
+        with patch.object(
+            cache_module.os, "link", side_effect=insert_conflicting_marker
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        self.assertFalse(marker.exists())
+        conflicts = list(
+            root.glob(".papa-shin-stock-cache-root.conflict-*")
+        )
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].read_bytes(), foreign_payload)
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            cache_module._attest_cache_root(root, create=True)
+
+    @unittest.skipUnless(os.name == "posix", "FD accounting проверяется на POSIX")
+    def test_failed_final_attestation_does_not_leak_root_descriptor(self) -> None:
+        root = Path(self.temp_dir.name) / "fd-stable"
+        root.mkdir()
+        before = len(list(Path("/dev/fd").iterdir()))
+        with patch.object(
+            cache_module.CacheRootAttestation,
+            "assert_current",
+            side_effect=StockError("cache_unavailable", "Проверенный кэш недоступен", 5),
+        ):
+            for _ in range(20):
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    cache_module._attest_cache_root(root, create=True)
+        after = len(list(Path("/dev/fd").iterdir()))
+        self.assertLessEqual(after, before + 1)
+
+    @unittest.skipUnless(os.name == "posix", "FD accounting проверяется на POSIX")
+    def test_failed_generation_load_does_not_leak_child_descriptors(self) -> None:
+        self.fixture.seed_generation()
+        state_path = (
+            self.cache_root
+            / "generations"
+            / "generation-existing"
+            / "state.json"
+        )
+        state_path.write_text("not-json", encoding="utf-8")
+        before = len(list(Path("/dev/fd").iterdir()))
+
+        for _ in range(20):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                CacheState.load(self.cache_root)
+
+        after = len(list(Path("/dev/fd").iterdir()))
+        self.assertLessEqual(after, before + 1)
 
     def test_concurrent_empty_root_initializers_converge_on_one_marker(self) -> None:
         root = Path(self.temp_dir.name) / "concurrent-marker"
@@ -568,23 +703,25 @@ class StockCacheTest(unittest.TestCase):
     def test_post_publish_fsync_failure_quarantines_lock_and_allows_reacquire(
         self,
     ) -> None:
-        real_fsync_directory = cache_module._fsync_directory
+        real_fsync_directory = cache_module._fsync_directory_descriptor
         failed = False
 
-        def fail_once_after_publish(path: Path) -> None:
+        def fail_once_after_publish(descriptor: int) -> None:
             nonlocal failed
             if (
-                path == self.cache_root
+                cache_module._same_file_identity(
+                    os.fstat(descriptor), self.cache_root.stat()
+                )
                 and (self.cache_root / ".refresh.lock").is_dir()
                 and not failed
             ):
                 failed = True
                 raise OSError("synthetic post-publish fsync failure")
-            real_fsync_directory(path)
+            real_fsync_directory(descriptor)
 
         with patch.object(
             cache_module,
-            "_fsync_directory",
+            "_fsync_directory_descriptor",
             side_effect=fail_once_after_publish,
         ):
             with self.assertRaises((OSError, StockError)):
@@ -598,19 +735,21 @@ class StockCacheTest(unittest.TestCase):
 
     def test_post_publish_attestation_failure_quarantines_owned_lock(self) -> None:
         canonical = self.cache_root / ".refresh.lock"
-        real_read_owner = CacheLock._read_owner
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
         failed = False
 
-        def fail_first_canonical_attestation(path: Path) -> tuple[str, float] | None:
+        def fail_first_canonical_attestation(
+            descriptor: int, expected: os.stat_result
+        ) -> tuple[str, float] | None:
             nonlocal failed
-            if path == canonical and not failed:
+            if canonical.is_dir() and not failed:
                 failed = True
                 return None
-            return real_read_owner(path)
+            return real_read_owner(descriptor, expected)
 
         with patch.object(
             CacheLock,
-            "_read_owner",
+            "_read_owner_from_directory_descriptor",
             side_effect=fail_first_canonical_attestation,
         ):
             with self.assertRaisesRegex(StockError, "cache_locked"):
@@ -626,13 +765,27 @@ class StockCacheTest(unittest.TestCase):
         canonical = self.cache_root / ".refresh.lock"
         abandoned = self.cache_root / ".refresh.lock.abandoned"
         successor_token = "successor-writer"
-        real_identity = CacheLock._directory_fencing_identity
+        real_lstat_child = cache_module._lstat_private_child
         successor_identity: tuple[int, int] | None = None
         displaced = False
 
-        def displace_before_attestation(path: Path) -> tuple[int, int] | None:
+        def displace_before_attestation(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            *,
+            missing_ok: bool = False,
+        ) -> os.stat_result | None:
             nonlocal displaced, successor_identity
-            if path == canonical and canonical.is_dir() and not displaced:
+            observed = real_lstat_child(
+                parent_descriptor, parent, name, missing_ok=missing_ok
+            )
+            if (
+                name == canonical.name
+                and observed is not None
+                and stat.S_ISDIR(observed.st_mode)
+                and not displaced
+            ):
                 displaced = True
                 os.rename(canonical, abandoned)
                 canonical.mkdir(mode=0o700)
@@ -643,35 +796,39 @@ class StockCacheTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 (canonical / f"heartbeat-{successor_token}").write_bytes(b"")
-                successor_identity = real_identity(canonical)
-            return real_identity(path)
+                replacement = canonical.stat(follow_symlinks=False)
+                successor_identity = (replacement.st_dev, replacement.st_ino)
+            return observed
 
         with patch.object(
-            CacheLock,
-            "_directory_fencing_identity",
+            cache_module,
+            "_lstat_private_child",
             side_effect=displace_before_attestation,
         ):
             with self.assertRaisesRegex(StockError, "cache_locked"):
                 CacheLock.acquire(self.cache_root)
 
         self.assertTrue(displaced)
-        self.assertEqual(real_identity(canonical), successor_identity)
+        replacement = canonical.stat(follow_symlinks=False)
+        self.assertEqual((replacement.st_dev, replacement.st_ino), successor_identity)
         owner = json.loads((canonical / "owner.json").read_text(encoding="utf-8"))
         self.assertEqual(owner["token"], successor_token)
 
     def test_post_publish_cleanup_failure_does_not_mask_primary_error(self) -> None:
-        real_fsync_directory = cache_module._fsync_directory
+        real_fsync_directory = cache_module._fsync_directory_descriptor
 
-        def fail_after_publish(path: Path) -> None:
-            if path == self.cache_root and (
+        def fail_after_publish(descriptor: int) -> None:
+            if cache_module._same_file_identity(
+                os.fstat(descriptor), self.cache_root.stat()
+            ) and (
                 self.cache_root / ".refresh.lock"
             ).is_dir():
                 raise OSError("primary post-publish failure")
-            real_fsync_directory(path)
+            real_fsync_directory(descriptor)
 
         with patch.object(
             cache_module,
-            "_fsync_directory",
+            "_fsync_directory_descriptor",
             side_effect=fail_after_publish,
         ):
             with patch.object(
@@ -686,17 +843,23 @@ class StockCacheTest(unittest.TestCase):
         self,
     ) -> None:
         canonical = self.cache_root / ".refresh.lock"
-        real_fsync_directory = cache_module._fsync_directory
+        real_fsync_directory = cache_module._fsync_directory_descriptor
         real_read_owner = CacheLock._read_owner_from_directory_descriptor
         fsync_failed = False
         owner_read_failed = False
 
-        def fail_once_after_publish(path: Path) -> None:
+        def fail_once_after_publish(descriptor: int) -> None:
             nonlocal fsync_failed
-            if path == self.cache_root and canonical.is_dir() and not fsync_failed:
+            if (
+                cache_module._same_file_identity(
+                    os.fstat(descriptor), self.cache_root.stat()
+                )
+                and canonical.is_dir()
+                and not fsync_failed
+            ):
                 fsync_failed = True
                 raise OSError("primary post-publish failure")
-            real_fsync_directory(path)
+            real_fsync_directory(descriptor)
 
         def fail_first_cleanup_owner_read(
             directory_descriptor: int,
@@ -710,7 +873,7 @@ class StockCacheTest(unittest.TestCase):
 
         with patch.object(
             cache_module,
-            "_fsync_directory",
+            "_fsync_directory_descriptor",
             side_effect=fail_once_after_publish,
         ):
             with patch.object(
@@ -734,19 +897,25 @@ class StockCacheTest(unittest.TestCase):
     ) -> None:
         canonical = self.cache_root / ".refresh.lock"
         parked_root = Path(self.temp_dir.name) / "parked-cache-root"
-        real_fsync_directory = cache_module._fsync_directory
+        real_fsync_directory = cache_module._fsync_directory_descriptor
         real_read_owner = CacheLock._read_owner_from_directory_descriptor
         external_marker: Path | None = None
         fsync_failed = False
         owner_reads = 0
         root_swapped = False
 
-        def fail_once_after_publish(path: Path) -> None:
+        def fail_once_after_publish(descriptor: int) -> None:
             nonlocal fsync_failed
-            if path == self.cache_root and canonical.is_dir() and not fsync_failed:
+            if (
+                cache_module._same_file_identity(
+                    os.fstat(descriptor), self.cache_root.stat()
+                )
+                and canonical.is_dir()
+                and not fsync_failed
+            ):
                 fsync_failed = True
                 raise OSError("primary post-publish failure")
-            real_fsync_directory(path)
+            real_fsync_directory(descriptor)
 
         def swap_root_after_quarantine_attestation(
             directory_descriptor: int,
@@ -774,7 +943,7 @@ class StockCacheTest(unittest.TestCase):
 
         with patch.object(
             cache_module,
-            "_fsync_directory",
+            "_fsync_directory_descriptor",
             side_effect=fail_once_after_publish,
         ):
             with patch.object(
@@ -845,6 +1014,7 @@ class StockCacheTest(unittest.TestCase):
                 canonical,
                 lock.token,
                 lock.identity,
+                lock.root_attestation,
             )
 
         self.assertFalse(removed)
@@ -914,6 +1084,7 @@ class StockCacheTest(unittest.TestCase):
                 canonical,
                 lock.token,
                 lock.identity,
+                lock.root_attestation,
             )
 
         self.assertFalse(removed)
@@ -972,6 +1143,7 @@ class StockCacheTest(unittest.TestCase):
                 canonical,
                 lock.token,
                 lock.identity,
+                lock.root_attestation,
             )
 
         self.assertFalse(removed)
@@ -1014,6 +1186,7 @@ class StockCacheTest(unittest.TestCase):
                 canonical,
                 lock.token,
                 lock.identity,
+                lock.root_attestation,
             )
 
         self.assertFalse(removed)
@@ -1080,6 +1253,7 @@ class StockCacheTest(unittest.TestCase):
                     canonical,
                     lock.token,
                     lock.identity,
+                    lock.root_attestation,
                 )
 
         self.assertFalse(removed)
@@ -1141,6 +1315,7 @@ class StockCacheTest(unittest.TestCase):
                 canonical,
                 lock.token,
                 lock.identity,
+                lock.root_attestation,
             )
 
         self.assertFalse(removed)
@@ -1202,19 +1377,22 @@ class StockCacheTest(unittest.TestCase):
         outside.write_bytes(current.read_bytes())
         os.chmod(outside, 0o666)
         outside_mode = stat.S_IMODE(outside.stat().st_mode)
-        real_lstat = Path.lstat
+        real_open_child = cache_module._open_private_child_regular_file
         swapped = False
 
-        def swap_after_lstat(path: Path) -> os.stat_result:
+        def swap_before_open(parent_descriptor: int, name: str) -> int:
             nonlocal swapped
-            observed = real_lstat(path)
-            if path == current and not swapped:
+            if name == "current.json" and not swapped:
                 swapped = True
                 os.rename(current, original)
                 os.symlink(outside, current)
-            return observed
+            return real_open_child(parent_descriptor, name)
 
-        with patch.object(Path, "lstat", swap_after_lstat):
+        with patch.object(
+            cache_module,
+            "_open_private_child_regular_file",
+            side_effect=swap_before_open,
+        ):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 CacheState.load(self.cache_root)
 
@@ -1464,45 +1642,25 @@ class StockCacheTest(unittest.TestCase):
             pointer.directory_name,
             runtime_value,
         )
-        parked_root = Path(self.temp_dir.name) / "parked-pointer-root"
-        real_unlink_owned = cache_module._unlink_private_regular_file_if_owned
-        external_marker: Path | None = None
-        root_swapped = False
+        attestation = cache_module._attest_cache_root(self.cache_root, create=False)
+        try:
+            (self.cache_root / ".papa-shin-stock-cache-root.json").unlink()
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                StockCache(
+                    self.cache_root,
+                    FakeHttpClient(),
+                )._rollback_pointer_if_owned_locked(
+                    current_path,
+                    pointer,
+                    expected_runtime,
+                    previous_pointer=None,
+                    root_attestation=attestation,
+                )
+        finally:
+            attestation.close()
 
-        def swap_root_after_unlink(
-            path: Path,
-            expected: os.stat_result,
-        ) -> bool:
-            nonlocal external_marker, root_swapped
-            removed = real_unlink_owned(path, expected)
-            if removed and not root_swapped:
-                root_swapped = True
-                os.rename(self.cache_root, parked_root)
-                self.cache_root.mkdir(mode=0o755)
-                os.chmod(self.cache_root, 0o755)
-                external_marker = self.cache_root / "must-not-harden.txt"
-                external_marker.write_text("safe", encoding="utf-8")
-            return removed
-
-        with patch.object(
-            cache_module,
-            "_unlink_private_regular_file_if_owned",
-            side_effect=swap_root_after_unlink,
-        ):
-            StockCache(
-                self.cache_root,
-                FakeHttpClient(),
-            )._rollback_pointer_if_owned_locked(
-                current_path,
-                pointer,
-                expected_runtime,
-                previous_pointer=None,
-            )
-
-        self.assertTrue(root_swapped)
-        self.assertIsNotNone(external_marker)
-        self.assertEqual(external_marker.read_text(encoding="utf-8"), "safe")
-        self.assertEqual(stat.S_IMODE(self.cache_root.stat().st_mode), 0o755)
+        self.assertTrue(current_path.exists())
+        self.assertEqual(CurrentPointer.load(current_path), pointer)
 
     @unittest.skipUnless(os.name == "posix", "Directory FD fsync проверяется на POSIX")
     def test_private_unlink_fsyncs_retained_parent_descriptor(self) -> None:
@@ -2081,15 +2239,17 @@ class StockCacheTest(unittest.TestCase):
 
     def test_release_owner_change_fences_old_owner_and_retains_orphan(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
-        real_read_owner = CacheLock._read_owner
+        real_read_owner = CacheLock._read_owner_from_directory_descriptor
         owner_changed = False
 
-        def read_then_replace_owner(path: Path) -> tuple[str, float] | None:
+        def read_then_replace_owner(
+            descriptor: int, expected: os.stat_result
+        ) -> tuple[str, float] | None:
             nonlocal owner_changed
-            owner = real_read_owner(path)
-            if path == lock.path and not owner_changed:
+            owner = real_read_owner(descriptor, expected)
+            if not owner_changed:
                 owner_changed = True
-                (path / "owner.json").write_text(
+                (lock.path / "owner.json").write_text(
                     json.dumps(
                         {"token": "replacement-writer", "created_at": time.time()}
                     ),
@@ -2097,7 +2257,11 @@ class StockCacheTest(unittest.TestCase):
                 )
             return owner
 
-        with patch.object(CacheLock, "_read_owner", side_effect=read_then_replace_owner):
+        with patch.object(
+            CacheLock,
+            "_read_owner_from_directory_descriptor",
+            side_effect=read_then_replace_owner,
+        ):
             lock.release()
 
         self.assertFalse(lock.path.exists())
@@ -2439,7 +2603,10 @@ class StockCacheTest(unittest.TestCase):
         real_commit_acquire = cache_module.RuntimeCommitLock.acquire
         paused = False
 
-        def pause_delayed_activation(root: Path) -> object:
+        def pause_delayed_activation(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             nonlocal paused
             if (
                 threading.current_thread().name == "delayed-activation"
@@ -2449,7 +2616,7 @@ class StockCacheTest(unittest.TestCase):
                 delayed_before_commit.set()
                 if not allow_delayed.wait(timeout=5):
                     raise AssertionError("delayed activation timeout")
-            return real_commit_acquire(root)
+            return real_commit_acquire(root, root_attestation)
 
         def run_delayed() -> None:
             try:
@@ -2506,23 +2673,28 @@ class StockCacheTest(unittest.TestCase):
         first_errors: list[BaseException] = []
         second_errors: list[BaseException] = []
         second_results: list[object] = []
-        real_write_json = cache_module._write_json_atomic
+        real_write_json = cache_module._write_json_atomic_at
         real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
-        def pause_first_pointer(path: Path, value: object) -> None:
+        def pause_first_pointer(
+            parent_descriptor: int, name: str, value: object
+        ) -> None:
             if (
-                path == self.cache_root / "current.json"
+                name == "current.json"
                 and threading.current_thread().name == "first-activation"
             ):
                 first_at_pointer.set()
                 if not allow_first_pointer.wait(timeout=5):
                     raise AssertionError("first pointer timeout")
-            real_write_json(path, value)
+            real_write_json(parent_descriptor, name, value)
 
-        def observe_second_wait(root: Path) -> object:
+        def observe_second_wait(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             if threading.current_thread().name == "second-activation":
                 second_waiting.set()
-            return real_publish_acquire(root)
+            return real_publish_acquire(root, root_attestation)
 
         def run_first() -> None:
             try:
@@ -2549,7 +2721,7 @@ class StockCacheTest(unittest.TestCase):
                 second_done.set()
 
         with patch.object(
-            cache_module, "_write_json_atomic", side_effect=pause_first_pointer
+            cache_module, "_write_json_atomic_at", side_effect=pause_first_pointer
         ):
             with patch.object(
                 cache_module._RefreshLockPublishLock,
@@ -2592,7 +2764,7 @@ class StockCacheTest(unittest.TestCase):
         second_errors: list[BaseException] = []
         second_results: list[object] = []
         real_load = CacheState.load
-        real_write_bytes = cache_module._write_bytes_atomic
+        real_write_bytes = cache_module._write_bytes_atomic_at
         real_publish_acquire = cache_module._RefreshLockPublishLock.acquire
 
         def fail_delayed_validation(
@@ -2608,21 +2780,26 @@ class StockCacheTest(unittest.TestCase):
                 )
             return real_load(cache_dir, progress if callable(progress) else None)
 
-        def pause_rollback(path: Path, payload: bytes) -> None:
+        def pause_rollback(
+            parent_descriptor: int, name: str, payload: bytes
+        ) -> None:
             if (
-                path == self.cache_root / "current.json"
+                name == "current.json"
                 and payload == previous_pointer
                 and threading.current_thread().name == "rollback-activation"
             ):
                 rollback_paused.set()
                 if not allow_rollback.wait(timeout=5):
                     raise AssertionError("rollback timeout")
-            real_write_bytes(path, payload)
+            real_write_bytes(parent_descriptor, name, payload)
 
-        def observe_second_wait(root: Path) -> object:
+        def observe_second_wait(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             if threading.current_thread().name == "rollback-successor":
                 second_waiting.set()
-            return real_publish_acquire(root)
+            return real_publish_acquire(root, root_attestation)
 
         def run_delayed() -> None:
             try:
@@ -2650,7 +2827,7 @@ class StockCacheTest(unittest.TestCase):
 
         with patch.object(CacheState, "load", side_effect=fail_delayed_validation):
             with patch.object(
-                cache_module, "_write_bytes_atomic", side_effect=pause_rollback
+                    cache_module, "_write_bytes_atomic_at", side_effect=pause_rollback
             ):
                 with patch.object(
                     cache_module._RefreshLockPublishLock,
@@ -2792,11 +2969,14 @@ class StockCacheTest(unittest.TestCase):
                 )
             return real_load(cache_dir, progress if callable(progress) else None)
 
-        def fail_rollback_and_cleanup_lock(root: Path) -> object:
+        def fail_rollback_and_cleanup_lock(
+            root: Path,
+            root_attestation: cache_module.CacheRootAttestation | None = None,
+        ) -> object:
             nonlocal publish_commit_completed
             if not publish_commit_completed:
                 publish_commit_completed = True
-                return real_commit_acquire(root)
+                return real_commit_acquire(root, root_attestation)
             raise StockError(
                 "cache_unavailable", "Синтетическая ошибка commit lock", 7
             )
@@ -2827,10 +3007,12 @@ class StockCacheTest(unittest.TestCase):
         self.fixture.seed_generation()
         real_replace = os.replace
 
-        def interrupt_current_replace(source: Path, destination: Path) -> None:
-            if Path(destination) == self.cache_root / "current.json":
+        def interrupt_current_replace(
+            source: object, destination: object, **kwargs: object
+        ) -> None:
+            if str(destination) == "current.json" or Path(destination) == self.cache_root / "current.json":
                 raise OSError("synthetic pointer interruption")
-            real_replace(source, destination)
+            real_replace(source, destination, **kwargs)
 
         with patch("papa_shin_stock.cache.os.replace", interrupt_current_replace):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
