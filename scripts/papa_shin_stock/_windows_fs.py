@@ -469,7 +469,10 @@ class WindowsFilesystem:
                         child_path, directory=False, destructive=True
                     ) as child:
                         pinned[child_name] = child.identity
-                if self.api.list_directory(victim.path) != names:
+                confirmed_names = self.api.list_directory(victim.path)
+                if len(confirmed_names) != len(names) or set(confirmed_names) != set(
+                    names
+                ):
                     raise WindowsFilesystemError("directory inventory changed")
                 for child_name, identity in pinned.items():
                     child_path = self._child(victim.path, child_name)

@@ -318,6 +318,36 @@ class WindowsFilesystemTest(unittest.TestCase):
             any("refresh.lock.release" in name for name in self.api.list_directory(self.root))
         )
 
+    def test_inventory_order_change_is_not_treated_as_namespace_race(self) -> None:
+        generations = self.root + r"\generations"
+        victim = generations + r"\generation-old"
+        self.api.add_directory(generations, (10, 1))
+        self.api.add_directory(victim, (10, 2))
+        self.api.add_file(victim + r"\a.json", (10, 3))
+        self.api.add_file(victim + r"\b.json", (10, 4))
+        original_list = self.api.list_directory
+        calls = 0
+
+        def alternate_order(path: str) -> list[str]:
+            nonlocal calls
+            values = original_list(path)
+            if PureWindowsPath(path).name == "generation-old":
+                calls += 1
+                if calls == 2:
+                    return list(reversed(values))
+            return values
+
+        self.api.list_directory = alternate_order  # type: ignore[method-assign]
+
+        self.assertTrue(
+            self.fs.delete_flat_directory(
+                generations,
+                "generation-old",
+                WindowsIdentity(10, 2),
+                quarantine_name=".generation-old.delete-fixed",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
