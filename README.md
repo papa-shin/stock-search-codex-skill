@@ -92,29 +92,71 @@ Set-Location -LiteralPath $PapaShinSkillDir
 - macOS/Linux: `~/.codex/secrets/papa-shin-stock.env`;
 - Windows: `%USERPROFILE%\.codex\secrets\papa-shin-stock.env`.
 
-В macOS/Linux подготовьте закрытый каталог, после чего попросите администратора поместить туда готовый файл:
+В macOS/Linux подготовьте закрытый каталог без extended ACL, после чего попросите администратора поместить туда готовый файл. На Linux нужен `setfacl`; если команда недоступна, остановитесь и попросите администратора проверить и очистить ACL:
 
 ```bash
 PAPA_SHIN_SECRETS_DIR="$HOME/.codex/secrets"
 mkdir -p -- "$PAPA_SHIN_SECRETS_DIR"
-chmod 700 -- "$PAPA_SHIN_SECRETS_DIR"
-test ! -f "$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env" || \
-  chmod 600 -- "$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env"
+case "$(uname -s)" in
+  Darwin) chmod -N "$PAPA_SHIN_SECRETS_DIR" ;;
+  Linux)
+    command -v setfacl >/dev/null 2>&1 || {
+      echo 'Для проверки ACL требуется setfacl' >&2
+      exit 1
+    }
+    setfacl -b -- "$PAPA_SHIN_SECRETS_DIR"
+    ;;
+  *) echo 'Неподдерживаемая ОС' >&2; exit 1 ;;
+esac
+chmod 700 "$PAPA_SHIN_SECRETS_DIR"
+PAPA_SHIN_CONFIG="$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env"
+if test -f "$PAPA_SHIN_CONFIG"; then
+  case "$(uname -s)" in
+    Darwin) chmod -N "$PAPA_SHIN_CONFIG" ;;
+    Linux) setfacl -b -- "$PAPA_SHIN_CONFIG" ;;
+  esac
+  chmod 600 "$PAPA_SHIN_CONFIG"
+fi
 ```
 
-Последняя команда безопасно пропускается до появления файла. После установки файла повторите её, чтобы ограничить доступ. В Windows PowerShell подготовьте каталог с ACL только для текущего пользователя:
+Очистка ACL файла безопасно пропускается до его появления. После установки файла повторите блок, чтобы удалить добавленные ACL и ограничить доступ. В Windows PowerShell создайте точный защищённый DACL по SID текущего пользователя; существующие explicit и inherited ACE при этом не сохраняются:
 
 ```powershell
 $PapaShinSecretsDir = Join-Path $env:USERPROFILE ".codex\secrets"
 New-Item -ItemType Directory -Force -Path $PapaShinSecretsDir | Out-Null
-icacls $PapaShinSecretsDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
+$PapaShinSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$PapaShinDirAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+$PapaShinDirAcl.SetAccessRuleProtection($true, $false)
+$PapaShinDirRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+  $PapaShinSid,
+  [System.Security.AccessControl.FileSystemRights]::FullControl,
+  [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit",
+  [System.Security.AccessControl.PropagationFlags]::None,
+  [System.Security.AccessControl.AccessControlType]::Allow
+)
+$PapaShinDirAcl.AddAccessRule($PapaShinDirRule)
+Set-Acl -LiteralPath $PapaShinSecretsDir -AclObject $PapaShinDirAcl
 $PapaShinConfig = Join-Path $PapaShinSecretsDir "papa-shin-stock.env"
 ```
 
-После установки файла администратором повторно примените ACL к `$PapaShinConfig`:
+После установки файла администратором задайте точный DACL файла и убедитесь, что в каталоге и файле остался только SID текущего пользователя:
 
 ```powershell
-icacls $PapaShinConfig /inheritance:r /grant:r "${env:USERNAME}:F"
+$PapaShinFileAcl = [System.Security.AccessControl.FileSecurity]::new()
+$PapaShinFileAcl.SetAccessRuleProtection($true, $false)
+$PapaShinFileRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+  $PapaShinSid,
+  [System.Security.AccessControl.FileSystemRights]::FullControl,
+  [System.Security.AccessControl.AccessControlType]::Allow
+)
+$PapaShinFileAcl.AddAccessRule($PapaShinFileRule)
+Set-Acl -LiteralPath $PapaShinConfig -AclObject $PapaShinFileAcl
+$PapaShinUnexpectedAcl = @($PapaShinSecretsDir, $PapaShinConfig) | ForEach-Object {
+  (Get-Acl -LiteralPath $_).Access
+} | Where-Object {
+  $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $PapaShinSid.Value
+}
+if ($PapaShinUnexpectedAcl) { throw "Обнаружены посторонние ACL" }
 ```
 
 Default config path не зависит от `CODEX_HOME`. Если администратор выбрал другой абсолютный путь, передавайте только путь через `PAPA_SHIN_STOCK_CONFIG` в окружении процесса Codex, не содержимое файла:
