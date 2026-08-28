@@ -24,12 +24,19 @@ Skill работает только с подготовленным read-only sn
 
 ## Установка в macOS и Linux
 
-Выберите установленный Python 3.11+ и сохраните launcher в отдельной переменной. Во всех последующих командах используйте только её:
+Выберите установленный Python 3.11+ и сохраните launcher в отдельной переменной. Команда ниже выбирает первую доступную поддерживаемую версию; во всех последующих командах используйте только найденный launcher:
 
 ```bash
-PAPA_SHIN_PYTHON='python3.11'
+PAPA_SHIN_PYTHON=''
+for candidate in python3.13 python3.12 python3.11 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 && \
+    "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    PAPA_SHIN_PYTHON="$candidate"
+    break
+  fi
+done
+test -n "$PAPA_SHIN_PYTHON" || { echo 'Требуется Python 3.11+' >&2; exit 1; }
 "$PAPA_SHIN_PYTHON" --version
-"$PAPA_SHIN_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Требуется Python 3.11+")'
 ```
 
 Клонируйте публичный репозиторий непосредственно в каталог skills. Команда безопасно завершится ошибкой, если целевой каталог уже существует:
@@ -51,11 +58,12 @@ cd -- "$PAPA_SHIN_SKILL_DIR"
 
 > Нативный refresh реализован через изолированный Win32 handle backend. Он проверяется теми же end-to-end тестами в Windows Server 2022 с Python 3.11/3.12 и отдельными mock race/fault-тестами на всех ОС. До зелёного Windows CI для конкретного commit нативный результат остаётся неподтверждённым для этого commit; macOS/Linux tests не заменяют такую проверку.
 
-В PowerShell выберите launcher. Для Python Launcher используйте `py -3.11`; если Python 3.11+ доступен командой `python`, задайте `$PapaShinPython = "python"` и `$PapaShinPythonArgs = @()`:
+В PowerShell сначала посмотрите установленные версии через Python Launcher, затем выберите имеющуюся версию 3.11 или новее. В примере установлена 3.12; замените `-3.12` на значение из вывода `py -0p`. Если Python 3.11+ доступен командой `python`, задайте `$PapaShinPython = "python"` и `$PapaShinPythonArgs = @()`:
 
 ```powershell
+py -0p
 $PapaShinPython = "py"
-$PapaShinPythonArgs = @("-3.11")
+$PapaShinPythonArgs = @("-3.12")
 & $PapaShinPython @PapaShinPythonArgs --version
 & $PapaShinPython @PapaShinPythonArgs -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Требуется Python 3.11+")'
 ```
@@ -87,7 +95,7 @@ Set-Location -LiteralPath $PapaShinSkillDir
 В macOS/Linux подготовьте закрытый каталог, после чего попросите администратора поместить туда готовый файл:
 
 ```bash
-PAPA_SHIN_SECRETS_DIR="${CODEX_HOME:-$HOME/.codex}/secrets"
+PAPA_SHIN_SECRETS_DIR="$HOME/.codex/secrets"
 mkdir -p -- "$PAPA_SHIN_SECRETS_DIR"
 chmod 700 -- "$PAPA_SHIN_SECRETS_DIR"
 test ! -f "$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env" || \
@@ -97,7 +105,7 @@ test ! -f "$PAPA_SHIN_SECRETS_DIR/papa-shin-stock.env" || \
 Последняя команда безопасно пропускается до появления файла. После установки файла повторите её, чтобы ограничить доступ. В Windows PowerShell подготовьте каталог с ACL только для текущего пользователя:
 
 ```powershell
-$PapaShinSecretsDir = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "secrets"
+$PapaShinSecretsDir = Join-Path $env:USERPROFILE ".codex\secrets"
 New-Item -ItemType Directory -Force -Path $PapaShinSecretsDir | Out-Null
 icacls $PapaShinSecretsDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
 $PapaShinConfig = Join-Path $PapaShinSecretsDir "papa-shin-stock.env"
@@ -109,7 +117,7 @@ $PapaShinConfig = Join-Path $PapaShinSecretsDir "papa-shin-stock.env"
 icacls $PapaShinConfig /inheritance:r /grant:r "${env:USERNAME}:F"
 ```
 
-Если администратор выбрал другой абсолютный путь, передавайте только путь через переменную процесса, не содержимое файла:
+Default config path не зависит от `CODEX_HOME`. Если администратор выбрал другой абсолютный путь, передавайте только путь через `PAPA_SHIN_STOCK_CONFIG` в окружении процесса Codex, не содержимое файла:
 
 ```bash
 export PAPA_SHIN_STOCK_CONFIG='/absolute/path/to/papa-shin-stock.env'
@@ -123,10 +131,16 @@ $env:PAPA_SHIN_STOCK_CONFIG = "C:\private\papa-shin-stock.env"
 
 ## Проверка
 
-Сначала убедитесь, что пакет установлен без лишнего уровня вложенности:
+Сначала убедитесь, что пакет установлен без лишнего уровня вложенности. В macOS/Linux используйте вычисленный при установке каталог:
 
-```text
-~/.codex/skills/papa-shin-stock-search/SKILL.md
+```bash
+test -f "$PAPA_SHIN_SKILL_DIR/SKILL.md"
+```
+
+В Windows PowerShell:
+
+```powershell
+Test-Path -LiteralPath (Join-Path $PapaShinSkillDir "SKILL.md")
 ```
 
 В macOS/Linux из корня пакета используйте ранее проверенный launcher:
@@ -197,6 +211,20 @@ Windows PowerShell:
 
 Обе команды возвращают один JSON-объект. Поиск запускайте после refresh; при `stale_cache` данные доступны, но ответ обязан явно сообщать об устаревании.
 
+### Параметры CLI
+
+| Параметр | Допустимое значение |
+|---|---|
+| `--product-type`, `--season`, `--spikes`, `--run-flat`, `--disk-type`, `--truck-axis`, `--truck-construction`, `--supplier` | Текстовое значение, совпадающее со значением в машинных данных. |
+| `--size` | Типоразмер с ASCII-цифрами, например `205/55R16`, `205/55 16` или `205 55 R16`; результат нормализуется в `205/55R16`. |
+| `--min-total-quantity` | Целое число от 0; по умолчанию `4`. |
+| `--max-price` | Конечное десятичное число от 0. |
+| `--max-delivery-days` | Целое число дней от 0. |
+| `--limit` | Целое число от 1 до 100; по умолчанию `10`. |
+| `--offers-limit` | Целое число от 1 до 25; по умолчанию `5`. |
+
+Каждый параметр и его значение передавайте отдельными аргументами. При `query_invalid` сначала сверяйтесь с этой таблицей и `scripts/search_stock.py --help`.
+
 ## Примеры запросов менеджера
 
 - «Найди летние шины 205/55R16, минимум четыре штуки, до 8 000 за единицу».
@@ -209,7 +237,7 @@ Windows PowerShell:
 
 | Симптом или код | Безопасное действие |
 |---|---|
-| Skill не обнаружен | Проверьте путь `~/.codex/skills/papa-shin-stock-search/SKILL.md`, отсутствие лишнего вложенного каталога и перезапустите Codex либо откройте новую задачу. |
+| Skill не обнаружен | Повторите `test -f "$PAPA_SHIN_SKILL_DIR/SKILL.md"` либо Windows-команду `Test-Path` из раздела «Проверка», исключите лишний вложенный каталог и перезапустите Codex либо откройте новую задачу. |
 | Python младше 3.11 | Выберите установленный Python 3.11+ и повторите все команды тем же launcher. |
 | `config_missing` | Попросите администратора установить готовый env-файл в default path либо проверить `PAPA_SHIN_STOCK_CONFIG`. Не отправляйте содержимое файла в чат или issue. |
 | `config_invalid` | Попросите администратора проверить формат, абсолютные пути и права файла. Не печатайте и не пересоздавайте секреты самостоятельно. |
@@ -217,7 +245,7 @@ Windows PowerShell:
 | `network_error` | Проверьте доступность сети и повторите позже; Skill не раскрывает приватный endpoint. |
 | `cache_locked` | Дождитесь завершения другого refresh. Не удаляйте lock-файлы вручную во время работающих процессов. |
 | `cache_unavailable` | Проверьте свободное место и корректность отдельного cache leaf; не удаляйте кэш массово по шаблону. |
-| `query_invalid` | Сверьте фильтры с `scripts/search_stock.py --help`, уменьшите лимиты и передавайте каждое значение отдельным аргументом. |
+| `query_invalid` | Сверьте фильтры с таблицей «Параметры CLI» и `scripts/search_stock.py --help`, уменьшите лимиты и передавайте каждое значение отдельным аргументом. |
 | `stale_cache` | Поиск разрешён по предыдущему проверенному поколению, но в ответе нужно указать `generated_at`, `checked_at` и предупреждение. |
 
 ## Границы безопасности
