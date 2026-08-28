@@ -20,7 +20,11 @@ from papa_shin_stock.cache import StockCache
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import HttpResponse
-from papa_shin_stock._windows_fs import MarkerEvidence, WindowsIdentity
+from papa_shin_stock._windows_fs import (
+    MarkerEvidence,
+    WindowsFilesystemError,
+    WindowsIdentity,
+)
 
 
 class LocalWindowsRoot:
@@ -284,7 +288,10 @@ class LocalWindowsRoot:
             path = parent / name
             if self._identity(path, directory=False) != expected:
                 raise OSError("identity changed")
-            os.utime(path, None, follow_symlinks=False)
+            if os.name == "nt":
+                os.utime(path, None)
+            else:
+                os.utime(path, None, follow_symlinks=False)
             self._fsync_directory(parent)
 
     def verify_file(
@@ -608,6 +615,32 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
             **kwargs,
         )
 
+    def test_local_windows_touch_omits_unsupported_symlink_argument(self) -> None:
+        session = self.windows.open_cache_root(
+            str(self.root),
+            ".papa-shin-stock-cache-root.json",
+            payload=cache_module._cache_root_marker_payload("a" * 32),
+            maximum=512,
+            create=True,
+        )
+        self.addCleanup(session.close)
+        identity = session.write_new_file((), "heartbeat", b"")
+        keyword_calls: list[dict[str, object]] = []
+
+        def windows_utime(
+            _path: object,
+            _times: object,
+            **kwargs: object,
+        ) -> None:
+            keyword_calls.append(kwargs)
+
+        with patch.object(os, "name", "nt"), patch.object(
+            os, "utime", side_effect=windows_utime
+        ):
+            session.touch_file((), "heartbeat", identity)
+
+        self.assertEqual(keyword_calls, [{}])
+
     def test_local_backend_skips_unsupported_windows_directory_fsync(self) -> None:
         with patch.object(os, "name", "nt"), patch.object(
             os,
@@ -892,6 +925,102 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
         self.assertEqual(result.status, "stale_cache")
         self.assertEqual(result.generation_id, first.generation_id)
         self.assertEqual(self._pointer_payload(), previous_pointer)
+
+    def test_windows_filesystem_verify_error_uses_integrity_warning(self) -> None:
+        original_verify = LocalWindowsRoot.verify_file
+        failed = False
+
+        def fail_products_verification(
+            session: LocalWindowsRoot,
+            parent_parts: tuple[str, ...],
+            name: str,
+            *,
+            expected_bytes: int,
+            expected_sha256: str,
+            progress: object | None = None,
+        ) -> None:
+            nonlocal failed
+            if (
+                len(parent_parts) == 2
+                and parent_parts[1].startswith(".staging-")
+                and name == "products.jsonl"
+                and not failed
+            ):
+                failed = True
+                raise WindowsFilesystemError("synthetic Windows checksum failure")
+            original_verify(
+                session,
+                parent_parts,
+                name,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_sha256,
+                progress=progress,  # type: ignore[arg-type]
+            )
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            previous_pointer = self._pointer_payload()
+            with patch.object(
+                LocalWindowsRoot,
+                "verify_file",
+                fail_products_verification,
+            ):
+                result = StockCache(
+                    self.root,
+                    self._generation_c_client(),
+                ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "download_integrity_failed")
+        self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+
+    def test_windows_verification_preserves_cache_locked_error(self) -> None:
+        original_verify = LocalWindowsRoot.verify_file
+
+        def lose_lock_during_verification(
+            session: LocalWindowsRoot,
+            parent_parts: tuple[str, ...],
+            name: str,
+            *,
+            expected_bytes: int,
+            expected_sha256: str,
+            progress: object | None = None,
+        ) -> None:
+            if len(parent_parts) == 2 and parent_parts[1].startswith(".staging-"):
+                raise StockError("cache_locked", "synthetic lost ownership", 6)
+            original_verify(
+                session,
+                parent_parts,
+                name,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_sha256,
+                progress=progress,  # type: ignore[arg-type]
+            )
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            first = StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            with patch.object(
+                LocalWindowsRoot,
+                "verify_file",
+                lose_lock_during_verification,
+            ):
+                result = StockCache(
+                    self.root,
+                    self._generation_c_client(),
+                ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(result.generation_id, first.generation_id)
 
     def test_post_rename_generation_cleanup_failure_blocks_redownload(self) -> None:
         third_client = FakeHttpClient(

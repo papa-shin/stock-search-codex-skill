@@ -2925,20 +2925,35 @@ class StockCache:
     ) -> None:
         lock.assert_owned()
         parts = ("generations", staged.files.manifest.parent.name)
-        lock.session.verify_file(
-            parts,
-            "products.jsonl",
-            expected_bytes=manifest.products.bytes,
-            expected_sha256=manifest.products.sha256,
-            progress=lock.heartbeat,
-        )
-        lock.session.verify_file(
-            parts,
-            "offers.jsonl",
-            expected_bytes=manifest.offers.bytes,
-            expected_sha256=manifest.offers.sha256,
-            progress=lock.heartbeat,
-        )
+        try:
+            lock.session.verify_file(
+                parts,
+                "products.jsonl",
+                expected_bytes=manifest.products.bytes,
+                expected_sha256=manifest.products.sha256,
+                progress=lock.heartbeat,
+            )
+            lock.session.verify_file(
+                parts,
+                "offers.jsonl",
+                expected_bytes=manifest.offers.bytes,
+                expected_sha256=manifest.offers.sha256,
+                progress=lock.heartbeat,
+            )
+        except StockError as error:
+            if error.code == "cache_locked":
+                raise
+            raise StockError(
+                "download_integrity_failed",
+                "Проверка загруженного файла не пройдена",
+                5,
+            ) from error
+        except OSError as error:
+            raise StockError(
+                "download_integrity_failed",
+                "Проверка загруженного файла не пройдена",
+                5,
+            ) from error
 
     def _activate_windows(
         self,
