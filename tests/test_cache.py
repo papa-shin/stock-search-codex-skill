@@ -425,7 +425,7 @@ class StockCacheTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "posix", "Lock fsync semantics проверяются на POSIX")
-    def test_post_publish_fsync_failure_removes_owned_lock_and_allows_reacquire(
+    def test_post_publish_fsync_failure_quarantines_lock_and_allows_reacquire(
         self,
     ) -> None:
         real_fsync_directory = cache_module._fsync_directory
@@ -456,7 +456,7 @@ class StockCacheTest(unittest.TestCase):
         self.addCleanup(replacement.release)
         replacement.assert_owned()
 
-    def test_post_publish_attestation_failure_removes_owned_lock(self) -> None:
+    def test_post_publish_attestation_failure_quarantines_owned_lock(self) -> None:
         canonical = self.cache_root / ".refresh.lock"
         real_read_owner = CacheLock._read_owner
         failed = False
@@ -954,6 +954,75 @@ class StockCacheTest(unittest.TestCase):
             ],
             lock.token,
         )
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_abort_attestation_never_deletes_quarantine_at_late_rmdir_swap(
+        self,
+    ) -> None:
+        lock = CacheLock.acquire(self.cache_root)
+        canonical = self.cache_root / ".refresh.lock"
+        owner_bytes = (canonical / "owner.json").read_bytes()
+        heartbeat_name = f"heartbeat-{lock.token}"
+        heartbeat_bytes = (canonical / heartbeat_name).read_bytes()
+        foreign = self.cache_root / ".foreign-abort-directory"
+        foreign.mkdir(mode=0o700)
+        foreign_marker = foreign / "must-survive.txt"
+        foreign_marker.write_text("safe", encoding="utf-8")
+        real_rename = cache_module.os.rename
+        real_rmdir = cache_module.os.rmdir
+        quarantine: Path | None = None
+        retained: Path | None = None
+        rmdir_attempted = False
+
+        def swap_at_would_be_rmdir(
+            name: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal foreign, foreign_marker, quarantine, retained
+            nonlocal rmdir_attempted
+            candidate_name = os.fspath(name)
+            if candidate_name.startswith(".refresh.lock.abort-"):
+                rmdir_attempted = True
+                quarantine = self.cache_root / candidate_name
+                retained = quarantine.with_name(f"{quarantine.name}.retained")
+                real_rename(quarantine, retained)
+                real_rename(foreign, quarantine)
+                foreign = quarantine
+                foreign_marker = foreign / "must-survive.txt"
+            real_rmdir(name, *args, **kwargs)
+
+        with patch.object(
+            cache_module.os,
+            "rmdir",
+            side_effect=swap_at_would_be_rmdir,
+        ):
+            removed = CacheLock._discard_published_lock_if_owned_locked(
+                canonical,
+                lock.token,
+                lock.identity,
+            )
+
+        self.assertFalse(removed)
+        self.assertFalse(rmdir_attempted)
+        self.assertFalse(canonical.exists())
+        if quarantine is None:
+            quarantine = next(self.cache_root.glob(".refresh.lock.abort-*"))
+        if retained is None:
+            retained = quarantine
+        self.assertTrue((retained / "owner.json").is_file())
+        self.assertEqual((retained / "owner.json").read_bytes(), owner_bytes)
+        self.assertTrue((retained / heartbeat_name).is_file())
+        self.assertEqual((retained / heartbeat_name).read_bytes(), heartbeat_bytes)
+        self.assertTrue(foreign_marker.is_file())
+        self.assertEqual(foreign_marker.read_text(encoding="utf-8"), "safe")
+        successor = CacheLock.acquire(self.cache_root)
+        self.addCleanup(successor.release)
+        successor.assert_owned()
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            lock.assert_owned()
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            lock.heartbeat()
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_load_hardens_existing_private_cache_artifacts(self) -> None:

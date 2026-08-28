@@ -740,11 +740,6 @@ class CacheLock:
                 path.name,
                 canonical,
             )
-            inventory = _snapshot_private_flat_directory_descriptor(
-                lock_descriptor
-            )
-            if inventory is None:
-                return False
             observed = cls._read_owner_from_directory_descriptor(
                 lock_descriptor,
                 canonical,
@@ -781,21 +776,7 @@ class CacheLock:
             )
             if moved_owner is None or moved_owner[0] != token:
                 return False
-            removed = _remove_retained_private_child_directory(
-                root_descriptor,
-                root,
-                quarantine.name,
-                moved_identity,
-                lock_descriptor,
-                inventory,
-            )
-            remaining = _lstat_private_child(
-                root_descriptor,
-                root,
-                quarantine.name,
-                missing_ok=True,
-            )
-            return removed and remaining is None
+            return False
         except (OSError, StockError):
             return False
         finally:
@@ -2500,65 +2481,6 @@ def _remove_private_child_directory(
     except OSError:
         return False
     return True
-
-
-def _remove_retained_private_child_directory(
-    parent_descriptor: int,
-    parent: Path,
-    name: str,
-    expected: os.stat_result,
-    directory_descriptor: int,
-    inventory: dict[str, os.stat_result],
-) -> bool:
-    try:
-        observed = _lstat_private_child(
-            parent_descriptor,
-            parent,
-            name,
-            missing_ok=True,
-        )
-        opened = os.fstat(directory_descriptor)
-        if (
-            observed is None
-            or not stat.S_ISDIR(observed.st_mode)
-            or not stat.S_ISDIR(opened.st_mode)
-            or not _same_file_identity(expected, observed)
-            or not _same_file_identity(expected, opened)
-        ):
-            return False
-        if not _empty_private_directory_descriptor(
-            directory_descriptor,
-            parent / name,
-            inventory,
-        ):
-            return False
-        confirmed = _lstat_private_child(
-            parent_descriptor,
-            parent,
-            name,
-            missing_ok=True,
-        )
-        confirmed_opened = os.fstat(directory_descriptor)
-        if (
-            confirmed is None
-            or not stat.S_ISDIR(confirmed.st_mode)
-            or not stat.S_ISDIR(confirmed_opened.st_mode)
-            or not _same_file_identity(expected, confirmed)
-            or not _same_file_identity(expected, confirmed_opened)
-        ):
-            return False
-        os.rmdir(name, dir_fd=parent_descriptor)
-        return (
-            _lstat_private_child(
-                parent_descriptor,
-                parent,
-                name,
-                missing_ok=True,
-            )
-            is None
-        )
-    except (OSError, StockError):
-        return False
 
 
 def _open_private_child_directory_for_deletion(
