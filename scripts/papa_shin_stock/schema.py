@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import json
 import math
+import re
 import shutil
 import sqlite3
 import tempfile
+import threading
+import warnings
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -21,6 +25,20 @@ _UNKNOWN = {"unknown", "missing"}
 _PUBLIC_CHARS = {"load_index", "speed_index"}
 _MAX_TEXT = 256
 _MAX_OUTPUT = 512 * 1024
+
+# Public machine-data resource contract. A JSONL record limit excludes CR/LF.
+MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+MAX_PRODUCT_ROWS = 5_000_000
+MAX_OFFER_ROWS = 50_000_000
+MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
+MAX_SPOOL_RECORDS = MAX_PRODUCT_ROWS + MAX_OFFER_ROWS
+
+_SQLITE_PAGE_BYTES = 4096
+_SQLITE_CACHE_KIB = 64 * 1024
+_SPOOL_CLEANUP_ATTEMPTS = 3
+_CANONICAL_NONNEGATIVE_INTEGER = re.compile(r"^(?:0|\+?[1-9][0-9]*)$")
+_PENDING_SPOOL_CLEANUPS: dict[Path, object] = {}
+_PENDING_SPOOL_CLEANUPS_LOCK = threading.Lock()
 
 
 def assert_generation(row: dict[str, object], expected: str) -> None:
@@ -68,54 +86,240 @@ class SearchResult:
                 break
         return result
 
+class _SpoolCleanupFailure(Exception):
+    """A safe marker that one or more cleanup stages failed."""
+
+
+def _remove_spool_directory(path: Path) -> bool:
+    for _ in range(_SPOOL_CLEANUP_ATTEMPTS):
+        try:
+            if not path.exists():
+                return True
+            shutil.rmtree(path)
+        except (OSError, ValueError):
+            continue
+        try:
+            if not path.exists():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _register_spool_cleanup(path: Path, temporary: object) -> None:
+    with _PENDING_SPOOL_CLEANUPS_LOCK:
+        _PENDING_SPOOL_CLEANUPS[path] = temporary
+
+
+def _retry_pending_spool_cleanups() -> None:
+    with _PENDING_SPOOL_CLEANUPS_LOCK:
+        pending = tuple(_PENDING_SPOOL_CLEANUPS.items())
+    for path, temporary in pending:
+        if _remove_spool_directory(path):
+            try:
+                temporary.cleanup()
+            except (OSError, ValueError, AttributeError):
+                pass
+            with _PENDING_SPOOL_CLEANUPS_LOCK:
+                _PENDING_SPOOL_CLEANUPS.pop(path, None)
+        else:
+            warnings.warn(
+                "Не удалось удалить временное хранилище поиска",
+                ResourceWarning,
+                stacklevel=1,
+            )
+
+
+atexit.register(_retry_pending_spool_cleanups)
+
+
 class _Spool:
     def __init__(self) -> None:
         self.temp: tempfile.TemporaryDirectory[str] | None = None
         self.db: sqlite3.Connection | None = None
+        self.records = 0
         try:
             self.temp = tempfile.TemporaryDirectory(prefix="papa-shin-search-")
             self.db = sqlite3.connect(str(Path(self.temp.name) / "query.sqlite3"))
+            self._configure_limits()
             self.db.create_collation("decimal", _decimal_compare)
-            self.db.executescript("CREATE TABLE c(id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT); CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER)")
-        except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
+            self.db.executescript(
+                "CREATE TABLE c("
+                "id TEXT PRIMARY KEY,n TEXT,a TEXT,t TEXT,ch TEXT,q INTEGER,u TEXT"
+                ");"
+                "CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER);"
+            )
+        except (
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
             self._cleanup()
             raise _spool_unavailable() from error
-    def __enter__(self) -> "_Spool": return self
+
+    def __enter__(self) -> "_Spool":
+        return self
+
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
         cleanup_error = self._cleanup()
         if exc is None and cleanup_error is not None:
             raise _spool_unavailable() from cleanup_error
         return False
+
+    def _configure_limits(self) -> None:
+        connection = self._connection()
+        if MAX_SPOOL_BYTES < _SQLITE_PAGE_BYTES:
+            raise ValueError("invalid spool byte budget")
+        connection.execute(f"PRAGMA page_size={_SQLITE_PAGE_BYTES}")
+        page_row = connection.execute("PRAGMA page_size").fetchone()
+        if page_row is None or not isinstance(page_row[0], int) or page_row[0] <= 0:
+            raise ValueError("invalid SQLite page size")
+        max_pages = MAX_SPOOL_BYTES // page_row[0]
+        max_page_row = connection.execute(
+            f"PRAGMA max_page_count={max_pages}"
+        ).fetchone()
+        if max_page_row is None or max_page_row[0] > max_pages:
+            raise ValueError("SQLite page limit was not applied")
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA mmap_size=0")
+        connection.execute(f"PRAGMA cache_size=-{_SQLITE_CACHE_KIB}")
+        connection.execute("PRAGMA temp_store=FILE")
+
     def _cleanup(self) -> BaseException | None:
-        failure: BaseException | None = None
+        failed = False
         if self.db is not None:
-            try: self.db.close()
-            except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError, RecursionError) as error: failure = error
+            try:
+                self.db.close()
+            except (
+                sqlite3.Error,
+                OSError,
+                ValueError,
+                TypeError,
+                OverflowError,
+                RecursionError,
+            ):
+                failed = True
             self.db = None
         if self.temp is not None:
-            name = Path(self.temp.name)
-            try: self.temp.cleanup()
-            except (OSError, ValueError) as error:
-                if failure is None: failure = error
-            if name.exists(): shutil.rmtree(name, ignore_errors=True)
+            temporary = self.temp
+            name = Path(temporary.name)
+            cleanup_failed = False
+            try:
+                temporary.cleanup()
+            except (OSError, ValueError):
+                failed = True
+                cleanup_failed = True
+            removed = _remove_spool_directory(name)
+            if not removed:
+                _register_spool_cleanup(name, temporary)
+                failed = True
+            elif cleanup_failed:
+                try:
+                    temporary.cleanup()
+                except (OSError, ValueError):
+                    pass
             self.temp = None
-        return failure
+        return _SpoolCleanupFailure("spool cleanup failed") if failed else None
+
     def _connection(self) -> sqlite3.Connection:
-        if self.db is None: raise _spool_unavailable()
+        if self.db is None:
+            raise _spool_unavailable()
         return self.db
+
+    def _assert_record_budget(self) -> None:
+        if self.records > MAX_SPOOL_RECORDS:
+            raise _spool_unavailable()
+
     def add_product(self, p: Product) -> None:
-        try: self._connection().execute("INSERT INTO c VALUES(?,?,?,?,?,?,?)",(p.product_id,p.name,p.article,p.product_type,json.dumps(p.characteristics),p.total_quantity,json.dumps(p.unknown_characteristics)))
-        except sqlite3.IntegrityError as error: raise StockError("manifest_invalid","Некорректные данные товаров",3) from error
-        except OverflowError as error: raise StockError("manifest_invalid","Некорректные данные товаров",3) from error
-        except (sqlite3.Error,OSError,ValueError,TypeError,RecursionError) as error: raise _spool_unavailable() from error
+        try:
+            self._connection().execute(
+                "INSERT INTO c VALUES(?,?,?,?,?,?,?)",
+                (
+                    p.product_id,
+                    p.name,
+                    p.article,
+                    p.product_type,
+                    json.dumps(p.characteristics),
+                    p.total_quantity,
+                    json.dumps(p.unknown_characteristics),
+                ),
+            )
+            self.records += 1
+            self._assert_record_budget()
+        except sqlite3.IntegrityError as error:
+            raise StockError(
+                "manifest_invalid", "Некорректные данные товаров", 3
+            ) from error
+        except OverflowError as error:
+            raise StockError(
+                "manifest_invalid", "Некорректные данные товаров", 3
+            ) from error
+        except StockError:
+            raise
+        except (
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            RecursionError,
+        ) as error:
+            raise _spool_unavailable() from error
+
     def has(self, ident: str) -> bool:
-        try: return self._connection().execute("SELECT 1 FROM c WHERE id=?",(ident,)).fetchone() is not None
-        except (sqlite3.Error,OSError,ValueError,TypeError,OverflowError,RecursionError) as error: raise _spool_unavailable() from error
+        try:
+            return (
+                self._connection()
+                .execute("SELECT 1 FROM c WHERE id=?", (ident,))
+                .fetchone()
+                is not None
+            )
+        except (
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
+            raise _spool_unavailable() from error
+
     def add_offer(self, ident: str, offer: Offer, limit: int) -> None:
         try:
-            self._connection().execute("INSERT INTO o VALUES(?,?,?,?,?)",(ident,offer.supplier,_price_text(offer.price),offer.delivery_days,offer.quantity)); self._connection().execute("DELETE FROM o WHERE id=? AND rowid NOT IN (SELECT rowid FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",(ident,ident,limit))
-        except OverflowError as error: raise StockError("manifest_invalid","Некорректные данные предложений",3) from error
-        except (sqlite3.Error,OSError,ValueError,TypeError,RecursionError) as error: raise _spool_unavailable() from error
+            self._connection().execute(
+                "INSERT INTO o VALUES(?,?,?,?,?)",
+                (
+                    ident,
+                    offer.supplier,
+                    _price_text(offer.price),
+                    offer.delivery_days,
+                    offer.quantity,
+                ),
+            )
+            deleted = self._connection().execute(
+                "DELETE FROM o WHERE id=? AND rowid NOT IN ("
+                "SELECT rowid FROM o WHERE id=? "
+                "ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",
+                (ident, ident, limit),
+            ).rowcount
+            self.records += 1 - max(deleted, 0)
+            self._assert_record_budget()
+        except OverflowError as error:
+            raise StockError(
+                "manifest_invalid", "Некорректные данные предложений", 3
+            ) from error
+        except StockError:
+            raise
+        except (
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            RecursionError,
+        ) as error:
+            raise _spool_unavailable() from error
     def result(self, query: SearchQuery) -> tuple[SearchSummary,tuple[Product,...],dict[str,tuple[Offer,...]]]:
         try:
             required=any(x is not None for x in (query.supplier,query.max_price,query.max_delivery_days)); where="WHERE EXISTS(SELECT 1 FROM o WHERE o.id=c.id)" if required else ""
@@ -134,27 +338,57 @@ class StockSearcher:
     def search(self, query: SearchQuery) -> SearchResult:
         with _Spool() as spool:
             generation,warnings=_generation(self.files)
-            for row in _rows(self.files.products):
+            for row in _rows(self.files.products, MAX_PRODUCT_ROWS):
                 assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
                 if _match_product(product,row,query): spool.add_product(product)
-            for row in _rows(self.files.offers):
+            for row in _rows(self.files.offers, MAX_OFFER_ROWS):
                 assert_generation(row,self.files.generation_id); ident=_offer_id(row,self.config.offer_product_id_field)
                 if spool.has(ident):
                     offer=_offer(row)
                     if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
             summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
 
-def _rows(path: Path):
+def _rows(path: Path, maximum_rows: int):
     try:
-        with path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if line.strip():
-                    try: value=_parse(line)
-                    except (ValueError,TypeError,OverflowError,RecursionError,json.JSONDecodeError) as error: raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
-                    if not isinstance(value,dict): raise StockError("manifest_invalid","Некорректные машинные данные",3)
+        with path.open("rb") as stream:
+            row_count = 0
+            while True:
+                raw = stream.readline(MAX_JSONL_LINE_BYTES + 2)
+                if not raw:
+                    break
+                row_count += 1
+                if row_count > maximum_rows:
+                    raise StockError(
+                        "manifest_invalid", "Превышен лимит машинных данных", 3
+                    )
+                payload = raw[:-1] if raw.endswith(b"\n") else raw
+                if payload.endswith(b"\r"):
+                    payload = payload[:-1]
+                if len(payload) > MAX_JSONL_LINE_BYTES:
+                    raise StockError(
+                        "manifest_invalid", "Превышен лимит машинных данных", 3
+                    )
+                if payload.strip():
+                    try:
+                        value = _parse(payload.decode("utf-8"))
+                    except (
+                        ValueError,
+                        TypeError,
+                        OverflowError,
+                        RecursionError,
+                        UnicodeError,
+                        json.JSONDecodeError,
+                    ) as error:
+                        raise StockError(
+                            "manifest_invalid", "Некорректные машинные данные", 3
+                        ) from error
+                    if not isinstance(value, dict):
+                        raise StockError(
+                            "manifest_invalid", "Некорректные машинные данные", 3
+                        )
                     yield value
     except StockError: raise
-    except (OSError,UnicodeError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
+    except OSError as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
 
 def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
     try: manifest=_parse(files.manifest.read_text(encoding="utf-8"))
@@ -195,9 +429,18 @@ def _text(value:object)->str:
     if not isinstance(value,str) or not value or len(value)>_MAX_TEXT:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return value
 def _int(value:object)->int:
-    try: result=int(value)
-    except (TypeError,ValueError,OverflowError) as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
-    if isinstance(value,bool) or result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str) and _CANONICAL_NONNEGATIVE_INTEGER.fullmatch(value):
+        try:
+            result = int(value)
+        except (ValueError, OverflowError) as error:
+            raise StockError(
+                "manifest_invalid", "Некорректные машинные данные", 3
+            ) from error
+    else:
+        raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    if result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return result
 def _decimal(value:object)->Decimal:
     try: result=Decimal(str(value))

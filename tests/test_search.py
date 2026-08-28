@@ -207,6 +207,138 @@ class StockSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "manifest_invalid"):
             self.search()
 
+    def test_source_integer_fields_accept_only_canonical_nonnegative_integers(self) -> None:
+        accepted = ((0, 0), (7, 7), ("0", 0), ("7", 7), ("+7", 7))
+
+        for field in ("total_quantity", "delivery_days", "quantity"):
+            for raw, expected in accepted:
+                with self.subTest(field=field, raw=raw):
+                    if field == "total_quantity":
+                        product = schema_module._product(
+                            {
+                                "name": "Synthetic",
+                                "article": "SYN",
+                                "product_type": "Шины",
+                                "total_quantity": raw,
+                                "characteristics": {},
+                            },
+                            "synthetic-product",
+                        )
+                        actual = product.total_quantity
+                    else:
+                        row = {
+                            "supplier": "Synthetic",
+                            "price": "1",
+                            "delivery_days": 0,
+                            "quantity": 0,
+                            field: raw,
+                        }
+                        offer = schema_module._offer(row)
+                        actual = getattr(offer, field)
+
+                    self.assertEqual(actual, expected)
+
+    def test_source_integer_fields_reject_noncanonical_or_noninteger_values(self) -> None:
+        invalid = (
+            True,
+            False,
+            1.0,
+            1.5,
+            Decimal("1"),
+            Decimal("1.5"),
+            "",
+            "01",
+            "+01",
+            "-0",
+            "-1",
+            " 1",
+            "1 ",
+            "1.0",
+            "1e0",
+            "--1",
+        )
+
+        for field in ("total_quantity", "delivery_days", "quantity"):
+            for raw in invalid:
+                with self.subTest(field=field, raw=repr(raw)):
+                    with self.assertRaisesRegex(StockError, "manifest_invalid"):
+                        if field == "total_quantity":
+                            schema_module._product(
+                                {
+                                    "name": "Synthetic",
+                                    "article": "SYN",
+                                    "product_type": "Шины",
+                                    "total_quantity": raw,
+                                    "characteristics": {},
+                                },
+                                "synthetic-product",
+                            )
+                        else:
+                            schema_module._offer(
+                                {
+                                    "supplier": "Synthetic",
+                                    "price": "1",
+                                    "delivery_days": 0,
+                                    "quantity": 0,
+                                    field: raw,
+                                }
+                            )
+
+    def test_jsonl_reader_accepts_record_at_byte_limit(self) -> None:
+        record = b'{"a":1}'
+        path = self.generation_dir / "boundary.jsonl"
+        path.write_bytes(record + b"\r\n")
+
+        with patch.object(schema_module, "MAX_JSONL_LINE_BYTES", len(record)):
+            self.assertEqual(list(schema_module._rows(path, 1)), [{"a": 1}])
+
+    def test_jsonl_reader_rejects_record_above_byte_limit_without_full_read(self) -> None:
+        record = b'{"a":1}'
+        path = self.generation_dir / "oversized.jsonl"
+        path.write_bytes(record + b"x" * 1_000_000)
+
+        with patch.object(schema_module, "MAX_JSONL_LINE_BYTES", len(record) - 1):
+            with self.assertRaisesRegex(StockError, "manifest_invalid"):
+                list(schema_module._rows(path, 1))
+
+    def test_product_and_offer_row_limits_accept_boundary_and_reject_overflow(self) -> None:
+        with patch.object(schema_module, "MAX_PRODUCT_ROWS", 4):
+            with patch.object(schema_module, "MAX_OFFER_ROWS", 9):
+                self.search()
+
+        for constant, value in (("MAX_PRODUCT_ROWS", 3), ("MAX_OFFER_ROWS", 8)):
+            with self.subTest(constant=constant):
+                with patch.object(schema_module, constant, value):
+                    with self.assertRaisesRegex(StockError, "manifest_invalid"):
+                        self.search()
+
+    def test_spool_record_limit_accepts_boundary_and_rejects_overflow(self) -> None:
+        with patch.object(schema_module, "MAX_SPOOL_RECORDS", 10):
+            self.search()
+
+        with patch.object(schema_module, "MAX_SPOOL_RECORDS", 9):
+            with self.assertRaisesRegex(StockError, "cache_unavailable") as raised:
+                self.search()
+
+        self.assertEqual(
+            raised.exception.safe_message,
+            "Временное хранилище поиска недоступно",
+        )
+
+    def test_spool_page_limit_rejects_growth_without_large_file(self) -> None:
+        small = Product("small", "N", "A", "T", {}, 1, ())
+        oversized = Product("x" * (128 * 1024), "N", "A", "T", {}, 1, ())
+
+        with patch.object(schema_module, "MAX_SPOOL_BYTES", 16 * 4096):
+            with schema_module._Spool() as spool:
+                spool.add_product(small)
+                with self.assertRaisesRegex(
+                    StockError, "cache_unavailable"
+                ) as raised:
+                    spool.add_product(oversized)
+
+        self.assertNotIn(str(self.generation_dir), str(raised.exception))
+
     def test_more_than_ten_thousand_products_returns_exact_top_result(self) -> None:
         product = (
             '{"private_product_key":"synthetic-%s","content_generation_id":"synthetic-generation",'
@@ -1456,6 +1588,83 @@ class SqliteFailureNormalizationTest(unittest.TestCase):
         self.assertEqual(primary_error.code, "generation_mismatch")
         self.assertFalse(directories[0].exists())
 
+    def test_cleanup_retries_are_bounded_and_remove_directory(self) -> None:
+        directory = Path(self.temp_dir.name) / "retry-cleanup"
+        directory.mkdir()
+        real_rmtree = schema_module.shutil.rmtree
+        attempts = 0
+
+        def fail_twice_then_remove(path: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("/private/retry cleanup")
+            real_rmtree(path)
+
+        with patch.object(schema_module, "_SPOOL_CLEANUP_ATTEMPTS", 3):
+            with patch.object(
+                schema_module.shutil,
+                "rmtree",
+                side_effect=fail_twice_then_remove,
+            ):
+                removed = schema_module._remove_spool_directory(directory)
+
+        self.assertTrue(removed)
+        self.assertEqual(attempts, 3)
+        self.assertFalse(directory.exists())
+
+    def test_primary_and_double_cleanup_failure_register_reliable_retry(self) -> None:
+        real_temporary_directory = tempfile.TemporaryDirectory
+        temporary_directories: list[object] = []
+
+        class CleanupFailureDirectory:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self._temporary = real_temporary_directory(*args, **kwargs)
+                self.name = self._temporary.name
+                self.cleanup_calls = 0
+                temporary_directories.append(self)
+
+            def cleanup(self) -> None:
+                self.cleanup_calls += 1
+                if self.cleanup_calls == 1:
+                    raise PermissionError("/private/temporary cleanup")
+                self._temporary.cleanup()
+
+        real_connect = sqlite3.connect
+
+        def connect(path: str) -> SqliteFailureNormalizationTest.ConnectionProxy:
+            return self.ConnectionProxy(real_connect(path), fail_close=True)
+
+        self.files.products.write_bytes(
+            (FIXTURES_DIR / "products-generation-mismatch.jsonl").read_bytes()
+        )
+        with patch.object(
+            schema_module.tempfile,
+            "TemporaryDirectory",
+            CleanupFailureDirectory,
+        ):
+            with patch.object(schema_module.sqlite3, "connect", side_effect=connect):
+                with patch.object(
+                    schema_module,
+                    "_remove_spool_directory",
+                    return_value=False,
+                ):
+                    with self.assertRaisesRegex(
+                        StockError, "generation_mismatch"
+                    ) as raised:
+                        self.search()
+
+        directory = Path(temporary_directories[0].name)
+        self.assertEqual(raised.exception.code, "generation_mismatch")
+        self.assertNotIn(str(directory), str(raised.exception))
+        self.assertTrue(directory.exists())
+        self.assertIn(directory, schema_module._PENDING_SPOOL_CLEANUPS)
+
+        schema_module._retry_pending_spool_cleanups()
+
+        self.assertFalse(directory.exists())
+        self.assertNotIn(directory, schema_module._PENDING_SPOOL_CLEANUPS)
+
 
 class SearchStockCliTest(unittest.TestCase):
     def test_success_writes_one_public_json_document(self) -> None:
@@ -1479,13 +1688,55 @@ class SearchStockCliTest(unittest.TestCase):
 
     def test_invalid_argument_writes_safe_json_envelope(self) -> None:
         output = StringIO()
+        errors = StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stdout(output), redirect_stderr(errors):
             exit_code = search_stock.main(["--limit", "nope"])
 
         result = json.loads(output.getvalue())
         self.assertEqual(exit_code, 4)
         self.assertEqual(result["error"]["code"], "query_invalid")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_only_sole_exact_help_forms_write_help_and_exit_zero(self) -> None:
+        for argument in ("-h", "--help"):
+            with self.subTest(argument=argument):
+                output = StringIO()
+                errors = StringIO()
+                with patch.object(search_stock, "search_default") as search:
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = search_stock.main([argument])
+
+                self.assertEqual(exit_code, 0)
+                self.assertIn("usage:", output.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+                search.assert_not_called()
+
+    def test_attached_abbreviated_mixed_duplicate_and_separator_help_are_json_errors(self) -> None:
+        invalid_arguments = (
+            ["-hfoo"],
+            ["--he"],
+            ["--help=value"],
+            ["--help", "--limit", "1"],
+            ["-h", "--help"],
+            ["--"],
+            ["--", "--help"],
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                output = StringIO()
+                errors = StringIO()
+                with patch.object(search_stock, "search_default") as search:
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = search_stock.main(arguments)
+
+                public = json.loads(output.getvalue())
+                self.assertEqual(exit_code, 4)
+                self.assertEqual(public["error"]["code"], "query_invalid")
+                self.assertEqual(output.getvalue().count("\n"), 1)
+                self.assertEqual(errors.getvalue(), "")
+                search.assert_not_called()
 
     def test_decimal_exponent_boundaries_write_json_without_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from papa_shin_stock.cache import StockCache
 from papa_shin_stock.config import StockConfig
@@ -10,12 +11,29 @@ from papa_shin_stock.http_client import SafeHttpClient
 from papa_shin_stock.query import SearchQuery
 from papa_shin_stock.schema import StockSearcher
 
+
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        raise StockError("query_invalid", "Некорректные параметры поиска", 4)
+        raise _query_invalid()
+
+
+def _query_invalid() -> StockError:
+    return StockError("query_invalid", "Некорректные параметры поиска", 4)
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = SafeArgumentParser(description="Поиск по локальному проверенному кэшу")
+    parser = SafeArgumentParser(
+        description="Поиск по локальному проверенному кэшу",
+        add_help=False,
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        dest="help_requested",
+        help="show this help message and exit",
+    )
     parser.add_argument("--product-type")
     parser.add_argument("--size")
     parser.add_argument("--season")
@@ -41,14 +59,26 @@ def search_default(namespace: argparse.Namespace) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    if arguments == ["-h"] or arguments == ["--help"]:
+        parser.print_help()
+        return 0
+
     try:
-        namespace = build_parser().parse_args(argv)
+        namespace = parser.parse_args(arguments)
+        if namespace.help_requested:
+            raise _query_invalid()
         result = search_default(namespace)
         exit_code = 0
-    except SystemExit as error:
-        if error.code == 0:
-            return 0
-        result = {"status": "error", "error": {"code": "query_invalid", "message": "Некорректные параметры поиска"}}
+    except SystemExit:
+        result = {
+            "status": "error",
+            "error": {
+                "code": "query_invalid",
+                "message": "Некорректные параметры поиска",
+            },
+        }
         exit_code = 4
     except StockError as error:
         result = {
@@ -61,4 +91,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
