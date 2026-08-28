@@ -6,14 +6,24 @@
 
 | Имя | Назначение |
 |---|---|
-| `PAPA_SHIN_STOCK_MANIFEST_URL` | Абсолютный HTTPS-адрес машинного манифеста без userinfo |
+| `PAPA_SHIN_STOCK_MANIFEST_URL` | Абсолютный HTTPS-адрес manifest: `https://office.papa-shin.ru/robotyre-stock/v1/manifest.json` |
 | `PAPA_SHIN_STOCK_USERNAME` | Имя учётной записи только для чтения |
 | `PAPA_SHIN_STOCK_PASSWORD` | Секрет учётной записи только для чтения |
-| `PAPA_SHIN_STOCK_PRODUCT_ID_FIELD` | Поле связи товара |
-| `PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD` | Поле связи предложения с товаром |
+| `PAPA_SHIN_STOCK_PRODUCT_ID_FIELD` | Необязательно; только `robotyre_product_id`, это же значение используется по умолчанию |
+| `PAPA_SHIN_STOCK_OFFER_PRODUCT_ID_FIELD` | Необязательно; только `robotyre_product_id`, это же значение используется по умолчанию |
 | `PAPA_SHIN_STOCK_CACHE_DIR` | Необязательный абсолютный путь к отдельному leaf-каталогу локального кэша вне каталога skill package |
 
 Не придумывай значения и не запрашивай их в чате. Не печатай содержимое файла, не передавай его в аргументах команд и не сохраняй в репозитории. Отсутствующий файл возвращает безопасный код `config_missing`; повреждённый или нечитаемый файл — `config_invalid`. В обоих случаях попроси администратора проверить готовый приватный файл, не раскрывая его путь.
+
+Минимальная форма:
+
+```dotenv
+PAPA_SHIN_STOCK_MANIFEST_URL=https://office.papa-shin.ru/robotyre-stock/v1/manifest.json
+PAPA_SHIN_STOCK_USERNAME=read-only-user
+PAPA_SHIN_STOCK_PASSWORD=administrator-provided-secret
+```
+
+Это единственный URL машинных данных в env. Пути `products.jsonl`, `offers.jsonl` и `archive.zip` извлекаются из проверенного manifest и отдельно в env не задаются. Замени примеры логина и пароля только готовыми значениями от администратора.
 
 Парсер читает только буквальные строки `KEY=VALUE`: файл не исполняется как shell-код и не выполняет подстановки.
 

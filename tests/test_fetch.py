@@ -782,7 +782,7 @@ class FetchStockCliTest(unittest.TestCase):
             "generation": {
                 "id": "synthetic-generation",
                 "generated_at": "2026-08-27T10:00:00+00:00",
-                "checked_at": "2026-08-27T10:01:00+00:00",
+                "verified_at": "2026-08-27T10:01:00+00:00",
                 "stale": True,
             },
             "warnings": [{"code": "network_error", "message": "Используется кэш"}],

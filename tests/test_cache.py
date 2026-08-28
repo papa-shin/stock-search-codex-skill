@@ -13,6 +13,7 @@ import time
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,29 +37,62 @@ from papa_shin_stock.http_client import DownloadReceipt, HttpResponse
 import fetch_stock
 
 
-PRODUCTS = b'{"product_id":"synthetic-product","content_generation_id":"generation-b"}\n'
-OFFERS = b'{"product_id":"synthetic-product","content_generation_id":"generation-b"}\n'
+PRODUCTS = b'{"product_id":"synthetic-product","content_generation_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n'
+OFFERS = b'{"product_id":"synthetic-product","content_generation_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n'
+ARCHIVE = b"synthetic-archive"
+_MANIFEST_NOW = datetime.now(timezone.utc)
+_MANIFEST_GENERATED_AT = (_MANIFEST_NOW - timedelta(minutes=2)).isoformat()
+_MANIFEST_CHECKED_AT = (_MANIFEST_NOW - timedelta(minutes=1)).isoformat()
+_MANIFEST_REPORT_DATE = (_MANIFEST_NOW + timedelta(hours=5)).date().isoformat()
 
 
 def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def manifest_bytes(generation_id: str = "generation-b") -> bytes:
+def manifest_bytes(
+    generation_id: str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    *,
+    generated_at: str = _MANIFEST_GENERATED_AT,
+    checked_at: str = _MANIFEST_CHECKED_AT,
+) -> bytes:
     return json.dumps(
         {
-            "generation_id": generation_id,
-            "generated_at": "2026-08-27T10:00:00+00:00",
+            "contract": "robotyre-stock/v1",
+            "schema_version": "1",
+            "content_generation_id": generation_id,
+            "report_date": _MANIFEST_REPORT_DATE,
+            "timezone": "Asia/Yekaterinburg",
+            "product_type_sku_counts": {"172": 1},
+            "offer_count": 1,
+            "warnings": [],
+            "generated_at": generated_at,
+            "checked_at": checked_at,
+            "stale_after_seconds": 5400,
             "files": {
-                "products": {
-                    "url": "products.jsonl",
+                "products.jsonl": {
+                    "url": "/robotyre-stock/v1/products.jsonl",
+                    "media_type": "application/x-ndjson",
                     "bytes": len(PRODUCTS),
                     "sha256": sha256(PRODUCTS),
+                    "etag": '"1-1"',
+                    "last_modified": "Thu, 27 Aug 2026 10:00:00 GMT",
                 },
-                "offers": {
-                    "url": "/offers.jsonl",
+                "offers.jsonl": {
+                    "url": "/robotyre-stock/v1/offers.jsonl",
+                    "media_type": "application/x-ndjson",
                     "bytes": len(OFFERS),
                     "sha256": sha256(OFFERS),
+                    "etag": '"1-2"',
+                    "last_modified": "Thu, 27 Aug 2026 10:00:00 GMT",
+                },
+                "archive.zip": {
+                    "url": "/robotyre-stock/v1/archive.zip",
+                    "media_type": "application/zip",
+                    "bytes": len(ARCHIVE),
+                    "sha256": sha256(ARCHIVE),
+                    "etag": '"1-3"',
+                    "last_modified": "Thu, 27 Aug 2026 10:00:00 GMT",
                 },
             },
         },
@@ -78,7 +112,7 @@ class FakeHttpClient:
         self.response = response or HttpResponse(
             status=200,
             headers={
-                "ETag": '"generation-b"',
+                "ETag": '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
                 "Last-Modified": "Thu, 27 Aug 2026 10:00:00 GMT",
             },
             body=manifest_bytes(),
@@ -130,8 +164,11 @@ class CacheFixture:
 
     def seed_generation(
         self,
-        generation_id: str = "generation-a",
+        generation_id: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         directory_name: str = "generation-existing",
+        *,
+        generated_at: str = _MANIFEST_GENERATED_AT,
+        source_checked_at: str = _MANIFEST_CHECKED_AT,
     ) -> None:
         attestation = cache_module._attest_cache_root(self.root, create=True)
         try:
@@ -152,16 +189,21 @@ class CacheFixture:
                     }
                 )
             )
-        (generation / "manifest.json").write_bytes(manifest_bytes(generation_id))
+        generation_manifest = manifest_bytes(
+            generation_id,
+            generated_at=generated_at,
+            checked_at=source_checked_at,
+        )
+        (generation / "manifest.json").write_bytes(generation_manifest)
         (generation / "products.jsonl").write_bytes(PRODUCTS)
         (generation / "offers.jsonl").write_bytes(OFFERS)
         (generation / "state.json").write_text(
             json.dumps(
                 {
                     "generation_id": generation_id,
-                    "generated_at": "2026-08-26T10:00:00+00:00",
-                    "checked_at": "2026-08-26T10:01:00+00:00",
-                    "manifest_etag": '"generation-a"',
+                    "generated_at": json.loads(generation_manifest)["generated_at"],
+                    "verified_at": "2026-08-26T10:01:00+00:00",
+                    "manifest_etag": '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
                     "manifest_last_modified": "Wed, 26 Aug 2026 10:00:00 GMT",
                 }
             ),
@@ -784,12 +826,12 @@ class StockCacheTest(unittest.TestCase):
         result = cache.refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertEqual(cache.current_generation().generation_id, "generation-b")
+        self.assertEqual(cache.current_generation().generation_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         self.assertEqual(cache.current_generation().products.read_bytes(), PRODUCTS)
         self.assertEqual(cache.current_generation().offers.read_bytes(), OFFERS)
         self.assertFalse((self.cache_root / "current.json").is_symlink())
         self.assertEqual(
-            result.to_public_dict()["generation"]["id"], "generation-b"
+            result.to_public_dict()["generation"]["id"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         )
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
@@ -1895,7 +1937,7 @@ class StockCacheTest(unittest.TestCase):
     ) -> None:
         root = Path(self.temp_dir.name) / "runtime-root"
         root.mkdir(mode=0o700)
-        status = root / ".runtime-status-generation-a.json"
+        status = root / ".runtime-status-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
         status.write_text("owned", encoding="utf-8")
         observed = status.lstat()
         parked_root = Path(self.temp_dir.name) / "parked-runtime-root"
@@ -1940,15 +1982,15 @@ class StockCacheTest(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "Directory FD fsync проверяется на POSIX")
     def test_pointer_unlink_does_not_fsync_replaced_cache_root(self) -> None:
         pointer = CurrentPointer(
-            generation_id="generation-a",
+            generation_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             directory_name="generation-existing",
             activation_token="synthetic-activation",
         )
         runtime_value = {
-            "generation_id": "generation-a",
-            "checked_at": "2026-08-27T10:00:00+00:00",
+            "generation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verified_at": "2026-08-27T10:00:00+00:00",
             "stale": False,
-            "warning_code": None,
+            "warning_codes": [],
             "revision": "a" * 32,
         }
         expected_runtime = cache_module.validate_runtime_status(
@@ -2165,8 +2207,8 @@ class StockCacheTest(unittest.TestCase):
         result = cache.refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "download_integrity_failed")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "download_integrity_failed")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(
             result.to_public_dict()["warnings"][0]["code"],
             "download_integrity_failed",
@@ -2192,8 +2234,8 @@ class StockCacheTest(unittest.TestCase):
         result = cache.refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "network_error")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "network_error")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(
             sorted(path.name for path in (self.cache_root / "generations").iterdir()),
             ["generation-existing"],
@@ -2211,9 +2253,91 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(result.status, "not_modified")
         self.assertEqual(
             client.manifest_calls,
-            [('"generation-a"', "Wed, 26 Aug 2026 10:00:00 GMT")],
+            [('"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', "Wed, 26 Aug 2026 10:00:00 GMT")],
         )
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+    def test_expired_source_200_is_activated_as_stale_without_archive_download(self) -> None:
+        checked = datetime.now(timezone.utc) - timedelta(hours=2)
+        generated = checked - timedelta(minutes=1)
+        client = FakeHttpClient(
+            response=HttpResponse(
+                status=200,
+                headers={"ETag": '"expired"'},
+                body=manifest_bytes(
+                    generated_at=generated.isoformat(),
+                    checked_at=checked.isoformat(),
+                ),
+            )
+        )
+
+        result = StockCache(self.cache_root, client).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertTrue(result.stale)
+        self.assertEqual(result.warning_codes, ("source_stale",))
+        self.assertEqual(
+            client.download_calls,
+            [
+                "https://stock.example.test/robotyre-stock/v1/products.jsonl",
+                "https://stock.example.test/robotyre-stock/v1/offers.jsonl",
+            ],
+        )
+
+    def test_expired_source_304_stays_stale_and_fallback_preserves_both_reasons(self) -> None:
+        checked = datetime.now(timezone.utc) - timedelta(hours=2)
+        generated = checked - timedelta(minutes=1)
+        self.fixture.seed_generation(
+            generated_at=generated.isoformat(),
+            source_checked_at=checked.isoformat(),
+        )
+        not_modified = StockCache(
+            self.cache_root,
+            FakeHttpClient(response=HttpResponse(status=304, headers={}, body=b"")),
+        ).refresh(self.config)
+
+        with patch.object(
+            FakeHttpClient,
+            "get_manifest",
+            side_effect=StockError("network_error", "Синтетическая ошибка", 3),
+        ):
+            fallback = StockCache(self.cache_root, FakeHttpClient()).refresh(
+                self.config
+            )
+
+        self.assertEqual(not_modified.status, "not_modified")
+        self.assertTrue(not_modified.stale)
+        self.assertEqual(not_modified.warning_codes, ("source_stale",))
+        self.assertEqual(fallback.status, "stale_cache")
+        self.assertTrue(fallback.stale)
+        self.assertEqual(
+            fallback.warning_codes,
+            ("source_stale", "network_error"),
+        )
+
+    def test_304_freshness_does_not_reread_manifest_path_after_attested_load(self) -> None:
+        self.fixture.seed_generation()
+        manifest_path = (
+            self.cache_root
+            / "generations"
+            / "generation-existing"
+            / "manifest.json"
+        )
+
+        class ReplacingClient:
+            def get_manifest(
+                self, etag: str | None = None, last_modified: str | None = None
+            ) -> HttpResponse:
+                manifest_path.write_bytes(
+                    b"x" * (cache_module._WINDOWS_MANIFEST_MAX_BYTES + 1)
+                )
+                return HttpResponse(status=304, headers={}, body=b"")
+
+        result = StockCache(self.cache_root, ReplacingClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "not_modified")
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, object()).current_generation()
 
     def test_not_modified_without_readable_cache_fails_closed(self) -> None:
         cache = StockCache(
@@ -2236,8 +2360,8 @@ class StockCacheTest(unittest.TestCase):
         result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
     def test_active_lock_warning_is_not_persisted_into_active_generation(self) -> None:
         self.fixture.seed_generation()
@@ -2252,10 +2376,10 @@ class StockCacheTest(unittest.TestCase):
         current = CacheState.load(self.cache_root)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
         self.assertIsNotNone(current)
         self.assertFalse(current.stale)
-        self.assertIsNone(current.warning_code)
+        self.assertEqual(current.warning_codes, ())
         self.assertFalse(
             (self.cache_root / ".runtime-status-generation-existing.json").exists()
         )
@@ -2272,8 +2396,8 @@ class StockCacheTest(unittest.TestCase):
             if not activated:
                 activated = True
                 self.fixture.seed_generation(
-                    generation_id="generation-concurrent",
-                    directory_name="generation-concurrent",
+                    generation_id="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    directory_name="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 )
 
         with patch.object(
@@ -2289,14 +2413,14 @@ class StockCacheTest(unittest.TestCase):
         current = CacheState.load(self.cache_root)
         self.assertTrue(activated)
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.generation_id, "generation-a")
-        self.assertEqual(result.warning_code, "network_error")
+        self.assertEqual(result.generation_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(result.warning_codes[-1], "network_error")
         self.assertIsNotNone(current)
-        self.assertEqual(current.generation_id, "generation-concurrent")
+        self.assertEqual(current.generation_id, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
         self.assertFalse(current.stale)
-        self.assertIsNone(current.warning_code)
+        self.assertEqual(current.warning_codes, ())
         self.assertFalse(
-            (self.cache_root / ".runtime-status-generation-concurrent.json").exists()
+            (self.cache_root / ".runtime-status-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json").exists()
         )
 
     def test_fallback_lock_root_mkdir_error_stays_safe_json(self) -> None:
@@ -2526,7 +2650,7 @@ class StockCacheTest(unittest.TestCase):
             result = StockCache(self.cache_root, client).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
         self.assertEqual(client.manifest_calls, [])
 
     def test_displaced_owner_cannot_return_not_modified_success(self) -> None:
@@ -2554,8 +2678,8 @@ class StockCacheTest(unittest.TestCase):
         ).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
     def test_release_owner_change_fences_old_owner_and_retains_orphan(self) -> None:
         lock = CacheLock.acquire(self.cache_root)
@@ -2909,8 +3033,8 @@ class StockCacheTest(unittest.TestCase):
         result = cache.refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
     def test_delayed_activation_before_commit_cannot_overwrite_successful_writer(
         self,
@@ -2949,8 +3073,8 @@ class StockCacheTest(unittest.TestCase):
         current_client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-c"'},
-                body=manifest_bytes("generation-c"),
+                headers={"ETag": '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'},
+                body=manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             )
         )
         with patch.object(
@@ -2979,7 +3103,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(delayed_errors, [])
         self.assertEqual(len(delayed_results), 1)
         self.assertEqual(current_result.status, "updated")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+        self.assertEqual(self.fixture.current_generation_id(), "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
         active = CacheState.load(self.cache_root)
         self.assertIsNotNone(active)
         self.assertTrue(active.files.manifest.parent.is_dir())
@@ -3048,8 +3172,8 @@ class StockCacheTest(unittest.TestCase):
         current_client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-c"'},
-                body=manifest_bytes("generation-c"),
+                headers={"ETag": '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'},
+                body=manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             )
         )
 
@@ -3096,7 +3220,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(second_errors, [])
         self.assertEqual(len(second_results), 1)
         self.assertEqual(second_results[0].status, "updated")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+        self.assertEqual(self.fixture.current_generation_id(), "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 
     def test_activation_rollback_cas_cannot_restore_over_successful_writer(
         self,
@@ -3120,7 +3244,7 @@ class StockCacheTest(unittest.TestCase):
             pointer = CurrentPointer.load(cache_dir / "current.json")
             if (
                 threading.current_thread().name == "rollback-activation"
-                and pointer.generation_id == "generation-b"
+                and pointer.generation_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ):
                 raise StockError(
                     "cache_unavailable", "Синтетическая ошибка validation", 7
@@ -3157,8 +3281,8 @@ class StockCacheTest(unittest.TestCase):
         current_client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
-                headers={"ETag": '"generation-c"'},
-                body=manifest_bytes("generation-c"),
+                headers={"ETag": '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'},
+                body=manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
             )
         )
 
@@ -3206,7 +3330,7 @@ class StockCacheTest(unittest.TestCase):
         self.assertEqual(second_errors, [])
         self.assertEqual(len(second_results), 1)
         self.assertEqual(second_results[0].status, "updated")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-c")
+        self.assertEqual(self.fixture.current_generation_id(), "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
         active = CacheState.load(self.cache_root)
         self.assertIsNotNone(active)
         self.assertTrue(active.files.manifest.parent.is_dir())
@@ -3244,7 +3368,7 @@ class StockCacheTest(unittest.TestCase):
                         and not post_publish_failed
                         and threading.current_thread().name
                         == f"revision-race-{iteration}"
-                        and pointer.generation_id == "generation-b"
+                        and pointer.generation_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                     ):
                         post_publish_failed = True
                         published.set()
@@ -3290,7 +3414,7 @@ class StockCacheTest(unittest.TestCase):
                 self.assertEqual(successor.status, "not_modified")
                 final = CacheState.load(root)
                 self.assertIsNotNone(final)
-                self.assertEqual(final.generation_id, "generation-b")
+                self.assertEqual(final.generation_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
                 self.assertEqual(
                     final.runtime_revision, successor_state.runtime_revision
                 )
@@ -3308,7 +3432,7 @@ class StockCacheTest(unittest.TestCase):
             cache_dir: Path, progress: object | None = None
         ) -> CacheState | None:
             pointer = CurrentPointer.load(cache_dir / "current.json")
-            if pointer.generation_id == "generation-b":
+            if pointer.generation_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb":
                 raise StockError(
                     "post_publish_failure",
                     "Синтетическая ошибка post-publish",
@@ -3339,7 +3463,7 @@ class StockCacheTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "post_publish_failure")
         pointer = CurrentPointer.load(self.cache_root / "current.json")
-        self.assertEqual(pointer.generation_id, "generation-b")
+        self.assertEqual(pointer.generation_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         target = self.cache_root / "generations" / pointer.directory_name
         self.assertTrue(target.is_dir())
         self.assertTrue((target / "manifest.json").is_file())
@@ -3365,8 +3489,8 @@ class StockCacheTest(unittest.TestCase):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_unavailable")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "cache_unavailable")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(
             sorted(path.name for path in (self.cache_root / "generations").iterdir()),
             ["generation-existing"],
@@ -3383,7 +3507,7 @@ class StockCacheTest(unittest.TestCase):
             pointer = json.loads(
                 (cache_dir / "current.json").read_text(encoding="utf-8")
             )
-            if pointer["generation_id"] == "generation-b":
+            if pointer["generation_id"] == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb":
                 raise StockError(
                     "cache_unavailable", "Синтетическая ошибка validation", 7
                 )
@@ -3393,8 +3517,8 @@ class StockCacheTest(unittest.TestCase):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_unavailable")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-a")
+        self.assertEqual(result.warning_codes[-1], "cache_unavailable")
+        self.assertEqual(self.fixture.current_generation_id(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(
             sorted(path.name for path in (self.cache_root / "generations").iterdir()),
             ["generation-existing"],
@@ -3406,11 +3530,32 @@ class StockCacheTest(unittest.TestCase):
         StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         active = StockCache(self.cache_root, FakeHttpClient()).current_generation()
-        self.assertEqual(active.generation_id, "generation-b")
+        self.assertEqual(active.generation_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         self.assertEqual(
             [path for path in (self.cache_root / "generations").iterdir() if path.is_dir()],
             [active.manifest.parent],
         )
+
+    def test_success_preserves_inactive_legacy_generation_for_manual_cleanup(self) -> None:
+        self.fixture.seed_generation()
+        legacy = self.cache_root / "generations" / "generation-legacy"
+        legacy.mkdir()
+        (legacy / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "generation_id": "legacy-generation",
+                    "generated_at": "2026-08-27T10:00:00+00:00",
+                    "files": {"products": {}, "offers": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(result.warning_codes, ())
+        self.assertTrue(legacy.is_dir())
 
     def test_inactive_cleanup_failure_is_observable_without_rollback(self) -> None:
         self.fixture.seed_generation()
@@ -3434,12 +3579,12 @@ class StockCacheTest(unittest.TestCase):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertEqual(result.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(result.warning_codes[-1], "cache_cleanup_incomplete")
         self.assertEqual(
             result.to_public_dict()["warnings"][0]["code"],
             "cache_cleanup_incomplete",
         )
-        self.assertEqual(self.fixture.current_generation_id(), "generation-b")
+        self.assertEqual(self.fixture.current_generation_id(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         self.assertTrue(
             (self.cache_root / "generations" / "generation-existing").is_dir()
         )
@@ -3475,9 +3620,9 @@ class StockCacheTest(unittest.TestCase):
             second = StockCache(self.cache_root, client).refresh(self.config)
 
         self.assertEqual(first.status, "updated")
-        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(first.warning_codes[-1], "cache_cleanup_incomplete")
         self.assertEqual(second.status, "stale_cache")
-        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.warning_codes[-1], "cache_cleanup_incomplete")
         self.assertEqual(
             (self.cache_root / "current.json").read_bytes(), pointer_after_first
         )
@@ -3520,9 +3665,9 @@ class StockCacheTest(unittest.TestCase):
             second = StockCache(self.cache_root, client).refresh(self.config)
 
         self.assertEqual(first.status, "updated")
-        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(first.warning_codes[-1], "cache_cleanup_incomplete")
         self.assertEqual(second.status, "stale_cache")
-        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.warning_codes[-1], "cache_cleanup_incomplete")
         self.assertEqual(
             (self.cache_root / "current.json").read_bytes(), pointer_after_first
         )
@@ -3585,15 +3730,15 @@ class StockCacheTest(unittest.TestCase):
             replacement_name = "generation-new-owner"
             replacement = self.cache_root / "generations" / replacement_name
             shutil.copytree(current_directory, replacement)
-            (replacement / "manifest.json").write_bytes(manifest_bytes("generation-c"))
+            (replacement / "manifest.json").write_bytes(manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
             state_path = replacement / "state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["generation_id"] = "generation-c"
+            state["generation_id"] = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
             state_path.write_text(json.dumps(state), encoding="utf-8")
             (self.cache_root / "current.json").write_text(
                 json.dumps(
                     {
-                        "generation_id": "generation-c",
+                        "generation_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                         "directory_name": replacement_name,
                         "activation_token": "replacement-writer",
                     }
@@ -3617,9 +3762,9 @@ class StockCacheTest(unittest.TestCase):
 
         current = CacheState.load(self.cache_root)
         self.assertIsNotNone(current)
-        self.assertEqual(current.generation_id, "generation-c")
+        self.assertEqual(current.generation_id, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
         self.assertEqual(result.status, "stale_cache")
-        self.assertEqual(result.warning_code, "cache_locked")
+        self.assertEqual(result.warning_codes[-1], "cache_locked")
 
     def test_cache_state_rejects_pointer_to_incomplete_generation(self) -> None:
         self.fixture.seed_generation()
@@ -3639,7 +3784,7 @@ class StockCacheTest(unittest.TestCase):
     def test_cache_state_rejects_stored_manifest_generation_mismatch(self) -> None:
         self.fixture.seed_generation()
         generation = self.cache_root / "generations" / "generation-existing"
-        (generation / "manifest.json").write_bytes(manifest_bytes("generation-c"))
+        (generation / "manifest.json").write_bytes(manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
 
         with self.assertRaisesRegex(StockError, "cache_unavailable"):
             CacheState.load(self.cache_root)
@@ -3674,11 +3819,11 @@ class StockCacheTest(unittest.TestCase):
         result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(result.status, "updated")
-        self.assertEqual(self.fixture.current_generation_id(), "generation-b")
+        self.assertEqual(self.fixture.current_generation_id(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
     def test_manifest_path_traversal_is_rejected_before_download(self) -> None:
         body = json.loads(manifest_bytes())
-        body["files"]["products"]["url"] = "../../outside.jsonl"
+        body["files"]["products.jsonl"]["url"] = "../../outside.jsonl"
         client = FakeHttpClient(
             response=HttpResponse(
                 status=200,
@@ -3696,8 +3841,8 @@ class StockCacheTest(unittest.TestCase):
         self.fixture.seed_generation()
         previous_pointer = (self.cache_root / "current.json").read_bytes()
         invalid_values = (
-            ("generation_id", "g" * 257),
-            ("generation_id", "\ud800"),
+            ("content_generation_id", "g" * 257),
+            ("content_generation_id", "\ud800"),
             ("generated_at", "2" * 257),
             ("generated_at", "\ud800"),
             ("generated_at", "not-an-iso-8601-timestamp"),
@@ -3705,12 +3850,12 @@ class StockCacheTest(unittest.TestCase):
 
         for field, invalid in invalid_values:
             with self.subTest(field=field, invalid=ascii(invalid)):
-                body = json.loads(manifest_bytes("generation-c"))
+                body = json.loads(manifest_bytes("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
                 body[field] = invalid
                 client = FakeHttpClient(
                     response=HttpResponse(
                         status=200,
-                        headers={"ETag": '"generation-c"'},
+                        headers={"ETag": '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'},
                         body=json.dumps(body, separators=(",", ":")).encode("utf-8"),
                     )
                 )
@@ -3718,8 +3863,8 @@ class StockCacheTest(unittest.TestCase):
                 result = StockCache(self.cache_root, client).refresh(self.config)
 
                 self.assertEqual(result.status, "stale_cache")
-                self.assertEqual(result.generation_id, "generation-a")
-                self.assertEqual(result.warning_code, "manifest_invalid")
+                self.assertEqual(result.generation_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                self.assertEqual(result.warning_codes[-1], "manifest_invalid")
                 self.assertEqual(client.download_calls, [])
                 self.assertEqual(
                     (self.cache_root / "current.json").read_bytes(),

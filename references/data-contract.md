@@ -6,7 +6,7 @@
 {
   "status": "updated",
   "generation": {
-    "id": "synthetic-generation",
+    "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "generated_at": "2030-01-01T00:00:00Z",
     "checked_at": "2030-01-01T00:01:00Z",
     "stale": false
@@ -15,7 +15,7 @@
 }
 ```
 
-`status` refresh может быть `updated`, `not_modified` или `stale_cache`. При `stale_cache` поле `generation.stale` равно `true`, а `warnings` объясняет причину использования предыдущего поколения.
+`status` refresh может быть `updated`, `not_modified` или `stale_cache`. `generation.id` равен `content_generation_id` из manifest. `generation.checked_at` — время проверки машинного источника, опубликованное в manifest, а не время локального HTTP-запроса. При `stale_cache` поле `generation.stale` равно `true`, а `warnings` объясняет причину использования предыдущего поколения.
 
 Успешный поиск содержит:
 
@@ -30,9 +30,11 @@
 | `unknown_characteristics` | Неизвестные или отсутствующие свойства возвращённых товаров |
 | `warnings` | Предупреждения о свежести или ограничении вывода |
 
-Элемент `products` содержит `product_id`, `name`, `article`, `product_type`, известные `characteristics`, `total_quantity`, `minimum_price` и `offers`. Предложение содержит `supplier`, строковое `price`, `delivery_days` и `quantity`. `minimum_price` может быть `null`, если подходящих предложений нет.
+Элемент `products` содержит `product_id`, `name`, `article`, `product_type`, известные `characteristics`, `total_quantity`, `minimum_price` и `offers`. Предложение содержит `supplier`, строковое `price`, допускающее `null` поле `delivery_days` и целое `quantity`. `minimum_price` может быть `null`, если подходящих предложений нет.
 
-Целочисленные поля машинного источника `total_quantity`, `delivery_days` и `quantity` принимают неотрицательное JSON-целое либо каноническую десятичную строку: `0`, `7`, `+7`. Булевы значения, числа с плавающей точкой, отрицательные значения, пробелы, ведущие нули, десятичная точка и экспоненциальная запись отклоняются без округления или усечения.
+Публичная цена и фильтр `--max-price` используют только положительный `price_sale`. `price_input` проверяется как часть машинной строки, но никогда не выводится и не используется как fallback. Предложения без поставщика или без `price_sale` не попадают в публичную выдачу.
+
+Целочисленные поля машинного источника `total_quantity`, `delivery_days` и `quantity` принимают только JSON-целое в допустимом диапазоне; `delivery_days` также может быть `null`. Булевы значения, строки, числа с плавающей точкой и отрицательные значения отклоняются без округления или усечения.
 
 Поиск применяет публичный ресурсный контракт: не более 2 MiB на одну JSONL-запись без завершающего CR/LF, 5 000 000 строк товаров и 50 000 000 строк предложений. Основная SQLite-база spool ограничена 8 GiB и 55 000 000 сохранённых записей; отдельная SQLite temp-схема имеет такой же page budget 8 GiB. Оба ограничения `max_page_count` применяются только к страницам объектов соответствующих схем и сами по себе не ограничивают временные sorter-файлы SQLite. Лимит каждого загруженного файла поколения 16 GiB применяется раньше, при refresh. Превышение лимита исходных данных возвращает безопасный `manifest_invalid`, а исчерпание основного или temp-хранилища — `cache_unavailable`. Эти пределы не меняют точную сортировку выборки больше 10 000 товаров.
 
@@ -42,7 +44,9 @@
 
 Элемент `unknown_characteristics` содержит `product_id`, `characteristic` и `status`: `unknown` означает «неизвестно», `missing` — «нет данных». Не восстанавливай эти значения по названию или внешним источникам.
 
-`warnings` — массив объектов `code` и `message`. Код `output_truncated` означает, что `summary` остаётся полным, но `products` ограничен; менеджеру нужно предложить более узкие фильтры.
+Публичный словарь `characteristics` допускает ровно семь имён: `season`, `all_season`, `spikes`, `run_flat`, `disk_type`, `truck_axis`, `truck_construction`. Известные булевы значения проектируются в строки `Да` и `Нет`; `unknown` и `missing` не попадают в `characteristics`, а выносятся в `unknown_characteristics`. Источник не публикует структурированный типоразмер, поэтому `--size` с непустым значением возвращает `query_unsupported`.
+
+`warnings` — массив объектов `code` и `message`, а не один взаимоисключающий статус. `source_stale` означает, что `checked_at + stale_after_seconds` уже истекло. Он может сочетаться с причиной fallback, например `network_error`, `cache_locked` или `download_integrity_failed`. Код `output_truncated` означает, что `summary` остаётся полным, но `products` ограничен; менеджеру нужно предложить более узкие фильтры. В ответе менеджеру перечисляй все коды.
 
 Ошибка имеет безопасную форму:
 

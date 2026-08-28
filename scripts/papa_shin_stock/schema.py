@@ -16,11 +16,13 @@ from pathlib import Path
 from papa_shin_stock.cache import (
     GenerationFiles,
     GenerationSnapshot,
+    Manifest,
     load_runtime_status,
 )
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.query import SearchQuery, normalize_tire_size
+from papa_shin_stock.robotyre_v1 import offer_projection, product_projection
 from papa_shin_stock.validation import (
     MAX_PUBLIC_TEXT_CODEPOINTS,
     is_bounded_unicode_scalar,
@@ -58,7 +60,7 @@ def assert_generation(row: dict[str, object], expected: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Offer:
-    supplier: str; price: Decimal; delivery_days: int; quantity: int
+    supplier: str; price: Decimal; delivery_days: int | None; quantity: int
     def to_public_dict(self) -> dict[str, object]: return {"supplier": self.supplier, "price": _price_text(self.price), "delivery_days": self.delivery_days, "quantity": self.quantity}
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +217,7 @@ class _Spool:
                 "ON c(ho DESC,mp COLLATE decimal,q DESC,id);"
                 "CREATE TABLE o(id TEXT,s TEXT,p TEXT,d INTEGER,q INTEGER);"
                 "CREATE INDEX o_by_product_price_delivery_quantity "
-                "ON o(id,p COLLATE decimal,d,q DESC);"
+                "ON o(id,p COLLATE decimal,(d IS NULL),d,q DESC);"
             )
         except (
             sqlite3.Error,
@@ -382,7 +384,7 @@ class _Spool:
             deleted = self._connection().execute(
                 "DELETE FROM o WHERE id=? AND rowid NOT IN ("
                 "SELECT rowid FROM o WHERE id=? "
-                "ORDER BY p COLLATE decimal,d,q DESC LIMIT ?)",
+                "ORDER BY p COLLATE decimal,(d IS NULL),d,q DESC LIMIT ?)",
                 (ident, ident, limit),
             ).rowcount
             self._connection().execute(
@@ -415,7 +417,7 @@ class _Spool:
             products=[]; offers={}
             for row in rows:
                 product=Product(row[0],row[1],row[2],row[3],json.loads(row[4]),row[5],tuple(json.loads(row[6]))); products.append(product)
-                offers[product.product_id]=tuple(Offer(x[0],Decimal(x[1]),x[2],x[3]) for x in self._connection().execute("SELECT s,p,d,q FROM o WHERE id=? ORDER BY p COLLATE decimal,d,q DESC",(product.product_id,)))
+                offers[product.product_id]=tuple(Offer(x[0],Decimal(x[1]),x[2],x[3]) for x in self._connection().execute("SELECT s,p,d,q FROM o WHERE id=? ORDER BY p COLLATE decimal,(d IS NULL),d,q DESC",(product.product_id,)))
             return SearchSummary(count,total),tuple(products),offers
         except StockError: raise
         except (sqlite3.Error,OSError,ValueError,TypeError,OverflowError,RecursionError,InvalidOperation) as error: raise _spool_unavailable() from error
@@ -423,6 +425,12 @@ class _Spool:
 class StockSearcher:
     def __init__(self, files: GenerationFiles | GenerationSnapshot, config: StockConfig) -> None: self.files=files; self.config=config
     def search(self, query: SearchQuery) -> SearchResult:
+        if query.size is not None:
+            raise StockError(
+                "query_unsupported",
+                "Источник не публикует структурированный типоразмер",
+                4,
+            )
         with _Spool() as spool:
             generation,warnings=_generation(self.files)
             integrity = self.files.integrity
@@ -432,18 +440,21 @@ class StockSearcher:
                 integrity.products_bytes if integrity is not None else None,
                 integrity.products_sha256 if integrity is not None else None,
             ):
-                assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
-                if _match_product(product,row,query): spool.add_product(product)
+                projected=product_projection(row,self.files.generation_id)
+                product=Product(projected.product_id,projected.name,projected.article,projected.product_type,projected.characteristics,projected.total_quantity,projected.unknown_characteristics)
+                if _match_product(product,projected.filter_values,query): spool.add_product(product)
             for row in _rows(
                 ((self.files, "offers") if isinstance(self.files, GenerationSnapshot) else self.files.offers),
                 MAX_OFFER_ROWS,
                 integrity.offers_bytes if integrity is not None else None,
                 integrity.offers_sha256 if integrity is not None else None,
             ):
-                assert_generation(row,self.files.generation_id); ident=_offer_id(row,self.config.offer_product_id_field)
-                if spool.has(ident):
-                    offer=_offer(row)
-                    if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
+                projected=offer_projection(row,self.files.generation_id)
+                if projected is not None:
+                    ident=projected.product_id
+                    if spool.has(ident):
+                        offer=Offer(projected.supplier,projected.price,projected.delivery_days,projected.quantity)
+                        if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
             summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
 
 def _rows(
@@ -515,31 +526,39 @@ def _generation(files: GenerationFiles | GenerationSnapshot) -> tuple[dict[str,o
     try:
         manifest_payload=(files.manifest_payload if isinstance(files,GenerationSnapshot) else files.manifest.read_bytes())
         if files.integrity is not None and hashlib.sha256(manifest_payload).hexdigest()!=files.integrity.manifest_sha256: raise _cache_unavailable()
-        manifest=_parse(manifest_payload.decode("utf-8"))
+        manifest=Manifest.parse(manifest_payload)
     except (OSError,UnicodeError,ValueError,TypeError,OverflowError,RecursionError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
-    generated_at=manifest.get("generated_at") if isinstance(manifest,dict) else None
-    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not is_bounded_unicode_scalar(files.generation_id) or not is_iso_8601_timestamp(generated_at) or (files.integrity is not None and generated_at!=files.integrity.generated_at): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
+    generated_at=manifest.generated_at
+    if manifest.generation_id!=files.generation_id or not is_bounded_unicode_scalar(files.generation_id) or (files.integrity is not None and generated_at!=files.integrity.generated_at): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
     if isinstance(files,GenerationSnapshot):
-        checked_at=files.checked_at; stale=files.stale; code=files.warning_code
+        stale=files.stale; codes=files.warning_codes
     else:
         path=files.runtime_status or files.manifest.parent/"state.json"
         if path.exists() or files.runtime_status is not None:
             state=load_runtime_status(path,files.generation_id)
-            checked_at=state.checked_at; stale=state.stale; code=state.warning_code
+            stale=state.stale; codes=state.warning_codes
         else:
-            checked_at=generated_at; stale=False; code=None
-    return {"id":files.generation_id,"generated_at":generated_at,"checked_at":checked_at,"stale":stale}, (({"code":code,"message":"Используется предыдущее поколение"},) if stale and code is not None else ())
+            stale=False; codes=()
+    source_stale=manifest.source_is_stale()
+    merged=list(codes)
+    if source_stale and "source_stale" not in merged:merged.insert(0,"source_stale")
+    stale=stale or source_stale
+    warnings=tuple({"code":code,"message":("Источник давно не обновлялся" if code=="source_stale" else "Используется предыдущее поколение")} for code in merged)
+    return {"id":files.generation_id,"generated_at":generated_at,"checked_at":manifest.source_checked_at,"stale":stale}, warnings
 
 def _product(row: dict[str,object], ident: str) -> Product:
     chars=row.get("characteristics",{});
     if not isinstance(chars,dict): raise StockError("manifest_invalid","Некорректные данные товаров",3)
     public={k:_text(v) for k,v in chars.items() if k in _PUBLIC_CHARS and isinstance(v,str)}
     return Product(_text(ident),_text(row.get("name")),_text(row.get("article")),_text(row.get("product_type")),public,_int(row.get("total_quantity")),_unknown(ident,row,chars))
-def _match_product(p: Product,row: dict[str,object],q: SearchQuery) -> bool:
+def _match_product(p: Product,row: dict[str,str],q: SearchQuery) -> bool:
     if p.total_quantity<q.min_total_quantity:return False
-    if q.size is not None and (not isinstance(row.get("size"),str) or _source_tire_size(row["size"])!=q.size):return False
-    for field in ("product_type","season","spikes","run_flat","disk_type","truck_axis","truck_construction"):
+    for field in ("product_type","spikes","run_flat","disk_type","truck_axis","truck_construction"):
         if (wanted:=getattr(q,field)) is not None and (p.product_type if field=="product_type" else row.get(field))!=wanted:return False
+    if q.season is not None:
+        if q.season == "Всесезонная":
+            if row.get("all_season") != "Да":return False
+        elif row.get("season") != q.season:return False
     return True
 def _offer_id(row: dict[str,object],field:str)->str:
     value=row.get(field)
@@ -549,7 +568,7 @@ def _source_tire_size(value:str)->str:
     try:return normalize_tire_size(value)
     except StockError as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
 def _offer(row:dict[str,object])->Offer:return Offer(_text(row.get("supplier")),_decimal(row.get("price")),_int(row.get("delivery_days")),_int(row.get("quantity")))
-def _match_offer(o:Offer,q:SearchQuery)->bool:return (q.supplier is None or o.supplier==q.supplier) and (q.max_price is None or o.price<=q.max_price) and (q.max_delivery_days is None or o.delivery_days<=q.max_delivery_days)
+def _match_offer(o:Offer,q:SearchQuery)->bool:return (q.supplier is None or o.supplier==q.supplier) and (q.max_price is None or o.price<=q.max_price) and (q.max_delivery_days is None or (o.delivery_days is not None and o.delivery_days<=q.max_delivery_days))
 def _unknown(ident:str,row:dict[str,object],chars:dict[str,object])->tuple[dict[str,str],...]:
     result=[]
     for field,value in list((x,row.get(x)) for x in ("size","season","spikes","run_flat","disk_type","truck_axis","truck_construction"))+[(x,chars[x]) for x in sorted(_PUBLIC_CHARS) if x in chars]:
