@@ -332,7 +332,7 @@ class StockCacheTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "cache_unavailable"):
             cache_module._attest_cache_root(root, create=True)
 
-    def test_marker_inserted_during_initialization_is_quarantined_fail_closed(
+    def test_marker_inserted_during_initialization_is_preserved_fail_closed(
         self,
     ) -> None:
         root = Path(self.temp_dir.name) / "foreign-marker-race"
@@ -351,14 +351,79 @@ class StockCacheTest(unittest.TestCase):
             with self.assertRaisesRegex(StockError, "cache_unavailable"):
                 cache_module._attest_cache_root(root, create=True)
 
-        self.assertFalse(marker.exists())
-        conflicts = list(
-            root.glob(".papa-shin-stock-cache-root.conflict-*")
+        self.assertEqual(marker.read_bytes(), foreign_payload)
+        self.assertEqual(
+            list(root.glob(".papa-shin-stock-cache-root.conflict-*")), []
         )
-        self.assertEqual(len(conflicts), 1)
-        self.assertEqual(conflicts[0].read_bytes(), foreign_payload)
-        with self.assertRaisesRegex(StockError, "cache_unavailable"):
-            cache_module._attest_cache_root(root, create=True)
+
+    def test_initializer_temp_replacement_is_preserved_fail_closed(self) -> None:
+        root = Path(self.temp_dir.name) / "initializer-temp-replacement"
+        root.mkdir(mode=0o755)
+        foreign_payload = b"foreign initializer replacement"
+        replacement_name: str | None = None
+
+        def replace_initializer_temp_then_fail(
+            source: str,
+            destination: str,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replacement_name
+            self.assertEqual(destination, ".papa-shin-stock-cache-root.json")
+            descriptor = kwargs["src_dir_fd"]
+            self.assertIsInstance(descriptor, int)
+            os.unlink(source, dir_fd=descriptor)
+            replacement_descriptor = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=descriptor,
+            )
+            try:
+                os.write(replacement_descriptor, foreign_payload)
+            finally:
+                os.close(replacement_descriptor)
+            replacement_name = source
+            raise OSError(errno.EIO, "synthetic publication failure")
+
+        with patch.object(
+            cache_module.os,
+            "link",
+            side_effect=replace_initializer_temp_then_fail,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        self.assertIsNotNone(replacement_name)
+        self.assertEqual((root / replacement_name).read_bytes(), foreign_payload)
+        self.assertFalse((root / ".papa-shin-stock-cache-root.json").exists())
+
+    def test_insertion_after_root_hardening_blocks_initialization(self) -> None:
+        root = Path(self.temp_dir.name) / "late-post-hardening-insertion"
+        root.mkdir(mode=0o755)
+        victim = root / "generations" / "generation-victim"
+        marker = victim / "must-survive.txt"
+        real_fchmod = os.fchmod
+        injected = False
+
+        def inject_after_root_hardening(descriptor: int, mode: int) -> None:
+            nonlocal injected
+            real_fchmod(descriptor, mode)
+            observed = os.fstat(descriptor)
+            if stat.S_ISDIR(observed.st_mode) and not injected:
+                injected = True
+                victim.mkdir(parents=True)
+                marker.write_text("safe", encoding="utf-8")
+
+        with patch.object(
+            cache_module.os,
+            "fchmod",
+            side_effect=inject_after_root_hardening,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._attest_cache_root(root, create=True)
+
+        self.assertTrue(injected)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
 
     @unittest.skipUnless(os.name == "posix", "FD accounting проверяется на POSIX")
     def test_failed_final_attestation_does_not_leak_root_descriptor(self) -> None:
