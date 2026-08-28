@@ -525,11 +525,12 @@ class _PrivateDownloadDestination:
             self.identity, observed
         ):
             raise _cache_unavailable()
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
+        removed = _unlink_private_regular_file_if_owned(
+            self.path,
+            self.identity,
+        )
+        if not removed and not missing_ok:
+            raise _cache_unavailable()
 
     def assert_path_owned(self) -> None:
         if self.descriptor < 0:
@@ -716,35 +717,85 @@ class CacheLock:
         token: str,
         identity: tuple[int, int],
     ) -> bool:
-        if cls._directory_fencing_identity(path) != identity:
+        root = path.parent
+        root_descriptor = _open_private_directory(root)
+        if root_descriptor is None:
             return False
-        observed = cls._read_owner(path)
-        if observed is None or observed[0] != token:
-            return False
-        quarantine = path.with_name(
-            f"{path.name}.abort-{token}-{uuid.uuid4().hex}"
-        )
         try:
-            os.rename(path, quarantine)
-        except OSError:
-            return False
-        if cls._directory_fencing_identity(quarantine) != identity:
+            canonical = _lstat_private_child(
+                root_descriptor,
+                root,
+                path.name,
+                missing_ok=True,
+            )
+            if (
+                canonical is None
+                or not stat.S_ISDIR(canonical.st_mode)
+                or (canonical.st_dev, canonical.st_ino) != identity
+            ):
+                return False
+            observed = cls._read_owner(path)
+            if observed is None or observed[0] != token:
+                return False
+            quarantine = path.with_name(
+                f"{path.name}.abort-{token}-{uuid.uuid4().hex}"
+            )
             try:
-                if _lstat_optional(path) is None:
-                    os.rename(quarantine, path)
-            except (OSError, StockError):
-                pass
+                os.rename(
+                    path.name,
+                    quarantine.name,
+                    src_dir_fd=root_descriptor,
+                    dst_dir_fd=root_descriptor,
+                )
+            except OSError:
+                return False
+            moved_identity = _lstat_private_child(
+                root_descriptor,
+                root,
+                quarantine.name,
+                missing_ok=True,
+            )
+            if (
+                moved_identity is None
+                or not stat.S_ISDIR(moved_identity.st_mode)
+                or (moved_identity.st_dev, moved_identity.st_ino) != identity
+            ):
+                _restore_private_quarantine(
+                    root_descriptor,
+                    root,
+                    path.name,
+                    quarantine.name,
+                )
+                return False
+            moved_owner = cls._read_owner(quarantine)
+            if moved_owner is None or moved_owner[0] != token:
+                _restore_private_quarantine(
+                    root_descriptor,
+                    root,
+                    path.name,
+                    quarantine.name,
+                )
+                return False
+            removed = _remove_private_child_directory(
+                root_descriptor,
+                root,
+                quarantine.name,
+                moved_identity,
+            )
+            remaining = _lstat_private_child(
+                root_descriptor,
+                root,
+                quarantine.name,
+                missing_ok=True,
+            )
+            return removed and remaining is None
+        except (OSError, StockError):
             return False
-        moved = cls._read_owner(quarantine)
-        if moved is None or moved[0] != token:
+        finally:
             try:
-                if _lstat_optional(path) is None:
-                    os.rename(quarantine, path)
-            except (OSError, StockError):
+                os.close(root_descriptor)
+            except OSError:
                 pass
-            return False
-        _remove_private_directory(quarantine)
-        return _lstat_optional(quarantine) is None
 
     @classmethod
     def _reclaim_stale(cls, path: Path) -> bool:
@@ -1348,8 +1399,16 @@ class StockCache:
         if current_runtime != expected_runtime:
             return
         if previous_pointer is None:
-            current_path.unlink(missing_ok=True)
-            _fsync_directory(current_path.parent)
+            observed_current = _lstat_optional(current_path)
+            if (
+                observed_current is not None
+                and stat.S_ISREG(observed_current.st_mode)
+                and _unlink_private_regular_file_if_owned(
+                    current_path,
+                    observed_current,
+                )
+            ):
+                _fsync_directory(current_path.parent)
             return
         _write_bytes_atomic(current_path, previous_pointer)
 
@@ -2480,7 +2539,7 @@ def _restore_private_quarantine(
         if current is not None or quarantine is None:
             return
         if parent_descriptor is None:
-            os.rename(parent / quarantine_name, parent / name)
+            return
         else:
             os.rename(
                 quarantine_name,
@@ -2509,15 +2568,62 @@ def _unlink_private_child_regular_file(
         raise _cache_unavailable()
     if not _directory_path_matches_descriptor(parent, parent_descriptor):
         raise _cache_unavailable()
+    if parent_descriptor is None:
+        raise _cache_unavailable()
     try:
-        if parent_descriptor is None:
-            (parent / name).unlink()
-        else:
-            os.unlink(name, dir_fd=parent_descriptor)
+        os.unlink(name, dir_fd=parent_descriptor)
     except FileNotFoundError:
         return
     except OSError as error:
         raise _cache_unavailable() from error
+
+
+def _open_private_parent_directory_for_cleanup(parent: Path) -> int | None:
+    if os.name != "posix":
+        return None
+    return _open_directory_descriptor_without_hardening(parent)
+
+
+def _unlink_private_regular_file_if_owned(
+    path: Path,
+    expected: os.stat_result,
+) -> bool:
+    parent_descriptor: int | None = None
+    try:
+        parent_descriptor = _open_private_parent_directory_for_cleanup(path.parent)
+        if parent_descriptor is None:
+            return False
+        observed = _lstat_private_child(
+            parent_descriptor,
+            path.parent,
+            path.name,
+            missing_ok=True,
+        )
+        if observed is None:
+            return True
+        if not stat.S_ISREG(observed.st_mode) or not _same_file_identity(
+            expected, observed
+        ):
+            return False
+        _unlink_private_child_regular_file(
+            parent_descriptor,
+            path.parent,
+            path.name,
+            observed,
+        )
+        return (
+            _lstat_private_child(
+                parent_descriptor,
+                path.parent,
+                path.name,
+                missing_ok=True,
+            )
+            is None
+        )
+    except (OSError, StockError):
+        return False
+    finally:
+        _close_optional_descriptor(parent_descriptor)
 
 
 def _remove_private_cache_generation(root: Path, directory: Path) -> bool:
@@ -2784,7 +2890,14 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
         os.close(descriptor)
         _fsync_directory(path.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        observed_temporary = _lstat_optional(temporary)
+        if observed_temporary is not None and stat.S_ISREG(
+            observed_temporary.st_mode
+        ):
+            _unlink_private_regular_file_if_owned(
+                temporary,
+                observed_temporary,
+            )
 
 
 def _write_bytes_fsync(path: Path, payload: bytes) -> None:

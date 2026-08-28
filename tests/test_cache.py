@@ -585,6 +585,67 @@ class StockCacheTest(unittest.TestCase):
         self.addCleanup(replacement.release)
         replacement.assert_owned()
 
+    @unittest.skipUnless(os.name == "posix", "Directory FD cleanup проверяется на POSIX")
+    def test_post_publish_cleanup_does_not_delete_through_swapped_cache_root(
+        self,
+    ) -> None:
+        canonical = self.cache_root / ".refresh.lock"
+        parked_root = Path(self.temp_dir.name) / "parked-cache-root"
+        real_fsync_directory = cache_module._fsync_directory
+        real_read_owner = CacheLock._read_owner
+        external_marker: Path | None = None
+        fsync_failed = False
+        root_swapped = False
+
+        def fail_once_after_publish(path: Path) -> None:
+            nonlocal fsync_failed
+            if path == self.cache_root and canonical.is_dir() and not fsync_failed:
+                fsync_failed = True
+                raise OSError("primary post-publish failure")
+            real_fsync_directory(path)
+
+        def swap_root_after_quarantine_attestation(
+            path: Path,
+        ) -> tuple[str, float] | None:
+            nonlocal external_marker, root_swapped
+            observed = real_read_owner(path)
+            if (
+                observed is not None
+                and not root_swapped
+                and path.name.startswith(".refresh.lock.abort-")
+            ):
+                root_swapped = True
+                os.rename(self.cache_root, parked_root)
+                self.cache_root.mkdir(mode=0o700)
+                external_quarantine = self.cache_root / path.name
+                external_quarantine.mkdir(mode=0o700)
+                external_marker = external_quarantine / "must-survive.txt"
+                external_marker.write_text("safe", encoding="utf-8")
+            return observed
+
+        with patch.object(
+            cache_module,
+            "_fsync_directory",
+            side_effect=fail_once_after_publish,
+        ):
+            with patch.object(
+                CacheLock,
+                "_read_owner",
+                side_effect=swap_root_after_quarantine_attestation,
+            ):
+                with self.assertRaisesRegex(OSError, "primary post-publish failure"):
+                    CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(fsync_failed)
+        self.assertTrue(root_swapped)
+        self.assertIsNotNone(external_marker)
+        self.assertTrue(external_marker.is_file())
+        self.assertEqual(external_marker.read_text(encoding="utf-8"), "safe")
+        self.assertTrue(
+            any(parked_root.glob(".refresh.lock.abort-*")),
+            "Owned quarantine may be safely retained after root identity loss",
+        )
+
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_load_hardens_existing_private_cache_artifacts(self) -> None:
         self.fixture.seed_generation()
@@ -813,6 +874,53 @@ class StockCacheTest(unittest.TestCase):
         self.assertFalse(removed)
         self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
 
+    def test_runtime_status_unlink_without_directory_fd_fails_closed_on_root_swap(
+        self,
+    ) -> None:
+        root = Path(self.temp_dir.name) / "runtime-root"
+        root.mkdir(mode=0o700)
+        status = root / ".runtime-status-generation-a.json"
+        status.write_text("owned", encoding="utf-8")
+        observed = status.lstat()
+        parked_root = Path(self.temp_dir.name) / "parked-runtime-root"
+        external_root = Path(self.temp_dir.name) / "external-runtime-root"
+        external_root.mkdir(mode=0o700)
+        external_status = external_root / status.name
+        external_status.write_text("safe", encoding="utf-8")
+        real_unlink = Path.unlink
+        swapped = False
+
+        def swap_root_before_path_unlink(
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal swapped
+            if path == status and not swapped:
+                swapped = True
+                os.rename(root, parked_root)
+                os.rename(external_root, root)
+            real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", swap_root_before_path_unlink):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._unlink_private_child_regular_file(
+                    None,
+                    root,
+                    status.name,
+                    observed,
+                )
+
+        self.assertFalse(swapped)
+        self.assertEqual(
+            (root / status.name).read_text(encoding="utf-8"),
+            "owned",
+        )
+        self.assertEqual(
+            (external_root / status.name).read_text(encoding="utf-8"),
+            "safe",
+        )
+
     @unittest.skipUnless(os.name == "posix", "Directory FD deletion проверяется на POSIX")
     def test_cleanup_rejects_directory_injected_after_quarantine_rename(
         self,
@@ -880,6 +988,25 @@ class StockCacheTest(unittest.TestCase):
                 side_effect=AssertionError("Windows cannot portably open directories"),
             ):
                 cache_module._ensure_private_directory(self.cache_root)
+
+    def test_download_cleanup_without_parent_directory_fd_retains_owned_file(
+        self,
+    ) -> None:
+        path = self.cache_root / "partial-download.jsonl"
+        destination = cache_module._PrivateDownloadDestination(path)
+        self.addCleanup(destination.close)
+        destination.write_bytes(b"partial")
+
+        with patch.object(
+            cache_module,
+            "_open_private_parent_directory_for_cleanup",
+            return_value=None,
+            create=True,
+        ):
+            destination.unlink(missing_ok=True)
+
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_bytes(), b"partial")
 
     def test_windows_311_directory_reparse_point_is_rejected_without_is_junction(
         self,
