@@ -39,6 +39,7 @@ import search_stock
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+EXTREME_JSON_FLOAT = "1e99999999999999999999999999999999999999999999"
 
 
 class StockSearchTest(unittest.TestCase):
@@ -2061,6 +2062,44 @@ class SqliteFailureNormalizationTest(unittest.TestCase):
 
 
 class SearchStockCliTest(unittest.TestCase):
+    def _run_generation_cli(
+        self,
+        *,
+        manifest: bytes,
+        products: bytes,
+        offers: bytes,
+    ) -> tuple[int, str, str, str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary) / "synthetic-generation"
+            generation.mkdir()
+            (generation / "manifest.json").write_bytes(manifest)
+            (generation / "products.jsonl").write_bytes(products)
+            (generation / "offers.jsonl").write_bytes(offers)
+            files = GenerationFiles.from_directory(
+                "synthetic-generation", generation
+            )
+            config = StockConfig(
+                manifest_url="https://stock.example.test/manifest.json",
+                username="synthetic-user",
+                password="synthetic-password",
+                product_id_field="private_product_key",
+                offer_product_id_field="private_offer_product_key",
+                cache_dir=Path(temporary) / "cache",
+            )
+            output = StringIO()
+            errors = StringIO()
+
+            with patch.object(search_stock.StockConfig, "load", return_value=config):
+                with patch.object(
+                    search_stock.StockCache,
+                    "current_generation",
+                    return_value=files,
+                ):
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = search_stock.main([])
+
+            return exit_code, output.getvalue(), errors.getvalue(), temporary
+
     def test_success_writes_one_public_json_document(self) -> None:
         output = StringIO()
         public_result = {
@@ -2145,6 +2184,70 @@ class SearchStockCliTest(unittest.TestCase):
                 "error": {
                     "code": "manifest_invalid",
                     "message": "Некорректные машинные данные",
+                },
+            },
+        )
+
+    def test_extreme_numeric_jsonl_price_is_one_safe_json_error_without_stderr(
+        self,
+    ) -> None:
+        offer = (
+            '{"private_offer_product_key":"synthetic-summer-a",'
+            '"content_generation_id":"synthetic-generation",'
+            '"supplier":"Synthetic","price":'
+            f"{EXTREME_JSON_FLOAT},"
+            '"delivery_days":1,"quantity":1}\n'
+        ).encode("ascii")
+
+        exit_code, output, errors, private_path = self._run_generation_cli(
+            manifest=(FIXTURES_DIR / "manifest.json").read_bytes(),
+            products=(FIXTURES_DIR / "products.jsonl").read_bytes(),
+            offers=offer,
+        )
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(output.count("\n"), 1)
+        self.assertEqual(errors, "")
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn(private_path, output)
+        self.assertEqual(
+            json.loads(output),
+            {
+                "status": "error",
+                "error": {
+                    "code": "manifest_invalid",
+                    "message": "Некорректные машинные данные",
+                },
+            },
+        )
+
+    def test_extreme_numeric_manifest_extra_field_is_one_safe_json_error_without_stderr(
+        self,
+    ) -> None:
+        manifest = (
+            '{"generation_id":"synthetic-generation",'
+            '"generated_at":"2026-08-27T10:00:00+00:00",'
+            f'"extra":{EXTREME_JSON_FLOAT}}}'
+        ).encode("ascii")
+
+        exit_code, output, errors, private_path = self._run_generation_cli(
+            manifest=manifest,
+            products=(FIXTURES_DIR / "products.jsonl").read_bytes(),
+            offers=(FIXTURES_DIR / "offers.jsonl").read_bytes(),
+        )
+
+        self.assertEqual(exit_code, 7)
+        self.assertEqual(output.count("\n"), 1)
+        self.assertEqual(errors, "")
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn(private_path, output)
+        self.assertEqual(
+            json.loads(output),
+            {
+                "status": "error",
+                "error": {
+                    "code": "cache_unavailable",
+                    "message": "Проверенный кэш недоступен",
                 },
             },
         )

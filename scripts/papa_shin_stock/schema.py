@@ -10,7 +10,7 @@ import sqlite3
 import tempfile
 import threading
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 
 from papa_shin_stock.cache import (
@@ -571,8 +571,11 @@ def _decimal_compare(a:str,b:str)->int:return (_decimal(a)>_decimal(b))-(_decima
 def _public_size(value:object)->int:return len(json.dumps(value,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
 def _spool_unavailable()->StockError:return StockError("cache_unavailable","Временное хранилище поиска недоступно",7)
 def _cache_unavailable()->StockError:return StockError("cache_unavailable","Проверенный кэш недоступен",7)
+def _parse_decimal_float(value:str)->Decimal:
+    try:return Decimal(value)
+    except DecimalException as error:raise ValueError("invalid decimal") from error
 def _parse(value:str)->object:
-    parsed=json.loads(value,object_pairs_hook=_unique,parse_float=Decimal,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
+    parsed=json.loads(value,object_pairs_hook=_unique,parse_float=_parse_decimal_float,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
 def _finite(value:object)->None:
     if isinstance(value,Decimal) and (not value.is_finite() or (not value.is_zero() and abs(value.adjusted())>128)): raise ValueError("non-finite")
     if isinstance(value,dict):
