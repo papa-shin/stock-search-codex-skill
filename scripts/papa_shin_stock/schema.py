@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -20,10 +20,15 @@ from papa_shin_stock.cache import (
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.query import SearchQuery, normalize_tire_size
+from papa_shin_stock.validation import (
+    MAX_PUBLIC_TEXT_CODEPOINTS,
+    is_bounded_unicode_scalar,
+    is_iso_8601_timestamp,
+)
 
 _UNKNOWN = {"unknown", "missing"}
 _PUBLIC_CHARS = {"load_index", "speed_index"}
-_MAX_TEXT = 256
+_MAX_TEXT = MAX_PUBLIC_TEXT_CODEPOINTS
 _MAX_OUTPUT = 512 * 1024
 
 # Public machine-data resource contract. A JSONL record limit excludes CR/LF.
@@ -419,24 +424,47 @@ class StockSearcher:
     def search(self, query: SearchQuery) -> SearchResult:
         with _Spool() as spool:
             generation,warnings=_generation(self.files)
-            for row in _rows(self.files.products, MAX_PRODUCT_ROWS):
+            integrity = self.files.integrity
+            for row in _rows(
+                self.files.products,
+                MAX_PRODUCT_ROWS,
+                integrity.products_bytes if integrity is not None else None,
+                integrity.products_sha256 if integrity is not None else None,
+            ):
                 assert_generation(row,self.files.generation_id); product=_product(row,self.config.resolve_product_id(row))
                 if _match_product(product,row,query): spool.add_product(product)
-            for row in _rows(self.files.offers, MAX_OFFER_ROWS):
+            for row in _rows(
+                self.files.offers,
+                MAX_OFFER_ROWS,
+                integrity.offers_bytes if integrity is not None else None,
+                integrity.offers_sha256 if integrity is not None else None,
+            ):
                 assert_generation(row,self.files.generation_id); ident=_offer_id(row,self.config.offer_product_id_field)
                 if spool.has(ident):
                     offer=_offer(row)
                     if _match_offer(offer,query): spool.add_offer(ident,offer,query.offers_limit)
             summary,products,offers=spool.result(query); return SearchResult(generation,query.public_filters(),summary,products,offers,warnings)
 
-def _rows(path: Path, maximum_rows: int):
+def _rows(
+    path: Path,
+    maximum_rows: int,
+    expected_bytes: int | None = None,
+    expected_sha256: str | None = None,
+):
     try:
+        if (expected_bytes is None) != (expected_sha256 is None):
+            raise _cache_unavailable()
+        digest = hashlib.sha256() if expected_sha256 is not None else None
+        received = 0
         with path.open("rb") as stream:
             row_count = 0
             while True:
                 raw = stream.readline(MAX_JSONL_LINE_BYTES + 2)
                 if not raw:
                     break
+                received += len(raw)
+                if digest is not None:
+                    digest.update(raw)
                 row_count += 1
                 if row_count > maximum_rows:
                     raise StockError(
@@ -468,14 +496,23 @@ def _rows(path: Path, maximum_rows: int):
                             "manifest_invalid", "Некорректные машинные данные", 3
                         )
                     yield value
+        if expected_bytes is not None and (
+            received != expected_bytes
+            or digest is None
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise _cache_unavailable()
     except StockError: raise
     except OSError as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
 
 def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str,str],...]]:
-    try: manifest=_parse(files.manifest.read_text(encoding="utf-8"))
+    try:
+        manifest_payload=files.manifest.read_bytes()
+        if files.integrity is not None and hashlib.sha256(manifest_payload).hexdigest()!=files.integrity.manifest_sha256: raise _cache_unavailable()
+        manifest=_parse(manifest_payload.decode("utf-8"))
     except (OSError,UnicodeError,ValueError,TypeError,OverflowError,RecursionError) as error: raise StockError("cache_unavailable","Проверенный кэш недоступен",7) from error
     generated_at=manifest.get("generated_at") if isinstance(manifest,dict) else None
-    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not isinstance(generated_at,str) or not generated_at or len(generated_at)>_MAX_TEXT: raise StockError("generation_mismatch","Поколение данных не согласовано",5)
+    if not isinstance(manifest,dict) or manifest.get("generation_id")!=files.generation_id or not is_bounded_unicode_scalar(files.generation_id) or not is_iso_8601_timestamp(generated_at) or (files.integrity is not None and generated_at!=files.integrity.generated_at): raise StockError("generation_mismatch","Поколение данных не согласовано",5)
     path=files.runtime_status or files.manifest.parent/"state.json"
     if path.exists() or files.runtime_status is not None:
         state=load_runtime_status(path,files.generation_id)
@@ -487,8 +524,8 @@ def _generation(files: GenerationFiles) -> tuple[dict[str,object],tuple[dict[str
 def _product(row: dict[str,object], ident: str) -> Product:
     chars=row.get("characteristics",{});
     if not isinstance(chars,dict): raise StockError("manifest_invalid","Некорректные данные товаров",3)
-    public={k:v for k,v in chars.items() if k in _PUBLIC_CHARS and isinstance(v,str) and len(v)<=_MAX_TEXT}
-    return Product(ident,_text(row.get("name")),_text(row.get("article")),_text(row.get("product_type")),public,_int(row.get("total_quantity")),_unknown(ident,row,chars))
+    public={k:_text(v) for k,v in chars.items() if k in _PUBLIC_CHARS and isinstance(v,str)}
+    return Product(_text(ident),_text(row.get("name")),_text(row.get("article")),_text(row.get("product_type")),public,_int(row.get("total_quantity")),_unknown(ident,row,chars))
 def _match_product(p: Product,row: dict[str,object],q: SearchQuery) -> bool:
     if p.total_quantity<q.min_total_quantity:return False
     if q.size is not None and (not isinstance(row.get("size"),str) or normalize_tire_size(row["size"])!=q.size):return False
@@ -507,7 +544,8 @@ def _unknown(ident:str,row:dict[str,object],chars:dict[str,object])->tuple[dict[
         if isinstance(value,dict) and value.get("status") in _UNKNOWN:result.append({"product_id":ident,"characteristic":field,"status":value["status"]})
     return tuple(result)
 def _text(value:object)->str:
-    if not isinstance(value,str) or not value or len(value)>_MAX_TEXT:raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    if not is_bounded_unicode_scalar(value,maximum=_MAX_TEXT):raise StockError("manifest_invalid","Некорректные машинные данные",3)
+    assert isinstance(value,str)
     return value
 def _int(value:object)->int:
     if type(value) is int:
@@ -524,7 +562,7 @@ def _int(value:object)->int:
     if result<0:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return result
 def _decimal(value:object)->Decimal:
-    try: result=Decimal(str(value))
+    try: result=value if isinstance(value,Decimal) else Decimal(str(value))
     except (InvalidOperation,TypeError,ValueError) as error:raise StockError("manifest_invalid","Некорректные машинные данные",3) from error
     if not result.is_finite() or result<0 or abs(result.adjusted())>128:raise StockError("manifest_invalid","Некорректные машинные данные",3)
     return result
@@ -532,10 +570,11 @@ def _price_text(value:Decimal)->str:return format(value,"f")
 def _decimal_compare(a:str,b:str)->int:return (_decimal(a)>_decimal(b))-(_decimal(a)<_decimal(b))
 def _public_size(value:object)->int:return len(json.dumps(value,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
 def _spool_unavailable()->StockError:return StockError("cache_unavailable","Временное хранилище поиска недоступно",7)
+def _cache_unavailable()->StockError:return StockError("cache_unavailable","Проверенный кэш недоступен",7)
 def _parse(value:str)->object:
-    parsed=json.loads(value,object_pairs_hook=_unique,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
+    parsed=json.loads(value,object_pairs_hook=_unique,parse_float=Decimal,parse_constant=lambda _:(_ for _ in ()).throw(ValueError("non-finite"))); _finite(parsed); return parsed
 def _finite(value:object)->None:
-    if isinstance(value,float) and not math.isfinite(value): raise ValueError("non-finite")
+    if isinstance(value,Decimal) and (not value.is_finite() or (not value.is_zero() and abs(value.adjusted())>128)): raise ValueError("non-finite")
     if isinstance(value,dict):
         for item in value.values(): _finite(item)
     elif isinstance(value,list):

@@ -33,6 +33,10 @@ except ImportError:  # pragma: no cover - POSIX only
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
 from papa_shin_stock.http_client import HttpResponse, SafeHttpClient
+from papa_shin_stock.validation import (
+    is_bounded_unicode_scalar,
+    is_iso_8601_timestamp,
+)
 
 
 _LOCK_TTL_SECONDS = 30 * 60
@@ -48,6 +52,12 @@ _RUNTIME_STATUS_TEMP = re.compile(
     r"\.json\.[0-9a-f]{32}\.tmp\Z"
 )
 _LOCK_INIT_DIRECTORY = re.compile(r"\.refresh\.lock\.init-[0-9a-f]{32}\Z")
+_GENERATION_DELETE_QUARANTINE = re.compile(
+    r"\.(?:generation-[A-Za-z0-9][A-Za-z0-9._-]*|\.staging-[0-9a-f]{32})"
+    r"\.delete-[0-9a-f]{32}\Z"
+)
+_GENERATION_QUARANTINE_SETTLE_ATTEMPTS = 3
+_GENERATION_QUARANTINE_SETTLE_SECONDS = 0.01
 _MAX_STATUS_TEXT = 256
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
@@ -96,12 +106,23 @@ def _windows_filesystem() -> Any:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationIntegrity:
+    manifest_sha256: str
+    generated_at: str
+    products_bytes: int
+    products_sha256: str
+    offers_bytes: int
+    offers_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationFiles:
     generation_id: str
     manifest: Path
     products: Path
     offers: Path
     runtime_status: Path | None = None
+    integrity: GenerationIntegrity | None = None
 
     @classmethod
     def from_directory(
@@ -109,6 +130,7 @@ class GenerationFiles:
         generation_id: str,
         directory: Path,
         runtime_status: Path | None = None,
+        integrity: GenerationIntegrity | None = None,
     ) -> "GenerationFiles":
         return cls(
             generation_id=generation_id,
@@ -116,6 +138,7 @@ class GenerationFiles:
             products=directory / "products.jsonl",
             offers=directory / "offers.jsonl",
             runtime_status=runtime_status,
+            integrity=integrity,
         )
 
     def assert_readable(self) -> None:
@@ -482,10 +505,28 @@ class CacheState:
             return state
 
     @classmethod
+    def load_for_search(cls, cache_dir: Path) -> "CacheState | None":
+        if _lstat_optional(cache_dir) is None:
+            return None
+        if _is_native_windows():
+            return cls._load_windows(cache_dir, verify_payloads=False)
+        with _attest_cache_root(cache_dir, create=False) as attestation:
+            state = cls._load_attested(
+                cache_dir,
+                None,
+                attestation,
+                verify_payloads=False,
+            )
+            attestation.assert_current()
+            return state
+
+    @classmethod
     def _load_windows(
         cls,
         cache_dir: Path,
         progress: Callable[[], None] | None = None,
+        *,
+        verify_payloads: bool = True,
     ) -> "CacheState | None":
         try:
             with _attest_cache_root(cache_dir, create=False) as attestation:
@@ -517,20 +558,21 @@ class CacheState:
                 manifest = Manifest.parse(manifest_payload)
                 if manifest.generation_id != pointer.generation_id:
                     raise _cache_unavailable()
-                session.verify_file(
-                    generation_parts,
-                    "products.jsonl",
-                    expected_bytes=manifest.products.bytes,
-                    expected_sha256=manifest.products.sha256,
-                    progress=progress,
-                )
-                session.verify_file(
-                    generation_parts,
-                    "offers.jsonl",
-                    expected_bytes=manifest.offers.bytes,
-                    expected_sha256=manifest.offers.sha256,
-                    progress=progress,
-                )
+                if verify_payloads:
+                    session.verify_file(
+                        generation_parts,
+                        "products.jsonl",
+                        expected_bytes=manifest.products.bytes,
+                        expected_sha256=manifest.products.sha256,
+                        progress=progress,
+                    )
+                    session.verify_file(
+                        generation_parts,
+                        "offers.jsonl",
+                        expected_bytes=manifest.offers.bytes,
+                        expected_sha256=manifest.offers.sha256,
+                        progress=progress,
+                    )
                 value = _parse_windows_json(
                     session.read_file(
                         generation_parts,
@@ -547,7 +589,7 @@ class CacheState:
                 manifest_last_modified = value.get("manifest_last_modified")
                 if generation_id != pointer.generation_id:
                     raise _cache_unavailable()
-                if not isinstance(generated_at, str) or not generated_at:
+                if not is_iso_8601_timestamp(generated_at):
                     raise _cache_unavailable()
                 if not isinstance(checked_at, str) or not checked_at:
                     raise _cache_unavailable()
@@ -593,6 +635,7 @@ class CacheState:
                         pointer.generation_id,
                         cache_dir / "generations" / pointer.directory_name,
                         runtime_file,
+                        _generation_integrity(manifest),
                     ),
                     runtime_revision=runtime.revision,
                     stale=runtime.stale,
@@ -609,6 +652,8 @@ class CacheState:
         cache_dir: Path,
         progress: Callable[[], None] | None = None,
         root_attestation: CacheRootAttestation | None = None,
+        *,
+        verify_payloads: bool = True,
     ) -> "CacheState | None":
         if root_attestation is None:
             raise _cache_unavailable()
@@ -646,6 +691,7 @@ class CacheState:
                 generation_descriptor,
                 root_attestation,
                 progress,
+                verify_payloads,
             )
         finally:
             _close_optional_descriptor(
@@ -664,6 +710,7 @@ class CacheState:
         generation_descriptor: int,
         root_attestation: CacheRootAttestation,
         progress: Callable[[], None] | None,
+        verify_payloads: bool,
     ) -> "CacheState":
         files = GenerationFiles.from_directory(pointer.generation_id, generation)
         try:
@@ -677,12 +724,20 @@ class CacheState:
             )
             if manifest.generation_id != pointer.generation_id:
                 raise _cache_unavailable()
-            _verify_child_file(
-                generation_descriptor, "products.jsonl", manifest.products, progress
-            )
-            _verify_child_file(
-                generation_descriptor, "offers.jsonl", manifest.offers, progress
-            )
+            if verify_payloads:
+                _verify_child_file(
+                    generation_descriptor,
+                    "products.jsonl",
+                    manifest.products,
+                    progress,
+                )
+                _verify_child_file(
+                    generation_descriptor,
+                    "offers.jsonl",
+                    manifest.offers,
+                    progress,
+                )
+            files = replace(files, integrity=_generation_integrity(manifest))
         except StockError as error:
             if error.code == "cache_locked":
                 raise
@@ -715,7 +770,7 @@ class CacheState:
         manifest_last_modified = value.get("manifest_last_modified")
         if generation_id != pointer.generation_id:
             raise _cache_unavailable()
-        if not isinstance(generated_at, str) or not generated_at:
+        if not is_iso_8601_timestamp(generated_at):
             raise _cache_unavailable()
         if not isinstance(checked_at, str) or not checked_at:
             raise _cache_unavailable()
@@ -729,11 +784,7 @@ class CacheState:
             root_attestation, pointer.directory_name, pointer.generation_id
         )
         if runtime_status is not None and runtime_path is not None:
-            files = GenerationFiles.from_directory(
-                pointer.generation_id,
-                generation,
-                runtime_status=runtime_path,
-            )
+            files = replace(files, runtime_status=runtime_path)
         else:
             runtime_status = validate_runtime_status(value, pointer.generation_id)
         result = cls(
@@ -774,18 +825,16 @@ def validate_runtime_status(
     if generation_id != expected_generation_id:
         raise _cache_unavailable()
     if (
-        not isinstance(checked_at, str)
-        or not checked_at
-        or len(checked_at) > _MAX_STATUS_TEXT
+        not is_iso_8601_timestamp(checked_at)
     ):
         raise _cache_unavailable()
     if not isinstance(stale, bool):
         raise _cache_unavailable()
     if stale:
         if (
-            not isinstance(warning_code, str)
-            or not warning_code
-            or len(warning_code) > _MAX_STATUS_TEXT
+            not is_bounded_unicode_scalar(
+                warning_code, maximum=_MAX_STATUS_TEXT
+            )
         ):
             raise _cache_unavailable()
     elif warning_code is not None:
@@ -881,9 +930,9 @@ class Manifest:
         generation_id = value.get("generation_id")
         generated_at = value.get("generated_at")
         files = value.get("files")
-        if not isinstance(generation_id, str) or not generation_id:
+        if not is_bounded_unicode_scalar(generation_id):
             raise _manifest_invalid()
-        if not isinstance(generated_at, str) or not generated_at:
+        if not is_iso_8601_timestamp(generated_at):
             raise _manifest_invalid()
         if not isinstance(files, dict):
             raise _manifest_invalid()
@@ -894,6 +943,17 @@ class Manifest:
             offers=_manifest_file(files.get("offers")),
             body=body,
         )
+
+
+def _generation_integrity(manifest: Manifest) -> GenerationIntegrity:
+    return GenerationIntegrity(
+        manifest_sha256=hashlib.sha256(manifest.body).hexdigest(),
+        generated_at=manifest.generated_at,
+        products_bytes=manifest.products.bytes,
+        products_sha256=manifest.products.sha256,
+        offers_bytes=manifest.offers.bytes,
+        offers_sha256=manifest.offers.sha256,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2504,17 +2564,9 @@ class StockCache:
                     if previous is None:
                         raise _cache_unavailable()
                     lock.assert_owned()
-                    current = CacheState.load(self.root, lock.heartbeat)
-                    if (
-                        current is None
-                        or current.generation_id != previous.generation_id
-                        or current.directory_name != previous.directory_name
-                    ):
-                        raise StockError(
-                            "cache_locked", "Активное поколение кэша изменилось", 6
-                        )
-                    lock.assert_owned()
-                    current = self._record_runtime_status(current, False, None, lock)
+                    current = self._record_runtime_status(
+                        previous, False, None, lock
+                    )
                     return RefreshResult.from_state("not_modified", current)
                 if response.status != 200:
                     raise StockError(
@@ -2525,12 +2577,9 @@ class StockCache:
                 cleanup_warning = self._cleanup_inactive_generations(lock)
                 if cleanup_warning is not None:
                     if previous is not None:
-                        current = CacheState.load(self.root, lock.heartbeat)
-                        if current is None:
-                            raise _cache_unavailable()
                         lock.assert_owned()
                         current = self._record_runtime_status(
-                            current, True, cleanup_warning, lock
+                            previous, True, cleanup_warning, lock
                         )
                         return RefreshResult.from_state(
                             "stale_cache",
@@ -2659,14 +2708,9 @@ class StockCache:
         if response.status == 304:
             if previous is None:
                 raise _cache_unavailable()
-            current = CacheState.load(self.root, lock.heartbeat)
-            if current is None or not _same_generation(current, previous):
-                raise StockError(
-                    "cache_locked", "Активное поколение кэша изменилось", 6
-                )
             return RefreshResult.from_state(
                 "not_modified",
-                self._record_runtime_status_windows(current, False, None, lock),
+                self._record_runtime_status_windows(previous, False, None, lock),
             )
         if response.status != 200:
             raise StockError("network_error", "Не удалось получить manifest", 3)
@@ -2675,11 +2719,8 @@ class StockCache:
         if cleanup_warning is not None:
             if previous is None:
                 raise _cache_unavailable()
-            current = CacheState.load(self.root, lock.heartbeat)
-            if current is None:
-                raise _cache_unavailable()
             current = self._record_runtime_status_windows(
-                current, True, cleanup_warning, lock
+                previous, True, cleanup_warning, lock
             )
             return RefreshResult.from_state(
                 "stale_cache",
@@ -2707,10 +2748,14 @@ class StockCache:
         lock: "_WindowsCacheLock",
     ) -> CacheState:
         lock.assert_owned()
-        current = CacheState.load(self.root, lock.heartbeat)
-        if current is None or not _same_runtime_revision(current, state):
-            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         session = lock.session
+        pointer = self._load_current_pointer_windows_session(session)
+        if (
+            pointer is None
+            or pointer.generation_id != state.generation_id
+            or pointer.directory_name != state.directory_name
+        ):
+            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
         generation_ownership = _parse_windows_generation_ownership(
             session.read_file(
                 ("generations", state.directory_name),
@@ -2721,6 +2766,34 @@ class StockCache:
         )
         if generation_ownership.generation_id != state.generation_id:
             raise _cache_unavailable()
+        path = _runtime_status_path(self.root, state.directory_name)
+        previous_payload = session.read_optional_file(
+            (), path.name, _WINDOWS_RUNTIME_MAX_BYTES
+        )
+        if previous_payload is None:
+            if state.runtime_revision is not None:
+                raise StockError(
+                    "cache_locked", "Активное поколение кэша изменилось", 6
+                )
+        else:
+            current_status = _validate_windows_runtime_payload(
+                previous_payload,
+                expected_generation_id=state.generation_id,
+                expected_directory_name=state.directory_name,
+                expected_root_token=lock.root_attestation.ownership_token,
+                expected_generation_ownership_token=(
+                    generation_ownership.ownership_token
+                ),
+            )
+            if (
+                current_status.revision != state.runtime_revision
+                or current_status.checked_at != state.checked_at
+                or current_status.stale != state.stale
+                or current_status.warning_code != state.warning_code
+            ):
+                raise StockError(
+                    "cache_locked", "Активное поколение кэша изменилось", 6
+                )
         value = _windows_runtime_value(
             {
                 "generation_id": state.generation_id,
@@ -2739,10 +2812,6 @@ class StockCache:
         )
         expected_status = validate_runtime_status(value, state.generation_id)
         lock.assert_owned()
-        path = _runtime_status_path(self.root, state.directory_name)
-        previous_payload = session.read_optional_file(
-            (), path.name, _WINDOWS_RUNTIME_MAX_BYTES
-        )
         payload = _json_payload(value)
         session.replace_file_cas(
             (),
@@ -2751,7 +2820,14 @@ class StockCache:
             payload=payload,
         )
         lock.assert_owned()
-        if session.read_file((), path.name, _WINDOWS_RUNTIME_MAX_BYTES) != payload:
+        committed_pointer = self._load_current_pointer_windows_session(session)
+        if (
+            committed_pointer is None
+            or committed_pointer.generation_id != state.generation_id
+            or committed_pointer.directory_name != state.directory_name
+            or session.read_file((), path.name, _WINDOWS_RUNTIME_MAX_BYTES)
+            != payload
+        ):
             raise _cache_unavailable()
         return replace(
             state,
@@ -3068,7 +3144,19 @@ class StockCache:
             root_names = session.list_directory(())
             cleanup_incomplete = False
             if "generations" in root_names:
-                for name in session.list_directory(("generations",)):
+                generation_names = session.list_directory(("generations",))
+                for attempt in range(_GENERATION_QUARANTINE_SETTLE_ATTEMPTS):
+                    if not any(
+                        _GENERATION_DELETE_QUARANTINE.fullmatch(name)
+                        for name in generation_names
+                    ):
+                        break
+                    if attempt + 1 == _GENERATION_QUARANTINE_SETTLE_ATTEMPTS:
+                        return "cache_cleanup_incomplete"
+                    lock.heartbeat()
+                    time.sleep(_GENERATION_QUARANTINE_SETTLE_SECONDS)
+                    generation_names = session.list_directory(("generations",))
+                for name in generation_names:
                     lock.assert_owned()
                     pointer = self._load_current_pointer_windows_session(session)
                     if pointer is not None and name == pointer.directory_name:
@@ -3188,7 +3276,7 @@ class StockCache:
             return "cache_cleanup_incomplete"
 
     def current_generation(self) -> GenerationFiles:
-        state = CacheState.load(self.root)
+        state = CacheState.load_for_search(self.root)
         if state is None:
             raise _cache_unavailable()
         return state.files
@@ -3199,11 +3287,16 @@ class StockCache:
         stale: bool,
         warning_code: str | None,
         lock: CacheLock,
+        *,
+        verify_current: bool = False,
     ) -> CacheState:
         lock.assert_owned()
-        current = CacheState.load(self.root, lock.heartbeat)
-        if current is None or not _same_runtime_revision(current, state):
-            raise StockError("cache_locked", "Активное поколение кэша изменилось", 6)
+        if verify_current:
+            current = CacheState.load(self.root, lock.heartbeat)
+            if current is None or not _same_runtime_revision(current, state):
+                raise StockError(
+                    "cache_locked", "Активное поколение кэша изменилось", 6
+                )
         value = {
             "generation_id": state.generation_id,
             "checked_at": (
@@ -3263,7 +3356,11 @@ class StockCache:
             try:
                 with CacheLock.acquire(self.root) as lock:
                     persisted = self._record_runtime_status(
-                        state, True, warning_code, lock
+                        state,
+                        True,
+                        warning_code,
+                        lock,
+                        verify_current=True,
                     )
             except StockError as error:
                 if error.code != "cache_locked":
@@ -3723,6 +3820,19 @@ class StockCache:
                 generations, generations_descriptor
             ):
                 return "cache_cleanup_incomplete"
+            for attempt in range(_GENERATION_QUARANTINE_SETTLE_ATTEMPTS):
+                if not any(
+                    _GENERATION_DELETE_QUARANTINE.fullmatch(name)
+                    for name in generation_names
+                ):
+                    break
+                if attempt + 1 == _GENERATION_QUARANTINE_SETTLE_ATTEMPTS:
+                    return "cache_cleanup_incomplete"
+                lock.heartbeat()
+                time.sleep(_GENERATION_QUARANTINE_SETTLE_SECONDS)
+                generation_names = _list_private_directory(
+                    generations_descriptor, generations
+                )
             cleanup_incomplete = False
             for name in generation_names:
                 lock.assert_owned()

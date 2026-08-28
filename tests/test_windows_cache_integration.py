@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.test_cache import FakeHttpClient, manifest_bytes
+from tests.test_cache import CacheFixture, FakeHttpClient, manifest_bytes
 
 from papa_shin_stock import cache as cache_module
 from papa_shin_stock.cache import StockCache
@@ -878,6 +878,69 @@ class WindowsCacheWorkflowMockTest(unittest.TestCase):
 
         self.assertEqual(result.status, "stale_cache")
         self.assertEqual(result.generation_id, first.generation_id)
+        self.assertEqual(self._pointer_payload(), previous_pointer)
+
+    def test_post_rename_generation_cleanup_failure_blocks_redownload(self) -> None:
+        third_client = FakeHttpClient(
+            response=HttpResponse(
+                status=200,
+                headers={"ETag": '"generation-d"'},
+                body=manifest_bytes("generation-d"),
+            )
+        )
+
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            StockCache(self.root, FakeHttpClient()).refresh(self.config)
+            self.windows.flat_delete_failures_remaining = 1
+            second = StockCache(
+                self.root, self._generation_c_client()
+            ).refresh(self.config)
+            pointer_after_second = self._pointer_payload()
+            quarantines_after_second = sorted(
+                path.name
+                for path in (self.root / "generations").iterdir()
+                if ".delete-" in path.name
+            )
+
+            third = StockCache(self.root, third_client).refresh(self.config)
+
+        self.assertEqual(second.status, "updated")
+        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(third.status, "stale_cache")
+        self.assertEqual(third.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(self._pointer_payload(), pointer_after_second)
+        self.assertEqual(third_client.download_calls, [])
+        self.assertEqual(len(quarantines_after_second), 1)
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (self.root / "generations").iterdir()
+                if ".delete-" in path.name
+            ),
+            quarantines_after_second,
+        )
+
+    def test_shared_cache_fixture_preserves_previous_generation_on_corrupt_download(
+        self,
+    ) -> None:
+        with patch.object(
+            cache_module, "_is_native_windows", return_value=True
+        ), patch.object(
+            cache_module, "_windows_filesystem", return_value=self.windows
+        ):
+            CacheFixture(self.root).seed_generation()
+            previous_pointer = self._pointer_payload()
+            result = StockCache(
+                self.root,
+                self._generation_c_client(corrupt_products=True),
+            ).refresh(self.config)
+
+        self.assertEqual(result.status, "stale_cache")
+        self.assertEqual(result.generation_id, "generation-a")
         self.assertEqual(self._pointer_payload(), previous_pointer)
 
     def test_activation_failure_preserves_previous_pointer_and_generation(self) -> None:

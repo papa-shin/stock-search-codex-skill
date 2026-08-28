@@ -97,6 +97,10 @@ class StockSearchTest(unittest.TestCase):
             with self.assertRaisesRegex(StockError, "query_invalid"):
                 normalize_tire_size(value)
 
+    def test_public_query_filters_reject_lone_surrogates(self) -> None:
+        with self.assertRaisesRegex(StockError, "query_invalid"):
+            self.search(supplier="\ud800")
+
     def test_tiny_decimal_exponent_is_safe_query_error(self) -> None:
         with self.assertRaisesRegex(StockError, "query_invalid"):
             self.search(max_price="1e-600000")
@@ -199,10 +203,104 @@ class StockSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(StockError, "generation_mismatch"):
             self.search()
 
+    def test_search_uses_same_generated_at_contract_as_refresh(self) -> None:
+        manifest_path = self.files.manifest
+        baseline = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        for invalid in ("2" * 257, "\ud800", "not-an-iso-8601-timestamp"):
+            with self.subTest(invalid=ascii(invalid)):
+                manifest = dict(baseline)
+                manifest["generated_at"] = invalid
+                manifest_path.write_bytes(
+                    json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+                )
+
+                with self.assertRaisesRegex(StockError, "generation_mismatch"):
+                    self.search()
+
+    def test_public_jsonl_strings_reject_lone_surrogates(self) -> None:
+        baseline = {
+            "name": "Synthetic",
+            "article": "SYN",
+            "product_type": "Шины",
+            "total_quantity": 4,
+            "characteristics": {"load_index": "91"},
+        }
+
+        for field in ("name", "article", "product_type"):
+            with self.subTest(field=field):
+                row = dict(baseline)
+                row[field] = "\ud800"
+                with self.assertRaisesRegex(StockError, "manifest_invalid"):
+                    schema_module._product(row, "synthetic-product")
+
+        row = dict(baseline)
+        row["characteristics"] = {"load_index": "\ud800"}
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            schema_module._product(row, "synthetic-product")
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            schema_module._product(baseline, "\ud800")
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            schema_module._offer(
+                {
+                    "supplier": "\ud800",
+                    "price": "1",
+                    "delivery_days": 1,
+                    "quantity": 1,
+                }
+            )
+
     def test_non_finite_json_value_is_rejected_before_public_serialization(self) -> None:
         products = self.files.products
         products.write_text(
             products.read_text(encoding="utf-8").replace('"load_index":"91"', '"load_index":NaN', 1),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(StockError, "manifest_invalid"):
+            self.search()
+
+    def test_numeric_json_prices_preserve_exact_filter_sort_and_output(self) -> None:
+        self.files.offers.write_text(
+            '{"private_offer_product_key":"synthetic-summer-a",'
+            '"content_generation_id":"synthetic-generation",'
+            '"supplier":"Precise","price":0.10000000000000001,'
+            '"delivery_days":1,"quantity":1}\n'
+            '{"private_offer_product_key":"synthetic-summer-b",'
+            '"content_generation_id":"synthetic-generation",'
+            '"supplier":"Lower","price":0.1,'
+            '"delivery_days":1,"quantity":1}\n',
+            encoding="utf-8",
+        )
+
+        result = self.search()
+        public = result.to_public_dict()
+        filtered = self.search(max_price="0.100000000000000005")
+
+        self.assertEqual(
+            [product.product_id for product in result.products[:2]],
+            ["synthetic-summer-b", "synthetic-summer-a"],
+        )
+        prices = {
+            product["product_id"]: product["offers"][0]["price"]
+            for product in public["products"]
+            if product["offers"]
+        }
+        self.assertEqual(prices["synthetic-summer-a"], "0.10000000000000001")
+        self.assertEqual(prices["synthetic-summer-b"], "0.1")
+        self.assertEqual(
+            [product.product_id for product in filtered.products],
+            ["synthetic-summer-b"],
+        )
+
+    def test_numeric_json_price_underflow_is_rejected(self) -> None:
+        self.files.offers.write_text(
+            '{"private_offer_product_key":"synthetic-summer-a",'
+            '"content_generation_id":"synthetic-generation",'
+            '"supplier":"Underflow","price":1e-9999,'
+            '"delivery_days":1,"quantity":1}\n',
             encoding="utf-8",
         )
 
@@ -932,6 +1030,79 @@ class SearchFreshnessIntegrationTest(unittest.TestCase):
         self.assertFalse(fresh_public["generation"]["stale"])
         self.assertEqual(fresh_public["warnings"], [])
         self.assertEqual((self.generation / "state.json").read_bytes(), immutable_state)
+
+    def test_304_then_search_reads_each_payload_at_most_twice(self) -> None:
+        class NotModifiedClient:
+            def get_manifest(
+                self, etag: str | None, modified: str | None
+            ) -> HttpResponse:
+                return HttpResponse(status=304, headers={}, body=b"")
+
+        payload_bytes = self.filesystem_payload_bytes()
+        verified_bytes = 0
+        streamed_bytes = 0
+        real_verify = cache_module._verify_child_file
+        real_rows = schema_module._rows
+
+        def count_verification(
+            parent_descriptor: int,
+            name: str,
+            expected: cache_module.ManifestFile,
+            progress: object | None = None,
+        ) -> None:
+            nonlocal verified_bytes
+            verified_bytes += expected.bytes
+            real_verify(
+                parent_descriptor,
+                name,
+                expected,
+                progress if callable(progress) else None,
+            )
+
+        def count_stream(
+            path: Path, maximum_rows: int, *integrity: object
+        ) -> object:
+            nonlocal streamed_bytes
+            streamed_bytes += path.stat().st_size
+            yield from real_rows(path, maximum_rows, *integrity)
+
+        with patch.object(
+            cache_module, "_verify_child_file", side_effect=count_verification
+        ), patch.object(schema_module, "_rows", side_effect=count_stream):
+            refreshed = StockCache(
+                self.cache_root, NotModifiedClient()
+            ).refresh(self.config)
+            files = StockCache(self.cache_root, object()).current_generation()
+            query = SearchQuery.from_args(argparse.Namespace())
+            public = StockSearcher(files, self.config).search(query).to_public_dict()
+
+        self.assertEqual(refreshed.status, "not_modified")
+        self.assertIsNotNone(files.integrity)
+        self.assertEqual(public["status"], "ok")
+        self.assertEqual(verified_bytes, payload_bytes)
+        self.assertEqual(streamed_bytes, payload_bytes)
+        self.assertEqual(verified_bytes + streamed_bytes, payload_bytes * 2)
+
+    def test_search_stream_rejects_payload_changed_after_generation_selection(
+        self,
+    ) -> None:
+        files = StockCache(self.cache_root, object()).current_generation()
+        products = self.generation / "products.jsonl"
+        products.write_bytes(
+            products.read_bytes().replace(
+                b"Synthetic Summer A", b"Synthetic Summer X", 1
+            )
+        )
+        query = SearchQuery.from_args(argparse.Namespace())
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockSearcher(files, self.config).search(query)
+
+    def filesystem_payload_bytes(self) -> int:
+        return sum(
+            (self.generation / name).stat().st_size
+            for name in ("products.jsonl", "offers.jsonl")
+        )
 
     def test_failure_then_304_then_failure_keeps_latest_checked_at(self) -> None:
         class FailingClient:
@@ -1920,6 +2091,63 @@ class SearchStockCliTest(unittest.TestCase):
         self.assertEqual(exit_code, 4)
         self.assertEqual(result["error"]["code"], "query_invalid")
         self.assertEqual(errors.getvalue(), "")
+
+    def test_surrogate_jsonl_string_is_one_safe_json_error_without_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary) / "synthetic-generation"
+            generation.mkdir()
+            (generation / "manifest.json").write_bytes(
+                (FIXTURES_DIR / "manifest.json").read_bytes()
+            )
+            product = {
+                "private_product_key": "synthetic-product",
+                "content_generation_id": "synthetic-generation",
+                "name": "\ud800",
+                "article": "SYN",
+                "product_type": "Шины",
+                "total_quantity": 4,
+                "characteristics": {},
+            }
+            (generation / "products.jsonl").write_bytes(
+                json.dumps(product, separators=(",", ":")).encode("utf-8") + b"\n"
+            )
+            (generation / "offers.jsonl").write_bytes(b"")
+            files = GenerationFiles.from_directory(
+                "synthetic-generation", generation
+            )
+            config = StockConfig(
+                manifest_url="https://stock.example.test/manifest.json",
+                username="synthetic-user",
+                password="synthetic-password",
+                product_id_field="private_product_key",
+                offer_product_id_field="private_offer_product_key",
+                cache_dir=Path(temporary) / "cache",
+            )
+            output = StringIO()
+            errors = StringIO()
+
+            with patch.object(search_stock.StockConfig, "load", return_value=config):
+                with patch.object(
+                    search_stock.StockCache,
+                    "current_generation",
+                    return_value=files,
+                ):
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        exit_code = search_stock.main([])
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(output.getvalue().count("\n"), 1)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "error",
+                "error": {
+                    "code": "manifest_invalid",
+                    "message": "Некорректные машинные данные",
+                },
+            },
+        )
 
     def test_only_sole_exact_help_forms_write_help_and_exit_zero(self) -> None:
         for argument in ("-h", "--help"):

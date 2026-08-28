@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from papa_shin_stock.errors import StockError
+from papa_shin_stock.validation import is_bounded_unicode_scalar
 
 
 _TIRE_SIZE = re.compile(r"^(?P<width>[0-9]{3})(?:/| )(?P<profile>[0-9]{2,3})(?:R|r| R?| )(?P<rim>[0-9]{2})$")
@@ -102,9 +103,12 @@ class SearchQuery:
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 256:
+    if not isinstance(value, str):
         raise StockError("query_invalid", "Некорректный фильтр поиска", 4)
-    return value.strip()
+    stripped = value.strip()
+    if not is_bounded_unicode_scalar(stripped):
+        raise StockError("query_invalid", "Некорректный фильтр поиска", 4)
+    return stripped
 
 
 def _nonnegative_int(value: object, label: str) -> int:

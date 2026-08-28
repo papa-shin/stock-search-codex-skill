@@ -879,6 +879,51 @@ class FetchStockCliTest(unittest.TestCase):
             },
         )
 
+    def test_surrogate_manifest_is_one_safe_json_error_without_stderr(self) -> None:
+        output = StringIO()
+        errors = StringIO()
+        body = json.dumps(
+            {
+                "generation_id": "\ud800",
+                "generated_at": "2026-08-27T10:00:00+00:00",
+                "files": {
+                    "products": {
+                        "url": "products.jsonl",
+                        "bytes": 0,
+                        "sha256": "0" * 64,
+                    },
+                    "offers": {
+                        "url": "offers.jsonl",
+                        "bytes": 0,
+                        "sha256": "0" * 64,
+                    },
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        def parse_manifest() -> dict[str, object]:
+            Manifest.parse(body)
+            return {}
+
+        with patch.object(fetch_stock, "refresh_default", side_effect=parse_manifest):
+            with redirect_stdout(output), redirect_stderr(errors):
+                exit_code = fetch_stock.main()
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(output.getvalue().count("\n"), 1)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "error",
+                "error": {
+                    "code": "manifest_invalid",
+                    "message": "Некорректный manifest",
+                },
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -132,9 +133,25 @@ class CacheFixture:
         generation_id: str = "generation-a",
         directory_name: str = "generation-existing",
     ) -> None:
-        cache_module._attest_cache_root(self.root, create=True).close()
+        attestation = cache_module._attest_cache_root(self.root, create=True)
+        try:
+            root_ownership_token = attestation.ownership_token
+        finally:
+            attestation.close()
         generation = self.root / "generations" / directory_name
         generation.mkdir(parents=True)
+        if cache_module._is_native_windows():
+            (generation / cache_module._WINDOWS_GENERATION_OWNER_NAME).write_bytes(
+                cache_module._json_payload(
+                    {
+                        "kind": cache_module._WINDOWS_GENERATION_OWNER_KIND,
+                        "schema_version": cache_module._WINDOWS_OWNER_SCHEMA_VERSION,
+                        "root_ownership_token": root_ownership_token,
+                        "generation_id": generation_id,
+                        "ownership_token": uuid.uuid4().hex,
+                    }
+                )
+            )
         (generation / "manifest.json").write_bytes(manifest_bytes(generation_id))
         (generation / "products.jsonl").write_bytes(PRODUCTS)
         (generation / "offers.jsonl").write_bytes(OFFERS)
@@ -3348,6 +3365,56 @@ class StockCacheTest(unittest.TestCase):
         )
         self.assertEqual(len(directories_after_first), 2)
 
+    def test_post_rename_generation_cleanup_failure_blocks_redownload(self) -> None:
+        self.fixture.seed_generation()
+        client = FakeHttpClient()
+        generations = self.cache_root / "generations"
+        real_empty = cache_module._empty_private_directory_descriptor
+
+        def fail_after_generation_quarantine(
+            descriptor: int,
+            path: Path,
+            inventory: dict[str, os.stat_result],
+        ) -> bool:
+            if path.name.startswith(".generation-existing.delete-"):
+                return False
+            return real_empty(descriptor, path, inventory)
+
+        with patch.object(
+            cache_module,
+            "_empty_private_directory_descriptor",
+            side_effect=fail_after_generation_quarantine,
+        ):
+            first = StockCache(self.cache_root, client).refresh(self.config)
+            pointer_after_first = (self.cache_root / "current.json").read_bytes()
+            quarantines_after_first = sorted(
+                path.name
+                for path in generations.iterdir()
+                if path.name.startswith(".generation-existing.delete-")
+            )
+            downloads_after_first = len(client.download_calls)
+
+            second = StockCache(self.cache_root, client).refresh(self.config)
+
+        self.assertEqual(first.status, "updated")
+        self.assertEqual(first.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(second.status, "stale_cache")
+        self.assertEqual(second.warning_code, "cache_cleanup_incomplete")
+        self.assertEqual(
+            (self.cache_root / "current.json").read_bytes(), pointer_after_first
+        )
+        self.assertEqual(len(client.download_calls), downloads_after_first)
+        self.assertEqual(downloads_after_first, 2)
+        self.assertEqual(len(quarantines_after_first), 1)
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in generations.iterdir()
+                if ".delete-" in path.name
+            ),
+            quarantines_after_first,
+        )
+
     def test_repeated_staging_cleanup_failure_without_cache_is_bounded(self) -> None:
         client = FakeHttpClient(interrupt_offers=True)
         real_remove = cache_module._remove_private_child_directory
@@ -3501,6 +3568,40 @@ class StockCacheTest(unittest.TestCase):
             StockCache(self.cache_root, client).refresh(self.config)
 
         self.assertEqual(client.manifest_calls, [(None, None)])
+
+    def test_invalid_manifest_identity_preserves_previous_generation(self) -> None:
+        self.fixture.seed_generation()
+        previous_pointer = (self.cache_root / "current.json").read_bytes()
+        invalid_values = (
+            ("generation_id", "g" * 257),
+            ("generation_id", "\ud800"),
+            ("generated_at", "2" * 257),
+            ("generated_at", "\ud800"),
+            ("generated_at", "not-an-iso-8601-timestamp"),
+        )
+
+        for field, invalid in invalid_values:
+            with self.subTest(field=field, invalid=ascii(invalid)):
+                body = json.loads(manifest_bytes("generation-c"))
+                body[field] = invalid
+                client = FakeHttpClient(
+                    response=HttpResponse(
+                        status=200,
+                        headers={"ETag": '"generation-c"'},
+                        body=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+                    )
+                )
+
+                result = StockCache(self.cache_root, client).refresh(self.config)
+
+                self.assertEqual(result.status, "stale_cache")
+                self.assertEqual(result.generation_id, "generation-a")
+                self.assertEqual(result.warning_code, "manifest_invalid")
+                self.assertEqual(client.download_calls, [])
+                self.assertEqual(
+                    (self.cache_root / "current.json").read_bytes(),
+                    previous_pointer,
+                )
 
     def test_directory_fsync_propagates_storage_failures(self) -> None:
         real_open = os.open
