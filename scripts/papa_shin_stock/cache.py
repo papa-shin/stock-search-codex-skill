@@ -6,8 +6,9 @@ import json
 import math
 import os
 import re
-import shutil
 import stat
+import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -606,10 +607,10 @@ class CacheLock:
         token = uuid.uuid4().hex
         candidate = root / f".refresh.lock.init-{token}"
         published = False
+        acquired: CacheLock | None = None
         try:
             try:
-                candidate.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
-                _ensure_private_directory(candidate)
+                _ensure_private_directory(candidate, create=True)
                 owner = {"token": token, "created_at": time.time()}
                 _write_json_atomic(candidate / "owner.json", owner)
                 _write_bytes_fsync(candidate / f"heartbeat-{token}", b"")
@@ -628,40 +629,122 @@ class CacheLock:
                     "cache_locked", "Не удалось установить блокировку кэша", 6
                 )
 
-            with _RefreshLockPublishLock.acquire(root):
-                cls._cleanup_stale_init_directories(root, candidate.name)
-                observed_lock = _lstat_optional(path)
-                if observed_lock is not None:
-                    if not stat.S_ISDIR(observed_lock.st_mode):
-                        raise StockError(
-                            "cache_locked", "Обновление кэша уже выполняется", 6
-                        )
-                    _ensure_private_directory(path)
-                    if not cls._reclaim_stale(path):
-                        remaining = _lstat_optional(path)
-                        if remaining is not None:
+            try:
+                with _RefreshLockPublishLock.acquire(root):
+                    cls._cleanup_stale_init_directories(root, candidate.name)
+                    observed_lock = _lstat_optional(path)
+                    if observed_lock is not None:
+                        if not stat.S_ISDIR(observed_lock.st_mode):
                             raise StockError(
                                 "cache_locked", "Обновление кэша уже выполняется", 6
                             )
-                try:
-                    os.rename(candidate, path)
-                except OSError as error:
-                    raise StockError(
-                        "cache_locked", "Не удалось установить блокировку кэша", 6
-                    ) from error
-                published = True
-                _fsync_directory(root)
-
-            if cls._directory_fencing_identity(path) != candidate_identity:
+                        _ensure_private_directory(path)
+                        if not cls._reclaim_stale(path):
+                            remaining = _lstat_optional(path)
+                            if remaining is not None:
+                                raise StockError(
+                                    "cache_locked",
+                                    "Обновление кэша уже выполняется",
+                                    6,
+                                )
+                    try:
+                        os.rename(candidate, path)
+                    except OSError as error:
+                        raise StockError(
+                            "cache_locked",
+                            "Не удалось установить блокировку кэша",
+                            6,
+                        ) from error
+                    published = True
+                    try:
+                        _fsync_directory(root)
+                        if cls._directory_fencing_identity(path) != candidate_identity:
+                            raise StockError(
+                                "cache_locked",
+                                "Право на обновление кэша было утрачено",
+                                6,
+                            )
+                        acquired = cls(path, token, candidate_identity)
+                        acquired.assert_owned()
+                    except BaseException:
+                        discarded = False
+                        try:
+                            discarded = cls._discard_published_lock_if_owned_locked(
+                                path, token, candidate_identity
+                            )
+                        except BaseException:
+                            pass
+                        if discarded:
+                            published = False
+                        raise
+            except BaseException:
+                if published:
+                    if cls._discard_published_lock_if_owned(
+                        root, path, token, candidate_identity
+                    ):
+                        published = False
+                raise
+            if acquired is None:
                 raise StockError(
-                    "cache_locked", "Право на обновление кэша было утрачено", 6
+                    "cache_locked", "Не удалось установить блокировку кэша", 6
                 )
-            acquired = cls(path, token, candidate_identity)
-            acquired.assert_owned()
             return acquired
         finally:
             if not published:
                 _remove_private_directory(candidate)
+
+    @classmethod
+    def _discard_published_lock_if_owned(
+        cls,
+        root: Path,
+        path: Path,
+        token: str,
+        identity: tuple[int, int],
+    ) -> bool:
+        try:
+            with _RefreshLockPublishLock.acquire(root):
+                return cls._discard_published_lock_if_owned_locked(
+                    path, token, identity
+                )
+        except BaseException:
+            return False
+
+    @classmethod
+    def _discard_published_lock_if_owned_locked(
+        cls,
+        path: Path,
+        token: str,
+        identity: tuple[int, int],
+    ) -> bool:
+        if cls._directory_fencing_identity(path) != identity:
+            return False
+        observed = cls._read_owner(path)
+        if observed is None or observed[0] != token:
+            return False
+        quarantine = path.with_name(
+            f"{path.name}.abort-{token}-{uuid.uuid4().hex}"
+        )
+        try:
+            os.rename(path, quarantine)
+        except OSError:
+            return False
+        if cls._directory_fencing_identity(quarantine) != identity:
+            try:
+                if _lstat_optional(path) is None:
+                    os.rename(quarantine, path)
+            except (OSError, StockError):
+                pass
+            return False
+        moved = cls._read_owner(quarantine)
+        if moved is None or moved[0] != token:
+            try:
+                if _lstat_optional(path) is None:
+                    os.rename(quarantine, path)
+            except (OSError, StockError):
+                pass
+            return False
+        _remove_private_directory(quarantine)
+        return _lstat_optional(quarantine) is None
 
     @classmethod
     def _reclaim_stale(cls, path: Path) -> bool:
@@ -700,7 +783,7 @@ class CacheLock:
             except OSError:
                 pass
             return False
-        shutil.rmtree(quarantine, ignore_errors=True)
+        _remove_private_directory(quarantine)
         return True
 
     @classmethod
@@ -725,7 +808,7 @@ class CacheLock:
             except OSError:
                 pass
             return False
-        shutil.rmtree(quarantine, ignore_errors=True)
+        _remove_private_directory(quarantine)
         return True
 
     @staticmethod
@@ -881,7 +964,7 @@ class CacheLock:
             return
         moved = self._read_owner(quarantine)
         if moved is not None and moved[0] == self.token:
-            shutil.rmtree(quarantine, ignore_errors=True)
+            _remove_private_directory(quarantine)
             return
         try:
             if not self.path.exists():
@@ -1081,8 +1164,7 @@ class StockCache:
         generations = self.root / "generations"
         _ensure_private_directory(generations, create=True)
         directory = generations / f".staging-{uuid.uuid4().hex}"
-        directory.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
-        _ensure_private_directory(directory)
+        _ensure_private_directory(directory, create=True)
         staged = GenerationFiles.from_directory(manifest.generation_id, directory)
         try:
             _write_bytes_fsync(staged.manifest, manifest.body)
@@ -1103,7 +1185,7 @@ class StockCache:
             _fsync_directory(directory)
             return staged
         except BaseException:
-            shutil.rmtree(directory, ignore_errors=True)
+            _remove_private_cache_generation(self.root, directory)
             raise
 
     def _download_private_file(
@@ -1290,85 +1372,177 @@ class StockCache:
                     and pointer.directory_name == directory.name
                 ):
                     return
-                shutil.rmtree(directory, ignore_errors=True)
+                if not _remove_private_cache_generation(self.root, directory):
+                    return
                 try:
                     status_path = _runtime_status_path(
                         self.root, directory.name
                     )
                 except StockError:
                     return
-                observed_status = _lstat_optional(status_path)
-                if observed_status is not None and not stat.S_ISDIR(
-                    observed_status.st_mode
-                ):
-                    status_path.unlink(missing_ok=True)
+                root_descriptor = _open_private_directory(self.root)
+                try:
+                    observed_status = _lstat_private_child(
+                        root_descriptor,
+                        self.root,
+                        status_path.name,
+                        missing_ok=True,
+                    )
+                    if observed_status is not None and stat.S_ISREG(
+                        observed_status.st_mode
+                    ):
+                        _unlink_private_child_regular_file(
+                            root_descriptor,
+                            self.root,
+                            status_path.name,
+                            observed_status,
+                        )
+                finally:
+                    _close_optional_descriptor(root_descriptor)
         except (OSError, StockError):
             return
 
     def _cleanup_inactive_generations(self, lock: CacheLock) -> str | None:
         lock.assert_owned()
         generations = self.root / "generations"
+        root_descriptor: int | None = None
+        generations_descriptor: int | None = None
         try:
-            entries = list(generations.iterdir())
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return "cache_cleanup_incomplete"
-        cleanup_incomplete = False
-        for entry in entries:
-            lock.assert_owned()
-            pointer = self._load_current_pointer_for_cleanup()
-            if (
-                pointer is not None and entry.name == pointer.directory_name
-            ) or entry.is_symlink():
-                continue
-            if entry.name.startswith(("generation-", ".staging-")):
+            root_descriptor = _open_private_directory(self.root)
+            observed_generations = _lstat_private_child(
+                root_descriptor,
+                self.root,
+                "generations",
+                missing_ok=True,
+            )
+            if observed_generations is None:
+                return None
+            if not stat.S_ISDIR(observed_generations.st_mode):
+                return "cache_cleanup_incomplete"
+            generations_descriptor = _open_private_child_directory(
+                root_descriptor,
+                self.root,
+                generations,
+            )
+            generation_names = _list_private_directory(
+                generations_descriptor, generations
+            )
+            if not _directory_path_matches_descriptor(
+                generations, generations_descriptor
+            ):
+                return "cache_cleanup_incomplete"
+            cleanup_incomplete = False
+            for name in generation_names:
                 lock.assert_owned()
                 pointer = self._load_current_pointer_for_cleanup()
-                if pointer is not None and entry.name == pointer.directory_name:
+                if pointer is not None and name == pointer.directory_name:
+                    continue
+                if not name.startswith(("generation-", ".staging-")):
                     continue
                 try:
-                    shutil.rmtree(entry)
+                    observed = _lstat_private_child(
+                        generations_descriptor,
+                        generations,
+                        name,
+                        missing_ok=True,
+                    )
+                    if observed is None:
+                        continue
+                    if not stat.S_ISDIR(observed.st_mode):
+                        cleanup_incomplete = True
+                        continue
+                    lock.assert_owned()
+                    pointer = self._load_current_pointer_for_cleanup()
+                    if pointer is not None and name == pointer.directory_name:
+                        continue
+                    if not _directory_path_matches_descriptor(
+                        generations, generations_descriptor
+                    ):
+                        cleanup_incomplete = True
+                        break
+                    if not _remove_private_child_directory(
+                        generations_descriptor,
+                        generations,
+                        name,
+                        observed,
+                    ):
+                        cleanup_incomplete = True
                 except FileNotFoundError:
                     continue
+                except StockError as error:
+                    if error.code == "cache_locked":
+                        raise
+                    cleanup_incomplete = True
                 except OSError:
                     cleanup_incomplete = True
-        try:
-            runtime_entries = [
-                (entry, parsed)
-                for entry in self.root.iterdir()
-                if (parsed := _parse_runtime_cleanup_name(entry.name)) is not None
-            ]
-        except OSError:
-            cleanup_incomplete = True
-            runtime_entries = []
-        for entry, (directory_name, temporary) in runtime_entries:
-            lock.assert_owned()
-            pointer = self._load_current_pointer_for_cleanup()
-            if (
-                not temporary
-                and pointer is not None
-                and directory_name == pointer.directory_name
-            ):
-                continue
             try:
-                observed = entry.lstat()
-                if stat.S_ISDIR(observed.st_mode):
-                    cleanup_incomplete = True
-                    continue
-                entry.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
+                runtime_names = _list_private_directory(
+                    root_descriptor, self.root
+                )
+            except (OSError, StockError):
                 cleanup_incomplete = True
-        return "cache_cleanup_incomplete" if cleanup_incomplete else None
+                runtime_names = []
+            for name in runtime_names:
+                parsed = _parse_runtime_cleanup_name(name)
+                if parsed is None:
+                    continue
+                directory_name, temporary = parsed
+                lock.assert_owned()
+                pointer = self._load_current_pointer_for_cleanup()
+                if (
+                    not temporary
+                    and pointer is not None
+                    and directory_name == pointer.directory_name
+                ):
+                    continue
+                try:
+                    observed = _lstat_private_child(
+                        root_descriptor,
+                        self.root,
+                        name,
+                        missing_ok=True,
+                    )
+                    if observed is None:
+                        continue
+                    if not stat.S_ISREG(observed.st_mode):
+                        cleanup_incomplete = True
+                        continue
+                    if not _directory_path_matches_descriptor(
+                        self.root, root_descriptor
+                    ):
+                        cleanup_incomplete = True
+                        break
+                    _unlink_private_child_regular_file(
+                        root_descriptor,
+                        self.root,
+                        name,
+                        observed,
+                    )
+                except FileNotFoundError:
+                    continue
+                except StockError as error:
+                    if error.code == "cache_locked":
+                        raise
+                    cleanup_incomplete = True
+                except OSError:
+                    cleanup_incomplete = True
+            return "cache_cleanup_incomplete" if cleanup_incomplete else None
+        except StockError as error:
+            if error.code == "cache_locked":
+                raise
+            return "cache_cleanup_incomplete"
+        except OSError:
+            return "cache_cleanup_incomplete"
+        finally:
+            _close_optional_descriptor(generations_descriptor)
+            _close_optional_descriptor(root_descriptor)
 
     def _load_current_pointer_for_cleanup(self) -> CurrentPointer | None:
         current_path = self.root / "current.json"
         try:
             return CurrentPointer.load(current_path)
         except StockError:
-            if not current_path.exists():
+            if _lstat_optional(current_path) is None:
                 return None
             raise
 
@@ -1632,6 +1806,8 @@ def _open_private_directory(
     descriptor = -1
     try:
         if create:
+            if os.name == "posix":
+                return _open_or_create_private_directory_posix(path, parents=parents)
             path.mkdir(
                 mode=_PRIVATE_DIRECTORY_MODE,
                 parents=parents,
@@ -1654,6 +1830,11 @@ def _open_private_directory(
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_DIRECTORY", 0)
         descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            observed, opened
+        ):
+            raise _cache_unavailable()
         opened = _harden_private_descriptor(
             descriptor, stat.S_IFDIR, _PRIVATE_DIRECTORY_MODE
         )
@@ -1679,6 +1860,261 @@ def _open_private_directory(
         raise _cache_unavailable() from error
 
 
+def _open_or_create_private_directory_posix(
+    path: Path,
+    *,
+    parents: bool,
+) -> int:
+    if _lstat_optional(path) is not None:
+        descriptor = _open_private_directory(path)
+        if descriptor is None:
+            raise _cache_unavailable()
+        return descriptor
+    parent = path.parent
+    if parent == path or not path.name:
+        raise _cache_unavailable()
+    if _lstat_optional(parent) is None:
+        if not parents:
+            raise _cache_unavailable()
+        parent_private = _open_private_directory(parent, create=True, parents=True)
+        if parent_private is None:
+            raise _cache_unavailable()
+        os.close(parent_private)
+
+    parent_descriptor = _open_directory_descriptor_without_hardening(parent)
+    descriptor = -1
+    created: os.stat_result | None = None
+    try:
+        parent_identity = os.fstat(parent_descriptor)
+        if not _parent_protects_private_directory_bootstrap(parent_identity):
+            raise _cache_unavailable()
+        try:
+            os.mkdir(path.name, _PRIVATE_DIRECTORY_MODE, dir_fd=parent_descriptor)
+        except FileExistsError as error:
+            raise _cache_unavailable() from error
+        created = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(created.st_mode):
+            raise _cache_unavailable()
+        effective_uid = getattr(os, "geteuid", lambda: created.st_uid)()
+        if created.st_uid != effective_uid:
+            raise _cache_unavailable()
+        if stat.S_IMODE(created.st_mode) & (stat.S_IRUSR | stat.S_IXUSR) != (
+            stat.S_IRUSR | stat.S_IXUSR
+        ):
+            if not _remove_created_private_directory_entry(
+                parent_descriptor, path.name, created
+            ):
+                raise _cache_unavailable()
+            created = None
+            _mkdir_private_directory_without_process_umask(
+                parent_descriptor, path.name
+            )
+            created = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(created.st_mode) or created.st_uid != effective_uid:
+                raise _cache_unavailable()
+        _chmod_created_private_directory(parent_descriptor, path.name, created)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            created, opened
+        ):
+            raise _cache_unavailable()
+        opened = _harden_private_descriptor(
+            descriptor, stat.S_IFDIR, _PRIVATE_DIRECTORY_MODE
+        )
+        confirmed = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+        confirmed_parent = parent.lstat()
+        if not stat.S_ISDIR(confirmed_parent.st_mode) or not _same_file_identity(
+            parent_identity, confirmed_parent
+        ):
+            raise _cache_unavailable()
+        confirmed_path = path.lstat()
+        if not stat.S_ISDIR(confirmed_path.st_mode) or not _same_file_identity(
+            opened, confirmed_path
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _remove_created_private_directory_entry(
+            parent_descriptor, path.name, created
+        )
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _remove_created_private_directory_entry(
+            parent_descriptor, path.name, created
+        )
+        raise _cache_unavailable() from error
+    finally:
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
+
+
+def _remove_created_private_directory_entry(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result | None,
+) -> bool:
+    if expected is None:
+        return False
+    try:
+        observed = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(observed.st_mode) or not _same_file_identity(
+            expected, observed
+        ):
+            return False
+        os.rmdir(name, dir_fd=parent_descriptor)
+        return True
+    except OSError:
+        return False
+
+
+def _mkdir_private_directory_without_process_umask(
+    parent_descriptor: int,
+    name: str,
+) -> None:
+    script = (
+        "import os,sys; "
+        "os.umask(0); "
+        "os.mkdir(sys.argv[2], 0o700, dir_fd=int(sys.argv[1]))"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(parent_descriptor), name],
+            check=False,
+            close_fds=True,
+            pass_fds=(parent_descriptor,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError) as error:
+        raise _cache_unavailable() from error
+    if completed.returncode != 0:
+        raise _cache_unavailable()
+
+
+def _parent_protects_private_directory_bootstrap(
+    parent: os.stat_result,
+) -> bool:
+    effective_uid = getattr(os, "geteuid", lambda: parent.st_uid)()
+    mode = stat.S_IMODE(parent.st_mode)
+    sticky = bool(parent.st_mode & stat.S_ISVTX)
+    if parent.st_uid != effective_uid and not sticky:
+        return False
+    if mode & (stat.S_IWGRP | stat.S_IWOTH) and not sticky:
+        return False
+    return True
+
+
+def _open_directory_descriptor_without_hardening(path: Path) -> int:
+    descriptor = -1
+    try:
+        observed = path.lstat()
+        if not stat.S_ISDIR(observed.st_mode):
+            raise _cache_unavailable()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            observed, opened
+        ):
+            raise _cache_unavailable()
+        confirmed = path.lstat()
+        if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
+def _chmod_created_private_directory(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    identity_descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        identity_descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(identity_descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            expected, opened
+        ):
+            raise _cache_unavailable()
+        os.fchmod(identity_descriptor, _PRIVATE_DIRECTORY_MODE)
+        hardened = os.fstat(identity_descriptor)
+        if (
+            not _same_file_identity(expected, hardened)
+            or stat.S_IMODE(hardened.st_mode) != _PRIVATE_DIRECTORY_MODE
+        ):
+            raise _cache_unavailable()
+        confirmed = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+            hardened, confirmed
+        ):
+            raise _cache_unavailable()
+    finally:
+        if identity_descriptor >= 0:
+            os.close(identity_descriptor)
+
+
 def _ensure_private_directory(
     path: Path,
     *,
@@ -1692,6 +2128,454 @@ def _ensure_private_directory(
         os.close(descriptor)
     except OSError as error:
         raise _cache_unavailable() from error
+
+
+def _open_private_child_directory(
+    parent_descriptor: int | None,
+    parent: Path,
+    path: Path,
+) -> int | None:
+    if path.parent != parent or path.name in {"", ".", ".."}:
+        raise _cache_unavailable()
+    if parent_descriptor is None:
+        return _open_private_directory(path)
+    descriptor = -1
+    try:
+        observed = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(observed.st_mode):
+            raise _cache_unavailable()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            observed, opened
+        ):
+            raise _cache_unavailable()
+        opened = _harden_private_descriptor(
+            descriptor, stat.S_IFDIR, _PRIVATE_DIRECTORY_MODE
+        )
+        confirmed = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(confirmed.st_mode) or not _same_file_identity(
+            opened, confirmed
+        ):
+            raise _cache_unavailable()
+        if not _directory_path_matches_descriptor(parent, parent_descriptor):
+            raise _cache_unavailable()
+        confirmed_path = path.lstat()
+        if not stat.S_ISDIR(confirmed_path.st_mode) or not _same_file_identity(
+            opened, confirmed_path
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
+def _directory_path_matches_descriptor(
+    path: Path,
+    descriptor: int | None,
+) -> bool:
+    if descriptor is None:
+        checked: int | None = None
+        try:
+            checked = _open_private_directory(path)
+            return True
+        except (OSError, StockError):
+            return False
+        finally:
+            _close_optional_descriptor(checked)
+    try:
+        opened = os.fstat(descriptor)
+        confirmed = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(opened.st_mode)
+        and stat.S_ISDIR(confirmed.st_mode)
+        and _same_file_identity(opened, confirmed)
+    )
+
+
+def _list_private_directory(
+    descriptor: int | None,
+    path: Path,
+) -> list[str]:
+    try:
+        names = os.listdir(descriptor) if descriptor is not None else os.listdir(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise _cache_unavailable() from error
+    if any(Path(name).name != name or name in {"", ".", ".."} for name in names):
+        raise _cache_unavailable()
+    return names
+
+
+def _lstat_private_child(
+    parent_descriptor: int | None,
+    parent: Path,
+    name: str,
+    *,
+    missing_ok: bool = False,
+) -> os.stat_result | None:
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise _cache_unavailable()
+    try:
+        if parent_descriptor is None:
+            observed = (parent / name).lstat()
+        else:
+            observed = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise _cache_unavailable()
+    except OSError as error:
+        raise _cache_unavailable() from error
+    if stat.S_ISDIR(observed.st_mode) and os.name == "nt" and (
+        _is_windows_directory_reparse_point(parent / name, observed)
+    ):
+        raise _cache_unavailable()
+    return observed
+
+
+def _remove_private_child_directory(
+    parent_descriptor: int | None,
+    parent: Path,
+    name: str,
+    expected: os.stat_result | None = None,
+) -> bool:
+    observed = _lstat_private_child(
+        parent_descriptor, parent, name, missing_ok=True
+    )
+    if observed is None:
+        return True
+    if not stat.S_ISDIR(observed.st_mode) or (
+        expected is not None and not _same_file_identity(expected, observed)
+    ):
+        return False
+    if not _directory_path_matches_descriptor(parent, parent_descriptor):
+        return False
+    if parent_descriptor is None:
+        return False
+    directory_descriptor = -1
+    try:
+        directory_descriptor = _open_private_child_directory_for_deletion(
+            parent_descriptor,
+            name,
+            observed,
+        )
+        inventory = _snapshot_private_flat_directory(
+            directory_descriptor,
+            parent / name,
+        )
+        if inventory is None:
+            _close_optional_descriptor(directory_descriptor)
+            return False
+    except (OSError, StockError):
+        _close_optional_descriptor(directory_descriptor)
+        return False
+    quarantine_name = f".{name}.delete-{uuid.uuid4().hex}"
+    try:
+        os.rename(
+            name,
+            quarantine_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        _close_optional_descriptor(directory_descriptor)
+        return True
+    except OSError:
+        _close_optional_descriptor(directory_descriptor)
+        raise
+    try:
+        moved = _lstat_private_child(
+            parent_descriptor,
+            parent,
+            quarantine_name,
+            missing_ok=True,
+        )
+        if (
+            moved is None
+            or not stat.S_ISDIR(moved.st_mode)
+            or not _same_file_identity(observed, moved)
+        ):
+            _restore_private_quarantine(
+                parent_descriptor, parent, name, quarantine_name
+            )
+            return False
+        if not _empty_private_directory_descriptor(
+            directory_descriptor,
+            parent / quarantine_name,
+            inventory,
+        ):
+            return False
+    except (OSError, StockError):
+        return False
+    finally:
+        _close_optional_descriptor(directory_descriptor)
+
+    confirmed = _lstat_private_child(
+        parent_descriptor,
+        parent,
+        quarantine_name,
+        missing_ok=True,
+    )
+    if (
+        confirmed is None
+        or not stat.S_ISDIR(confirmed.st_mode)
+        or not _same_file_identity(moved, confirmed)
+    ):
+        return False
+    try:
+        os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _open_private_child_directory_for_deletion(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> int:
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file_identity(
+            expected, opened
+        ):
+            raise _cache_unavailable()
+        return descriptor
+    except StockError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _cache_unavailable() from error
+
+
+def _empty_private_directory_descriptor(
+    descriptor: int,
+    path: Path,
+    inventory: dict[str, os.stat_result],
+) -> bool:
+    if not _directory_path_matches_descriptor(path, descriptor):
+        return False
+    try:
+        names = _list_private_directory(descriptor, path)
+    except StockError:
+        return False
+    if set(names) != set(inventory):
+        return False
+    for name, expected in inventory.items():
+        observed = _lstat_private_child(descriptor, path, name, missing_ok=True)
+        if (
+            observed is None
+            or not stat.S_ISREG(observed.st_mode)
+            or not _same_file_identity(expected, observed)
+        ):
+            return False
+    for name, expected in inventory.items():
+        try:
+            _unlink_private_child_regular_file(
+                descriptor,
+                path,
+                name,
+                expected,
+            )
+        except StockError:
+            return False
+    try:
+        return not _list_private_directory(descriptor, path)
+    except StockError:
+        return False
+
+
+def _snapshot_private_flat_directory(
+    descriptor: int,
+    path: Path,
+) -> dict[str, os.stat_result] | None:
+    if not _directory_path_matches_descriptor(path, descriptor):
+        return None
+    try:
+        names = _list_private_directory(descriptor, path)
+        inventory: dict[str, os.stat_result] = {}
+        for name in names:
+            observed = _lstat_private_child(
+                descriptor,
+                path,
+                name,
+                missing_ok=True,
+            )
+            if observed is None or not stat.S_ISREG(observed.st_mode):
+                return None
+            inventory[name] = observed
+        if set(_list_private_directory(descriptor, path)) != set(inventory):
+            return None
+        for name, expected in inventory.items():
+            confirmed = _lstat_private_child(
+                descriptor,
+                path,
+                name,
+                missing_ok=True,
+            )
+            if (
+                confirmed is None
+                or not stat.S_ISREG(confirmed.st_mode)
+                or not _same_file_identity(expected, confirmed)
+            ):
+                return None
+        return inventory
+    except StockError:
+        return None
+
+
+def _restore_private_quarantine(
+    parent_descriptor: int | None,
+    parent: Path,
+    name: str,
+    quarantine_name: str,
+) -> None:
+    try:
+        current = _lstat_private_child(
+            parent_descriptor, parent, name, missing_ok=True
+        )
+        quarantine = _lstat_private_child(
+            parent_descriptor, parent, quarantine_name, missing_ok=True
+        )
+        if current is not None or quarantine is None:
+            return
+        if parent_descriptor is None:
+            os.rename(parent / quarantine_name, parent / name)
+        else:
+            os.rename(
+                quarantine_name,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+    except (OSError, StockError):
+        return
+
+
+def _unlink_private_child_regular_file(
+    parent_descriptor: int | None,
+    parent: Path,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    observed = _lstat_private_child(
+        parent_descriptor, parent, name, missing_ok=True
+    )
+    if observed is None:
+        return
+    if not stat.S_ISREG(observed.st_mode) or not _same_file_identity(
+        expected, observed
+    ):
+        raise _cache_unavailable()
+    if not _directory_path_matches_descriptor(parent, parent_descriptor):
+        raise _cache_unavailable()
+    try:
+        if parent_descriptor is None:
+            (parent / name).unlink()
+        else:
+            os.unlink(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise _cache_unavailable() from error
+
+
+def _remove_private_cache_generation(root: Path, directory: Path) -> bool:
+    generations = root / "generations"
+    if (
+        directory.parent != generations
+        or not directory.name.startswith(("generation-", ".staging-"))
+    ):
+        return False
+    root_descriptor: int | None = None
+    generations_descriptor: int | None = None
+    try:
+        root_descriptor = _open_private_directory(root)
+        observed_generations = _lstat_private_child(
+            root_descriptor,
+            root,
+            "generations",
+            missing_ok=True,
+        )
+        if observed_generations is None or not stat.S_ISDIR(
+            observed_generations.st_mode
+        ):
+            return False
+        generations_descriptor = _open_private_child_directory(
+            root_descriptor,
+            root,
+            generations,
+        )
+        observed = _lstat_private_child(
+            generations_descriptor,
+            generations,
+            directory.name,
+            missing_ok=True,
+        )
+        if observed is None:
+            return True
+        if not stat.S_ISDIR(observed.st_mode):
+            return False
+        return _remove_private_child_directory(
+            generations_descriptor,
+            generations,
+            directory.name,
+            observed,
+        )
+    except (OSError, StockError):
+        return False
+    finally:
+        _close_optional_descriptor(generations_descriptor)
+        _close_optional_descriptor(root_descriptor)
+
+
+def _close_optional_descriptor(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        return
 
 
 def _open_private_regular_file(
@@ -1710,11 +2594,14 @@ def _open_private_regular_file(
     secure_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, secure_flags, _PRIVATE_FILE_MODE)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _cache_unavailable()
+        if observed is not None and not _same_file_identity(observed, opened):
+            raise _cache_unavailable()
         opened = _harden_private_descriptor(
             descriptor, stat.S_IFREG, _PRIVATE_FILE_MODE
         )
-        if observed is not None and not _same_file_identity(observed, opened):
-            raise _cache_unavailable()
         confirmed = path.lstat()
         if not stat.S_ISREG(confirmed.st_mode) or not _same_file_identity(
             opened, confirmed
@@ -1798,15 +2685,32 @@ def _touch_private_regular_file(path: Path) -> None:
 
 
 def _remove_private_directory(path: Path) -> None:
+    parent_descriptor: int | None = None
     try:
-        observed = path.lstat()
-    except FileNotFoundError:
+        if os.name == "posix":
+            parent_descriptor = _open_directory_descriptor_without_hardening(
+                path.parent
+            )
+        else:
+            parent_descriptor = _open_private_directory(path.parent)
+        observed = _lstat_private_child(
+            parent_descriptor,
+            path.parent,
+            path.name,
+            missing_ok=True,
+        )
+        if observed is None or not stat.S_ISDIR(observed.st_mode):
+            return
+        _remove_private_child_directory(
+            parent_descriptor,
+            path.parent,
+            path.name,
+            observed,
+        )
+    except (OSError, StockError):
         return
-    except OSError:
-        return
-    if not stat.S_ISDIR(observed.st_mode):
-        return
-    shutil.rmtree(path, ignore_errors=True)
+    finally:
+        _close_optional_descriptor(parent_descriptor)
 
 
 def _lock_commit_descriptor(descriptor: int) -> None:

@@ -195,6 +195,29 @@ class StockCacheTest(unittest.TestCase):
         )
         os.utime(lock_path / f"heartbeat-{owner['token']}", (expired, expired))
 
+    def _assert_private_cache_modes(self, root: Path) -> None:
+        pointer = json.loads((root / "current.json").read_text(encoding="utf-8"))
+        generation = root / "generations" / pointer["directory_name"]
+        directories = [root, root / "generations", generation]
+        files = [
+            root / ".runtime-status.commit.lock",
+            root / "current.json",
+            root / f".runtime-status-{generation.name}.json",
+            generation / "manifest.json",
+            generation / "products.jsonl",
+            generation / "offers.jsonl",
+            generation / "state.json",
+        ]
+        self.assertTrue(all(path.exists() for path in directories + files))
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in directories},
+            {path: 0o700 for path in directories},
+        )
+        self.assertEqual(
+            {path: stat.S_IMODE(path.stat().st_mode) for path in files},
+            {path: 0o600 for path in files},
+        )
+
     def test_success_activates_verified_generation_with_plain_json_pointer(self) -> None:
         cache = StockCache(self.cache_root, FakeHttpClient())
 
@@ -247,6 +270,142 @@ class StockCacheTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_refresh_creates_private_cache_tree_under_umask_000(self) -> None:
+        self.cache_root.rmdir()
+        previous_umask = os.umask(0o000)
+        try:
+            result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(result.status, "updated")
+        self._assert_private_cache_modes(self.cache_root)
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_refresh_creates_private_cache_tree_under_umask_0777(self) -> None:
+        self.cache_root.rmdir()
+        previous_umask = os.umask(0o777)
+        try:
+            result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(result.status, "updated")
+        self._assert_private_cache_modes(self.cache_root)
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
+    def test_nested_private_cache_bootstrap_succeeds_under_umask_0777(self) -> None:
+        private_parent = Path(self.temp_dir.name) / "missing-private-parent"
+        nested_root = private_parent / "nested-cache"
+        config = StockConfig(
+            manifest_url=self.config.manifest_url,
+            username=self.config.username,
+            password=self.config.password,
+            product_id_field=self.config.product_id_field,
+            offer_product_id_field=self.config.offer_product_id_field,
+            cache_dir=nested_root,
+        )
+        previous_umask = os.umask(0o777)
+        try:
+            result = StockCache(nested_root, FakeHttpClient()).refresh(config)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(stat.S_IMODE(private_parent.stat().st_mode), 0o700)
+        self._assert_private_cache_modes(nested_root)
+
+    @unittest.skipUnless(os.name == "posix", "Symlink race проверяется на POSIX")
+    def test_parent_swap_does_not_chmod_external_directory(self) -> None:
+        safe_parent = Path(self.temp_dir.name) / "safe-parent"
+        safe_parent.mkdir()
+        target = safe_parent / "cache"
+        target.mkdir(mode=0o700)
+        parked_parent = Path(self.temp_dir.name) / "parked-parent"
+        outside_parent = Path(self.temp_dir.name) / "outside-parent"
+        outside_target = outside_parent / "cache"
+        outside_target.mkdir(parents=True, mode=0o755)
+        os.chmod(outside_target, 0o755)
+        real_lstat = Path.lstat
+        swapped = False
+
+        def swap_parent_after_target_lstat(path: Path) -> os.stat_result:
+            nonlocal swapped
+            observed = real_lstat(path)
+            if path == target and not swapped:
+                swapped = True
+                os.rename(safe_parent, parked_parent)
+                safe_parent.symlink_to(outside_parent, target_is_directory=True)
+            return observed
+
+        with patch.object(Path, "lstat", swap_parent_after_target_lstat):
+            with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                cache_module._ensure_private_directory(target)
+
+        self.assertTrue(swapped)
+        self.assertEqual(stat.S_IMODE(outside_target.stat().st_mode), 0o755)
+
+    @unittest.skipUnless(os.name == "posix", "Directory identity race проверяется на POSIX")
+    def test_bootstrap_binds_created_directory_before_chmod(self) -> None:
+        parent = Path(self.temp_dir.name) / "bootstrap-parent"
+        parent.mkdir(mode=0o700)
+        target = parent / "private-cache"
+        parked = parent / "parked-created-cache"
+        outside = Path(self.temp_dir.name) / "outside-directory"
+        outside.mkdir(mode=0o755)
+        marker = outside / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        os.chmod(outside, 0o755)
+        real_stat = os.stat
+        swapped = False
+
+        def swap_created_entry_before_hardening(
+            path: object,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal swapped
+            observed = real_stat(path, *args, **kwargs)
+            if (
+                not swapped
+                and path == target.name
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                swapped = True
+                os.rename(target, parked)
+                os.rename(outside, target)
+            return observed
+
+        previous_umask = os.umask(0o777)
+        try:
+            with patch.object(
+                cache_module.os,
+                "stat",
+                side_effect=swap_created_entry_before_hardening,
+            ):
+                with self.assertRaisesRegex(StockError, "cache_unavailable"):
+                    cache_module._ensure_private_directory(target, create=True)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertTrue(swapped)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual((target / marker.name).read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX parent modes проверяются на POSIX")
+    def test_bootstrap_rejects_nonsticky_world_writable_parent(self) -> None:
+        unsafe_parent = Path(self.temp_dir.name) / "unsafe-parent"
+        unsafe_parent.mkdir(mode=0o777)
+        os.chmod(unsafe_parent, 0o777)
+        root = unsafe_parent / "private-cache"
+
+        with self.assertRaisesRegex(StockError, "cache_locked"):
+            CacheLock.acquire(root)
+
+        self.assertFalse(root.exists())
+
+    @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_lock_creation_uses_private_modes_under_umask_022(self) -> None:
         previous_umask = os.umask(0o022)
         try:
@@ -264,6 +423,167 @@ class StockCacheTest(unittest.TestCase):
             stat.S_IMODE((lock.path / f"heartbeat-{lock.token}").stat().st_mode),
             0o600,
         )
+
+    @unittest.skipUnless(os.name == "posix", "Lock fsync semantics проверяются на POSIX")
+    def test_post_publish_fsync_failure_removes_owned_lock_and_allows_reacquire(
+        self,
+    ) -> None:
+        real_fsync_directory = cache_module._fsync_directory
+        failed = False
+
+        def fail_once_after_publish(path: Path) -> None:
+            nonlocal failed
+            if (
+                path == self.cache_root
+                and (self.cache_root / ".refresh.lock").is_dir()
+                and not failed
+            ):
+                failed = True
+                raise OSError("synthetic post-publish fsync failure")
+            real_fsync_directory(path)
+
+        with patch.object(
+            cache_module,
+            "_fsync_directory",
+            side_effect=fail_once_after_publish,
+        ):
+            with self.assertRaises((OSError, StockError)):
+                CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(failed)
+        self.assertFalse((self.cache_root / ".refresh.lock").exists())
+        replacement = CacheLock.acquire(self.cache_root)
+        self.addCleanup(replacement.release)
+        replacement.assert_owned()
+
+    def test_post_publish_attestation_failure_removes_owned_lock(self) -> None:
+        canonical = self.cache_root / ".refresh.lock"
+        real_read_owner = CacheLock._read_owner
+        failed = False
+
+        def fail_first_canonical_attestation(path: Path) -> tuple[str, float] | None:
+            nonlocal failed
+            if path == canonical and not failed:
+                failed = True
+                return None
+            return real_read_owner(path)
+
+        with patch.object(
+            CacheLock,
+            "_read_owner",
+            side_effect=fail_first_canonical_attestation,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_locked"):
+                CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(failed)
+        self.assertFalse(canonical.exists())
+        replacement = CacheLock.acquire(self.cache_root)
+        self.addCleanup(replacement.release)
+        replacement.assert_owned()
+
+    def test_post_publish_cleanup_does_not_remove_successor_lock(self) -> None:
+        canonical = self.cache_root / ".refresh.lock"
+        abandoned = self.cache_root / ".refresh.lock.abandoned"
+        successor_token = "successor-writer"
+        real_identity = CacheLock._directory_fencing_identity
+        successor_identity: tuple[int, int] | None = None
+        displaced = False
+
+        def displace_before_attestation(path: Path) -> tuple[int, int] | None:
+            nonlocal displaced, successor_identity
+            if path == canonical and canonical.is_dir() and not displaced:
+                displaced = True
+                os.rename(canonical, abandoned)
+                canonical.mkdir(mode=0o700)
+                (canonical / "owner.json").write_text(
+                    json.dumps(
+                        {"token": successor_token, "created_at": time.time()}
+                    ),
+                    encoding="utf-8",
+                )
+                (canonical / f"heartbeat-{successor_token}").write_bytes(b"")
+                successor_identity = real_identity(canonical)
+            return real_identity(path)
+
+        with patch.object(
+            CacheLock,
+            "_directory_fencing_identity",
+            side_effect=displace_before_attestation,
+        ):
+            with self.assertRaisesRegex(StockError, "cache_locked"):
+                CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(displaced)
+        self.assertEqual(real_identity(canonical), successor_identity)
+        owner = json.loads((canonical / "owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["token"], successor_token)
+
+    def test_post_publish_cleanup_failure_does_not_mask_primary_error(self) -> None:
+        real_fsync_directory = cache_module._fsync_directory
+
+        def fail_after_publish(path: Path) -> None:
+            if path == self.cache_root and (
+                self.cache_root / ".refresh.lock"
+            ).is_dir():
+                raise OSError("primary post-publish failure")
+            real_fsync_directory(path)
+
+        with patch.object(
+            cache_module,
+            "_fsync_directory",
+            side_effect=fail_after_publish,
+        ):
+            with patch.object(
+                CacheLock,
+                "_discard_published_lock_if_owned_locked",
+                side_effect=RuntimeError("secondary cleanup failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "primary post-publish failure"):
+                    CacheLock.acquire(self.cache_root)
+
+    def test_post_publish_cleanup_retries_after_transient_owner_read_failure(
+        self,
+    ) -> None:
+        canonical = self.cache_root / ".refresh.lock"
+        real_fsync_directory = cache_module._fsync_directory
+        real_read_owner = CacheLock._read_owner
+        fsync_failed = False
+        owner_read_failed = False
+
+        def fail_once_after_publish(path: Path) -> None:
+            nonlocal fsync_failed
+            if path == self.cache_root and canonical.is_dir() and not fsync_failed:
+                fsync_failed = True
+                raise OSError("primary post-publish failure")
+            real_fsync_directory(path)
+
+        def fail_first_cleanup_owner_read(path: Path) -> tuple[str, float] | None:
+            nonlocal owner_read_failed
+            if path == canonical and fsync_failed and not owner_read_failed:
+                owner_read_failed = True
+                return None
+            return real_read_owner(path)
+
+        with patch.object(
+            cache_module,
+            "_fsync_directory",
+            side_effect=fail_once_after_publish,
+        ):
+            with patch.object(
+                CacheLock,
+                "_read_owner",
+                side_effect=fail_first_cleanup_owner_read,
+            ):
+                with self.assertRaisesRegex(OSError, "primary post-publish failure"):
+                    CacheLock.acquire(self.cache_root)
+
+        self.assertTrue(fsync_failed)
+        self.assertTrue(owner_read_failed)
+        self.assertFalse(canonical.exists())
+        replacement = CacheLock.acquire(self.cache_root)
+        self.addCleanup(replacement.release)
+        replacement.assert_owned()
 
     @unittest.skipUnless(os.name == "posix", "Точные POSIX modes доступны только на POSIX")
     def test_load_hardens_existing_private_cache_artifacts(self) -> None:
@@ -332,6 +652,209 @@ class StockCacheTest(unittest.TestCase):
             StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
 
         self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_cleanup_rejects_nonempty_generations_symlink_without_external_deletion(
+        self,
+    ) -> None:
+        outside = Path(self.temp_dir.name) / "outside-generations"
+        victim = outside / "generation-victim"
+        victim.mkdir(parents=True)
+        marker = victim / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        (self.cache_root / "generations").symlink_to(
+            outside, target_is_directory=True
+        )
+
+        with self.assertRaisesRegex(StockError, "cache_unavailable"):
+            StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
+
+        self.assertTrue(victim.is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Symlink race проверяется на POSIX")
+    def test_cleanup_parent_swap_does_not_traverse_external_generations(self) -> None:
+        generations = self.cache_root / "generations"
+        generations.mkdir()
+        internal = generations / "generation-internal"
+        internal.mkdir()
+        (internal / "internal.txt").write_text("internal", encoding="utf-8")
+        parked = self.cache_root / "generations-parked"
+        outside = Path(self.temp_dir.name) / "outside-generations"
+        victim = outside / "generation-victim"
+        victim.mkdir(parents=True)
+        marker = victim / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        real_listdir = os.listdir
+        swapped = False
+
+        def swap_before_listing(target: object) -> list[str]:
+            nonlocal swapped
+            if not swapped and (
+                target == generations
+                or (
+                    isinstance(target, int)
+                    and os.fstat(target).st_ino == generations.stat().st_ino
+                )
+            ):
+                swapped = True
+                os.rename(generations, parked)
+                generations.symlink_to(outside, target_is_directory=True)
+            return real_listdir(target)
+
+        with CacheLock.acquire(self.cache_root) as lock:
+            with patch.object(cache_module.os, "listdir", swap_before_listing):
+                warning = StockCache(
+                    self.cache_root, FakeHttpClient()
+                )._cleanup_inactive_generations(lock)
+
+        self.assertTrue(swapped)
+        self.assertEqual(warning, "cache_cleanup_incomplete")
+        self.assertTrue(victim.is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Symlink semantics проверяются на POSIX")
+    def test_inactive_generation_rollback_does_not_delete_external_victim(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside-generations"
+        victim = outside / "generation-victim"
+        victim.mkdir(parents=True)
+        marker = victim / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        (self.cache_root / "generations").symlink_to(
+            outside, target_is_directory=True
+        )
+
+        StockCache(self.cache_root, FakeHttpClient())._remove_generation_if_inactive(
+            self.cache_root / "generations" / "generation-victim"
+        )
+
+        self.assertTrue(victim.is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD deletion проверяется на POSIX")
+    def test_cleanup_does_not_delete_replaced_quarantine_directory(self) -> None:
+        generations = self.cache_root / "generations"
+        generations.mkdir(mode=0o700)
+        generation = generations / "generation-victim"
+        generation.mkdir(mode=0o700)
+        (generation / "owned.txt").write_text("owned", encoding="utf-8")
+        parked = generations / "parked-owned-generation"
+        outside = Path(self.temp_dir.name) / "outside-generation"
+        outside.mkdir(mode=0o755)
+        marker = outside / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        real_stat = os.stat
+        swapped = False
+
+        def replace_quarantine_after_identity_check(
+            path: object,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal swapped
+            observed = real_stat(path, *args, **kwargs)
+            if (
+                not swapped
+                and isinstance(path, str)
+                and path.startswith(".generation-victim.delete-")
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                swapped = True
+                quarantine = generations / path
+                os.rename(quarantine, parked)
+                os.rename(outside, quarantine)
+            return observed
+
+        descriptor = cache_module._open_private_directory(generations)
+        self.assertIsNotNone(descriptor)
+        try:
+            observed = cache_module._lstat_private_child(
+                descriptor,
+                generations,
+                generation.name,
+            )
+            self.assertIsNotNone(observed)
+            with patch.object(
+                cache_module.os,
+                "stat",
+                side_effect=replace_quarantine_after_identity_check,
+            ):
+                cache_module._remove_private_child_directory(
+                    descriptor,
+                    generations,
+                    generation.name,
+                    observed,
+                )
+        finally:
+            cache_module._close_optional_descriptor(descriptor)
+
+        self.assertTrue(swapped)
+        surviving_markers = list(Path(self.temp_dir.name).rglob(marker.name))
+        self.assertEqual(len(surviving_markers), 1)
+        self.assertEqual(surviving_markers[0].read_text(encoding="utf-8"), "safe")
+
+    def test_recursive_cleanup_without_directory_fd_fails_closed(self) -> None:
+        parent = self.cache_root / "windows-best-effort-parent"
+        parent.mkdir(mode=0o700)
+        victim = parent / "generation-victim"
+        victim.mkdir(mode=0o700)
+        marker = victim / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        observed = victim.lstat()
+
+        removed = cache_module._remove_private_child_directory(
+            None,
+            parent,
+            victim.name,
+            observed,
+        )
+
+        self.assertFalse(removed)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+
+    @unittest.skipUnless(os.name == "posix", "Directory FD deletion проверяется на POSIX")
+    def test_cleanup_rejects_directory_injected_after_quarantine_rename(
+        self,
+    ) -> None:
+        generations = self.cache_root / "generations"
+        generations.mkdir(mode=0o700)
+        generation = generations / "generation-victim"
+        generation.mkdir(mode=0o700)
+        (generation / "owned.txt").write_text("owned", encoding="utf-8")
+        outside = Path(self.temp_dir.name) / "outside-injected-generation"
+        outside.mkdir(mode=0o755)
+        marker = outside / "must-survive.txt"
+        marker.write_text("safe", encoding="utf-8")
+        real_empty = cache_module._empty_private_directory_descriptor
+        injected = False
+
+        def inject_before_walking(
+            descriptor: int,
+            path: Path,
+            *args: object,
+        ) -> bool:
+            nonlocal injected
+            if not injected:
+                injected = True
+                os.rename(outside, path / "late-external-directory")
+            return real_empty(descriptor, path, *args)
+
+        with patch.object(
+            cache_module,
+            "_empty_private_directory_descriptor",
+            side_effect=inject_before_walking,
+        ):
+            removed = cache_module._remove_private_cache_generation(
+                self.cache_root,
+                generation,
+            )
+
+        self.assertTrue(injected)
+        self.assertFalse(removed)
+        surviving_markers = list(Path(self.temp_dir.name).rglob(marker.name))
+        self.assertEqual(len(surviving_markers), 1)
+        self.assertEqual(surviving_markers[0].read_text(encoding="utf-8"), "safe")
 
     def test_windows_permission_hardening_is_explicit_best_effort(self) -> None:
         artifact = self.cache_root / "windows-best-effort.json"
@@ -832,17 +1355,21 @@ class StockCacheTest(unittest.TestCase):
         allow_creator = threading.Event()
         creator_locks: list[CacheLock] = []
         creator_errors: list[BaseException] = []
-        real_mkdir = Path.mkdir
+        real_mkdir = os.mkdir
         paused = False
 
         def pause_creator_after_lock_mkdir(
-            path: Path, *args: object, **kwargs: object
+            path: object,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
         ) -> None:
             nonlocal paused
-            real_mkdir(path, *args, **kwargs)
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            name = Path(os.fspath(path)).name
             if (
                 threading.current_thread().name == "displaced-creator"
-                and path.name.startswith(".refresh.lock")
+                and name.startswith(".refresh.lock.init-")
                 and not paused
             ):
                 paused = True
@@ -856,7 +1383,7 @@ class StockCacheTest(unittest.TestCase):
             except BaseException as error:
                 creator_errors.append(error)
 
-        with patch.object(Path, "mkdir", pause_creator_after_lock_mkdir):
+        with patch.object(cache_module.os, "mkdir", pause_creator_after_lock_mkdir):
             creator = threading.Thread(
                 target=acquire_as_creator, name="displaced-creator"
             )
@@ -1061,7 +1588,12 @@ class StockCacheTest(unittest.TestCase):
         real_rename = os.rename
         first_rename = True
 
-        def replace_owner_before_rename(source: Path, destination: Path) -> None:
+        def replace_owner_before_rename(
+            source: object,
+            destination: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
             nonlocal first_rename
             if first_rename:
                 first_rename = False
@@ -1071,7 +1603,7 @@ class StockCacheTest(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-            real_rename(source, destination)
+            real_rename(source, destination, *args, **kwargs)
 
         with patch("papa_shin_stock.cache.os.rename", replace_owner_before_rename):
             with self.assertRaisesRegex(StockError, "cache_locked"):
@@ -1552,15 +2084,21 @@ class StockCacheTest(unittest.TestCase):
 
     def test_inactive_cleanup_failure_is_observable_without_rollback(self) -> None:
         self.fixture.seed_generation()
-        real_rmtree = shutil.rmtree
+        real_remove = cache_module._remove_private_child_directory
 
-        def fail_for_previous_generation(path: Path, *args: object, **kwargs: object) -> None:
-            if Path(path).name == "generation-existing":
-                raise PermissionError("synthetic Windows cleanup failure")
-            real_rmtree(path, *args, **kwargs)
+        def fail_for_previous_generation(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            expected: os.stat_result | None = None,
+        ) -> bool:
+            if name == "generation-existing":
+                return False
+            return real_remove(parent_descriptor, parent, name, expected)
 
-        with patch(
-            "papa_shin_stock.cache.shutil.rmtree",
+        with patch.object(
+            cache_module,
+            "_remove_private_child_directory",
             side_effect=fail_for_previous_generation,
         ):
             result = StockCache(self.cache_root, FakeHttpClient()).refresh(self.config)
@@ -1579,16 +2117,22 @@ class StockCacheTest(unittest.TestCase):
     def test_repeated_cleanup_failure_does_not_accumulate_generations(self) -> None:
         self.fixture.seed_generation()
         client = FakeHttpClient()
-        real_rmtree = shutil.rmtree
+        real_remove = cache_module._remove_private_child_directory
         generations = self.cache_root / "generations"
 
-        def fail_for_generation(path: Path, *args: object, **kwargs: object) -> None:
-            if Path(path).parent == generations:
-                raise PermissionError("synthetic persistent cleanup failure")
-            real_rmtree(path, *args, **kwargs)
+        def fail_for_generation(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            expected: os.stat_result | None = None,
+        ) -> bool:
+            if "generation-" in name or ".staging-" in name:
+                return False
+            return real_remove(parent_descriptor, parent, name, expected)
 
-        with patch(
-            "papa_shin_stock.cache.shutil.rmtree",
+        with patch.object(
+            cache_module,
+            "_remove_private_child_directory",
             side_effect=fail_for_generation,
         ):
             first = StockCache(self.cache_root, client).refresh(self.config)
@@ -1616,19 +2160,22 @@ class StockCacheTest(unittest.TestCase):
 
     def test_repeated_staging_cleanup_failure_without_cache_is_bounded(self) -> None:
         client = FakeHttpClient(interrupt_offers=True)
-        real_rmtree = shutil.rmtree
+        real_remove = cache_module._remove_private_child_directory
         generations = self.cache_root / "generations"
 
-        def fail_for_staging(path: Path, *args: object, **kwargs: object) -> None:
-            candidate = Path(path)
-            if candidate.parent == generations and candidate.name.startswith(
-                ".staging-"
-            ):
-                raise PermissionError("synthetic persistent staging cleanup failure")
-            real_rmtree(path, *args, **kwargs)
+        def fail_for_staging(
+            parent_descriptor: int | None,
+            parent: Path,
+            name: str,
+            expected: os.stat_result | None = None,
+        ) -> bool:
+            if ".staging-" in name:
+                return False
+            return real_remove(parent_descriptor, parent, name, expected)
 
-        with patch(
-            "papa_shin_stock.cache.shutil.rmtree",
+        with patch.object(
+            cache_module,
+            "_remove_private_child_directory",
             side_effect=fail_for_staging,
         ):
             for _ in range(3):
