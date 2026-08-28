@@ -1090,6 +1090,44 @@ class WindowsFilesystemTest(unittest.TestCase):
         )
         self.assertEqual(self.api.list_directory(self.root), ["current.json"])
 
+    def test_atomic_replace_uses_share_all_identity_verified_rename_parent(
+        self,
+    ) -> None:
+        pointer = self.root + r"\current.json"
+        self.api.add_file(pointer, (7, 109), b"old-pointer")
+
+        with self.fs.open_verified(
+            self.root, directory=True, destructive=True, writable=True
+        ) as root:
+            pinned_parent_handle = root.handle
+            self.fs.replace_file_cas(
+                root,
+                "current.json",
+                expected=b"old-pointer",
+                payload=b"new-pointer",
+            )
+
+        rename_parent_handles = {
+            parent_handle
+            for _source, parent_handle, _destination, _replace in self.api.relative_rename_calls
+        }
+        self.assertEqual(len(rename_parent_handles), 1)
+        self.assertNotIn(pinned_parent_handle, rename_parent_handles)
+        rename_parent_handle = next(iter(rename_parent_handles))
+        rename_parent_open = next(
+            call
+            for call in self.api.open_calls
+            if self.api.canonical(call[0]) == self.api.canonical(self.root)
+            and call[2]
+            == FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        )
+        self.assertEqual(
+            rename_parent_open[2],
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        self.assertEqual(rename_parent_open[1] & GENERIC_WRITE, GENERIC_WRITE)
+        self.assertIn(rename_parent_handle, self.api.close_calls)
+
     def test_atomic_replace_reopens_quarantine_immutable_before_publish(self) -> None:
         pointer = self.root + r"\current.json"
         self.api.add_file(pointer, (7, 111), b"old-pointer")

@@ -1648,6 +1648,7 @@ class WindowsFilesystem:
         temporary: VerifiedHandle | None = None
         rollback: VerifiedHandle | None = None
         target: VerifiedHandle | None = None
+        rename_parent: VerifiedHandle | None = None
         target_identity: WindowsIdentity | None = None
         temporary_state = "UNPUBLISHED"
         rollback_state: str | None = None
@@ -1655,6 +1656,11 @@ class WindowsFilesystem:
         target_quarantined = False
         operation_failed = False
         deferred_cleanup_errors: list[OSError] = []
+
+        def destination_parent_handle() -> int:
+            if rename_parent is None:
+                raise WindowsFilesystemError("Win32 rename parent is unavailable")
+            return rename_parent.handle
 
         def close_during_recovery(handle: VerifiedHandle) -> None:
             try:
@@ -1734,7 +1740,7 @@ class WindowsFilesystem:
             try:
                 self.api.rename_relative(
                     rollback.handle,
-                    parent.handle,
+                    destination_parent_handle(),
                     name,
                     replace=False,
                 )
@@ -1786,6 +1792,16 @@ class WindowsFilesystem:
             return True
 
         try:
+            parent.assert_current()
+            # The retained parent remains namespace-pinned.  A second handle to
+            # the same verified identity supplies the share-all RootDirectory
+            # contract required by native relative rename.
+            rename_parent = self.open_verified(
+                parent.path,
+                directory=True,
+                expected=parent.identity,
+                writable=True,
+            )
             temporary = self.open_child(
                 parent,
                 temporary_name,
@@ -1825,7 +1841,7 @@ class WindowsFilesystem:
                 try:
                     self.api.rename_relative(
                         target.handle,
-                        parent.handle,
+                        destination_parent_handle(),
                         quarantine_name,
                         replace=False,
                     )
@@ -1866,7 +1882,7 @@ class WindowsFilesystem:
             try:
                 self.api.rename_relative(
                     temporary.handle,
-                    parent.handle,
+                    destination_parent_handle(),
                     name,
                     replace=False,
                 )
@@ -1918,7 +1934,7 @@ class WindowsFilesystem:
                     cleanup_needs_flush = True
                 except OSError as error:
                     cleanup_errors.append(error)
-            for handle in (target, rollback, temporary):
+            for handle in (target, rollback, temporary, rename_parent):
                 if handle is None:
                     continue
                 try:
