@@ -1,0 +1,9 @@
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier A","price":"7000","delivery_days":3,"quantity":5,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier B","price":"6500","delivery_days":5,"quantity":4,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier C","price":"6500","delivery_days":2,"quantity":3,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier D","price":"6800","delivery_days":1,"quantity":7,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier E","price":"6900","delivery_days":2,"quantity":2,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-a","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier F","price":"7100","delivery_days":1,"quantity":8,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-summer-b","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier A","price":"6000","delivery_days":4,"quantity":12,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-winter","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier A","price":"6200","delivery_days":2,"quantity":8,"source_note":"must-not-be-public"}
+{"private_offer_product_key":"synthetic-unknown","content_generation_id":"synthetic-generation","supplier":"Synthetic Supplier A","price":"5000","delivery_days":6,"quantity":3,"source_note":"must-not-be-public"}
