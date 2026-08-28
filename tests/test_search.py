@@ -2062,6 +2062,23 @@ class SqliteFailureNormalizationTest(unittest.TestCase):
 
 
 class SearchStockCliTest(unittest.TestCase):
+    def test_help_subprocess_writes_utf8_under_legacy_stdout_encoding(self) -> None:
+        environment = dict(os.environ)
+        environment["PYTHONIOENCODING"] = "cp1252"
+
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "search_stock.py"), "--help"],
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        help_text = completed.stdout.decode("utf-8")
+        self.assertIn("usage:", help_text)
+        self.assertIn("Поиск по локальному проверенному кэшу", help_text)
+
     def _run_generation_cli(
         self,
         *,

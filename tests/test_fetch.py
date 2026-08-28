@@ -709,6 +709,7 @@ class FetchStockCliTest(unittest.TestCase):
                 env=environment,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=False,
             )
 
@@ -834,6 +835,47 @@ class FetchStockCliTest(unittest.TestCase):
             },
         )
         self.assertNotIn("absent.env", result.stdout)
+
+    def test_subprocess_output_survives_non_unicode_stdout_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ)
+            environment["PAPA_SHIN_STOCK_CONFIG"] = str(
+                Path(directory) / "absent.env"
+            )
+            environment["PYTHONIOENCODING"] = "cp1252"
+
+            help_result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "fetch_stock.py"), "--help"],
+                env=environment,
+                capture_output=True,
+                check=False,
+            )
+            error_result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "fetch_stock.py")],
+                env=environment,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(help_result.returncode, 0)
+        self.assertEqual(help_result.stderr, b"")
+        self.assertIn("usage:", help_result.stdout.decode("utf-8"))
+        self.assertEqual(error_result.returncode, 2)
+        self.assertEqual(error_result.stderr, b"")
+        self.assertEqual(
+            json.loads(error_result.stdout.decode("utf-8")),
+            {
+                "status": "error",
+                "error": {
+                    "code": "config_missing",
+                    "message": "Файл конфигурации не найден",
+                },
+            },
+        )
+        self.assertNotIn(
+            os.fsencode(directory),
+            error_result.stdout + error_result.stderr,
+        )
 
     def test_auth_error_prints_safe_json_envelope(self) -> None:
         output = StringIO()

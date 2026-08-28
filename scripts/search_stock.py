@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from papa_shin_stock._cli_output import write_stdout_utf8
 from papa_shin_stock.cache import StockCache
 from papa_shin_stock.config import StockConfig
 from papa_shin_stock.errors import StockError
@@ -62,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     parser = build_parser()
     if arguments == ["-h"] or arguments == ["--help"]:
-        parser.print_help()
+        write_stdout_utf8(parser.format_help())
         return 0
 
     try:
@@ -86,7 +87,9 @@ def main(argv: list[str] | None = None) -> int:
             "error": {"code": error.code, "message": error.safe_message},
         }
         exit_code = error.exit_code
-    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    write_stdout_utf8(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
     return exit_code
 
 
