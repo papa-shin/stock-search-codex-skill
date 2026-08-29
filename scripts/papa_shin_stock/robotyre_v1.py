@@ -28,6 +28,11 @@ _MAX_DECIMAL_TEXT = 512
 _MAX_SOURCE_DEPTH = 32
 _MAX_SOURCE_NODES = 4096
 _MAX_SOURCE_TEXT = 2 * 1024 * 1024
+_DECIMAL_SOURCES = {
+    "json_integer",
+    "json_decimal_string",
+    "json_numeric_lexeme",
+}
 
 PRODUCT_TYPE_NAMES = {
     "172": "Шины",
@@ -196,12 +201,12 @@ def offer_projection(
     _nullable_text(row["warehouse_name"])
     quantity = _positive_integer(row["quantity"])
     _positive_decimal_text(row["price_input"])
-    if row["price_input_source"] not in {"json_integer", "json_decimal_string"}:
+    if row["price_input_source"] not in _DECIMAL_SOURCES:
         raise _invalid()
     sale = _nullable_decimal_pair(
         row["price_sale"],
         row["price_sale_source"],
-        {"json_integer", "json_decimal_string"},
+        _DECIMAL_SOURCES,
         require_positive=True,
     )
     if row["is_sale"] is not None and type(row["is_sale"]) is not bool:

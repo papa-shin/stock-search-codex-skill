@@ -258,6 +258,18 @@ class RobotyreV1ProjectionTest(unittest.TestCase):
         no_sale["price_sale_source"] = None
         self.assertIsNone(offer_projection(no_sale, GENERATION_ID))
 
+    def test_offer_accepts_numeric_lexeme_provenance_for_exact_prices(self) -> None:
+        for source_field in ("price_input_source", "price_sale_source"):
+            with self.subTest(source_field=source_field):
+                row = self.offer()
+                row[source_field] = "json_numeric_lexeme"
+
+                projected = offer_projection(row, GENERATION_ID)
+
+                self.assertIsNotNone(projected)
+                assert projected is not None
+                self.assertEqual(str(projected.price), "7000")
+
     def test_offer_does_not_fallback_to_purchase_price_or_private_article(self) -> None:
         row = self.offer()
         row["price_input"] = "1"
@@ -416,6 +428,18 @@ class RobotyreV1EndToEndTest(unittest.TestCase):
             "\n".join(
                 json.dumps(row, ensure_ascii=False, separators=(",", ":"))
                 for row in product_rows
+            )
+            + "\n"
+        ).encode("utf-8")
+        offer_rows = [
+            json.loads(line) for line in offers.decode("utf-8").splitlines()
+        ]
+        offer_rows[0]["price_input_source"] = "json_numeric_lexeme"
+        offer_rows[0]["price_sale_source"] = "json_numeric_lexeme"
+        offers = (
+            "\n".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                for row in offer_rows
             )
             + "\n"
         ).encode("utf-8")

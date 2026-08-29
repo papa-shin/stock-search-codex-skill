@@ -167,7 +167,7 @@ URL `products.jsonl`, `offers.jsonl` и `archive.zip` отдельно не на
 
 - canonical decimal-строка без exponent и leading plus;
 - значение строго больше нуля и в пределах существующего безопасного decimal budget клиента;
-- `price_sale_source` в `json_integer | json_decimal_string`.
+- `price_input_source` и непустой `price_sale_source` в `json_integer | json_decimal_string | json_numeric_lexeme` согласно канонической producer schema.
 
 Нулевая, отрицательная, слишком длинная/экстремальная цена, неправильный source или нарушение пары `price_sale/price_sale_source` делают строку заявленного v1 семантически непригодной и возвращают `manifest_invalid` fail-closed. При `price_sale == null` значение `price_sale_source` также обязано быть `null`.
 
@@ -349,3 +349,4 @@ Fixtures должны быть полностью синтетическими. 
 - `source_value` может содержать необработанные коммерческие значения и не должен попадать в публичный результат или диагностику.
 - Внутреннее имя `generation_id` допустимо сохранить только как implementation detail; внешний источник истины — `content_generation_id`.
 - Изменения ограничены read-only клиентом skill и не затрагивают canonical production-flow `/supplier-items`.
+- Post-merge review PR #2 выявил несовместимость с producer provenance `json_numeric_lexeme` и нерабочий legacy `.env.example`; follow-up обязан покрыть оба случая RED→GREEN и повторным review loop.
