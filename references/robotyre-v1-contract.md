@@ -34,7 +34,9 @@ https://office.papa-shin.ru/robotyre-stock/v1/manifest.json
 
 Статусы `unknown` и `missing` выносятся в `unknown_characteristics`; `source_value` не публикуется. Типоразмер не входит в контракт: `--size` возвращает `query_unsupported`.
 
-Цена покупателя берётся только из `price_sale`. `price_input` не используется ни как цена, ни как fallback. Предложение без `supplier_name` или без положительного `price_sale` в публичную выдачу не попадает.
+Цена покупателя берётся только из `price_sale`. `price_input` не используется ни как цена, ни как fallback. Для `price_input_source` и непустого `price_sale_source` допустимы `json_integer`, `json_decimal_string` и `json_numeric_lexeme`.
+
+Предложение без `supplier_name` или с `price_sale: null` в публичную выдачу не попадает. Нулевая или отрицательная `price_sale` нарушает контракт и отклоняет строку с `manifest_invalid`.
 
 ## Свежесть
 

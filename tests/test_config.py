@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+SKILL_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from papa_shin_stock.config import StockConfig
@@ -211,6 +212,23 @@ class StockConfigTest(unittest.TestCase):
                     StockConfig.load(
                         self.write_env(self.complete_env(f"{key}=legacy_id\n"))
                     )
+
+    def test_shipped_env_example_loads_with_canonical_v1_defaults(self) -> None:
+        cache_directory = self.directory / "cache" / "stock"
+        contents = (SKILL_ROOT / ".env.example").read_text(encoding="utf-8")
+        contents = contents.replace(
+            "replace-with-local-username", "synthetic-user"
+        ).replace("replace-with-local-password", "synthetic-password")
+        contents += f"PAPA_SHIN_STOCK_CACHE_DIR={cache_directory}\n"
+
+        config = StockConfig.load(self.write_env(contents))
+
+        self.assertEqual(
+            config.manifest_url,
+            "https://office.papa-shin.ru/robotyre-stock/v1/manifest.json",
+        )
+        self.assertEqual(config.product_id_field, "robotyre_product_id")
+        self.assertEqual(config.offer_product_id_field, "robotyre_product_id")
 
     def test_resolve_product_id_rejects_missing_or_empty_value(self) -> None:
         config = StockConfig.load(self.write_env(self.complete_env()))
